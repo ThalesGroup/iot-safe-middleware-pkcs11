@@ -94,7 +94,7 @@ void MiniDriverContainer::setContainerInformation( const boost::shared_ptr< Mars
 
     // The container information is a byte array blob containing the public key(s) in the selected container. 
     // The blob is formatted as follows:  Blob = [Signature_Pub_Key] | [Exchange_Pub_Key] 
-    // Signature_Pub_Key and Exchange_Pub_Key are optional depending on which key exists in the container and it’s a sequence of 3 TLV formatted as follows: 
+    // Signature_Pub_Key and Exchange_Pub_Key are optional depending on which key exists in the container and itâ€™s a sequence of 3 TLV formatted as follows: 
     
     //T_Key_Type = 0x03 
     //L_Key_Type = 0x01 

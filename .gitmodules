@@ -1,4 +1,0 @@
-[submodule "iotsafe-middleware"]
-	path = se-access-lib/middleware-modem
-	url = https://github.com/ThalesGroup/iot-safe-middleware
-	

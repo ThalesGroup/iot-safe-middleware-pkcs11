@@ -1,0 +1,3 @@
+[submodule "se-access-lib/iotsafe-middleware"]
+	path = se-access-lib/iotsafe-middleware
+	url = https://github.com/ThalesGroup/iot-safe-middleware

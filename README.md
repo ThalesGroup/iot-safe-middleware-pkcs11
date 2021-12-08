@@ -213,12 +213,14 @@ Below are the examples on how to run the test:
   ```
   ./pkcs11-test -p:1234 -i:0 -l:/usr/local/lib/libgtosepkcs11.so -h
   ```
+  -l is optional
 
 - To test performing AES CMAC:
 
   ```
   ./pkcs11-test -p:1234 -i:0 -l:/usr/local/lib/libgtosepkcs11.so -c
   ```
+  -l is optional
 
 # Other Related Projects
 

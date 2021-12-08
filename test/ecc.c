@@ -486,7 +486,6 @@ CK_RV computeECDH (CK_FUNCTION_LIST_PTR p_pFunctions, CK_SESSION_HANDLE p_hSessi
         //public key
         //l_ulErc = findECCKeyByKeyType (p_pFunctions, p_hSession, l_pszKeyID, l_ulBufferLen, TRUE, &l_hPrivateKey);
         
-        logInfo (("\tSEARCH  FOR PUBLIC KEY: \n"));
         l_ulErc = findECCKeyById (p_pFunctions, p_hSession,(CK_CHAR_PTR)l_pszKeyID, (CK_ULONG)strlen (l_pszKeyID), FALSE, &l_hPubKey);
         if (l_ulErc != CKR_OK)
         {
@@ -497,7 +496,7 @@ CK_RV computeECDH (CK_FUNCTION_LIST_PTR p_pFunctions, CK_SESSION_HANDLE p_hSessi
             printf("invalid public key handle\n");
         }
         else{
-              printf("OK public key handle is %d\n", l_hPubKey);
+              printf("found public key handle %d\n", l_hPubKey);
                   // DER-encoding of ANSI X9.62 EC Point value Q
              
                 // Display the key value
@@ -520,7 +519,6 @@ CK_RV computeECDH (CK_FUNCTION_LIST_PTR p_pFunctions, CK_SESSION_HANDLE p_hSessi
         }
 
         //private key
-        logInfo (("\tSEARCH  FOR PRIVATE KEY: \n"));
         l_ulErc = findECCKeyById (p_pFunctions, p_hSession, (CK_CHAR_PTR)l_pszKeyID, (CK_ULONG)strlen (l_pszKeyID), TRUE, &l_hPrivateKey);
         if (l_ulErc != CKR_OK)
         {
@@ -531,7 +529,7 @@ CK_RV computeECDH (CK_FUNCTION_LIST_PTR p_pFunctions, CK_SESSION_HANDLE p_hSessi
             printf("invalid private key handle\n");
         }
         else{
-              printf("OK private key handle is %d\n", l_hPrivateKey);
+              printf("found private key handle %d\n", l_hPrivateKey);
         }
 
         

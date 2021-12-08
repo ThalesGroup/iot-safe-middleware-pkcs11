@@ -55,6 +55,8 @@ To update the correct path to a SE hardware interface device, update the followi
 
 To build and install the PKCS#11 provider:
 ```
+export PROJECT_DIR=/home/pi/experiment/iot-safe-middleware-pkcs11
+sudo chmod u+x project-build.sh
 ./project-build.sh Release
 ```
 

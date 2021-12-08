@@ -1,15 +1,30 @@
+/*
+*  PKCS#11 library for IoT Safe
+*  Copyright (C) 2007-2009 Gemalto <support@gemalto.com>
+*  Copyright (C) 2009-2021 Thales
+*
+*  This library is free software; you can redistribute it and/or
+*  modify it under the terms of the GNU Lesser General Public
+*  License as published by the Free Software Foundation; either
+*  version 2.1 of the License, or (at your option) any later version.
+*
+*  This library is distributed in the hope that it will be useful,
+*  but WITHOUT ANY WARRANTY; without even the implied warranty of
+*  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+*  Lesser General Public License for more details.
+*
+*  You should have received a copy of the GNU Lesser General Public
+*  License along with this library; if not, write to the Free Software
+*  Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301  USA
+*
+*/
+#ifndef NO_FILESYSTEM
 
 #include "Configuration.hpp"
-//#include "Util.h"
-//#include "Singleton.h"
-//#include "Context.h"
 
 #include <fstream>
 #include <iostream>
 #include <algorithm> // remove(), erase()
-
-//namespace Gemalto
-//{
 
 /*
 */
@@ -40,34 +55,6 @@ void Configuration::getConfigurationFilePath( std::string &result )
 {
 	result = m_szConfigurationfilePath;
 }
-
-
-///*
-//*/
-//void Configuration::print( )
-//{
-//	std::string msg = "print configuration <BEGIN>";
-//	Gemalto::Context::getInstance( ).getLog( ).write( msg );
-//
-//	for( TConfiguration::iterator i = m_configuration.begin( ); i != m_configuration.end( ); i++ )
-//	{
-//		std::string sectionName = (*i).first;
-//		msg = "CurrentSection <" + sectionName + ">";
-//		Gemalto::Context::getInstance( ).getLog( ).write( msg );
-
-//		TSection sectionMap = (*i).second;
-//		for( TSection::iterator j = sectionMap.begin( ); j != sectionMap.end( ); j++ )
-//		{
-//			std::string key = (*j).first;
-//			std::string value = (*j).second;
-//			msg = "    Key <" + key + "> - Value <" + value + ">";
-//			Gemalto::Context::getInstance( ).getLog( ).write( msg );
-//		}
-//	}
-//
-//	msg = "print configuration <END>";
-//	Gemalto::Context::getInstance( ).getLog( ).write( msg );
-//}
 
 
 /*
@@ -341,15 +328,12 @@ void Configuration::getSectionName( const std::string& str, std::string &result 
 }
 
 
-
-
 /* Suppress all occurences of the targeted character
 */
 void Configuration::suppressAllOccurencesOfThisCharacter( const std::string& s, char c, std::string& result )
 { 
 	result = s;
 	result.erase( std::remove( result.begin( ), result.end( ), c ), result.end( ) ); 
-}   
-
-
-//} //namespace
+}
+   
+#endif 		// NO_FILESYSTEM

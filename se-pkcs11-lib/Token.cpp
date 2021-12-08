@@ -1,6 +1,7 @@
 /*
-*  PKCS#11 library for .Net smart cards
-*  Copyright (C) 2007-2009 Gemalto <support@gemalto->com>
+*  PKCS#11 library for IoT Safe
+*  Copyright (C) 2007-2009 Gemalto <support@gemalto.com>
+*  Copyright (C) 2009-2021 Thales
 *
 *  This library is free software; you can redistribute it and/or
 *  modify it under the terms of the GNU Lesser General Public
@@ -17,33 +18,299 @@
 *  Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301  USA
 *
 */
+// #include <boost/foreach.hpp>
 
-
-#include <boost/foreach.hpp>
 #include <ctime>
 #include <utility>
 #include <list>
 #include <map>
 #include <memory>
+#ifdef __APPLE__
+#include <pwd.h>
+#include <sys/socket.h>
+#include <sys/un.h>
+#endif
+
 #include "cryptoki.h"
-#include "symmalgo.h"
 #include "util.h"
 #include "x509cert.h"
 #include "attrcert.h"
 #include "Pkcs11ObjectKeyPublicRSA.hpp"
+#include "Pkcs11ObjectKeyPublicECC.hpp"
+#include "Pkcs11ObjectKeyPrivateECC.hpp"
 #include "Pkcs11ObjectData.hpp"
+#include "Pkcs11ObjectKeySecretAES.hpp"
+#include "Pkcs11ObjectKeyGenericSecret.hpp"
 #include "PKCS11Exception.hpp"
-#include "md5.h"
+#include "digest.h"
 #include "Log.hpp"
-#include "cr_rsa.h"
 #include "Token.hpp"
 #include "MiniDriverException.hpp"
-#include "sha1.h"
 #include "cardmod.h"
 #include "Slot.hpp"
 #include "PCSCMissing.h"
+#include "zlib.h"
+#include <errno.h>
+#include "Application.hpp"
+
+#ifdef _WIN32
+#include "resource.h"
+#else
+#include <sys/wait.h>
+#include <signal.h>
+#define UNREFERENCED_PARAMETER(P) {(P)=(P);}
+#endif
+
+#include <openssl/ec.h>
+#include <openssl/ecdsa.h>
+#include <openssl/ecdh.h>
+#include <openssl/rsa.h>
+#include <openssl/objects.h>
 
 const unsigned char g_ucPKCS_EMEV15_PADDING_TAG = 0x02;
+
+bool Token::s_bForcePinUser = false;
+
+unsigned char g_pbECC256k1_OID[7] = {0x06, 0x05, 0x2B, 0x81, 0x04, 0x00, 0x0A};
+
+unsigned char g_pbECC256_OID[10] = {0x06, 0x08, 0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x03, 0x01, 0x07};
+
+unsigned char g_pbECC384_OID[7] = {0x06, 0x05, 0x2B, 0x81, 0x04, 0x00, 0x22};
+
+unsigned char g_pbECC521_OID[7] = {0x06, 0x05, 0x2B, 0x81, 0x04, 0x00, 0x23};
+
+/*
+*/
+bool isFileExists( const std::string& a_stFileName, const MiniDriverFiles::FILES_NAME& a_stFilesList ) {
+
+    // Look if the file name is present intot the list
+    // BOOST_FOREACH( const std::string& fileName, a_stFilesList ) {
+	for (MiniDriverFiles::FILES_NAME::iterator iter = a_stFilesList.begin () ; iter != a_stFilesList.end (); ++iter) {
+		std::string& fileName = (std::string&)*iter;
+
+        // The file name has been found
+        if( std::string::npos != a_stFileName.find( fileName ) ) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+/*
+*/
+Token::CAtomicLogin::CAtomicLogin(Token* pToken, MiniDriverAuthentication::ROLES specificRole) : m_pToken(pToken)
+{
+	if (	m_pToken->m_Device
+		&&	m_pToken->m_pSlot
+        )
+    {
+        if (     (specificRole != MiniDriverAuthentication::PIN_USER)
+                &&  !m_pToken->m_Device->isNoPin(MiniDriverAuthentication::PIN_USER)
+                &&  (!m_pToken->m_Device->isSSO(MiniDriverAuthentication::PIN_USER) || !m_pToken->m_Device->isAuthenticated(MiniDriverAuthentication::PIN_USER))
+                )
+        {
+			authenticateRole(MiniDriverAuthentication::PIN_USER);
+        }
+	}
+}
+
+Token::CAtomicLogin::CAtomicLogin(Token* pToken, bool bIsForWriteOperation, CK_BYTE specificRole) : m_pToken(pToken), m_bIsForWriteOperation(bIsForWriteOperation)
+{
+	if (	m_pToken->m_Device
+		&&	m_pToken->m_pSlot
+        )
+    {
+        MiniDriverAuthentication::ROLES tokenRole = m_pToken->getUserRole();
+        if (    (specificRole == 0)
+            &&  (!m_bIsForWriteOperation || (m_bIsForWriteOperation && ( tokenRole == MiniDriverAuthentication::PIN_USER)))
+			&&  (!m_pToken->m_Device->isNoPin(tokenRole))
+         &&  (!m_pToken->m_Device->isSSO(tokenRole) || !m_pToken->m_Device->isAuthenticated(tokenRole))
+		    &&	m_pToken->m_pSlot->isAuthenticated()
+            )
+	    {
+			CSecureString& tokenSecuredPin = m_pToken->m_Device->getSecuredPin(tokenRole);
+		    try
+		    {
+				if (tokenSecuredPin.GetLength())
+				{
+					u1ArraySecure pin(tokenSecuredPin.GetLength());
+					tokenSecuredPin.CopyTo(pin.GetBuffer());
+					m_pToken->m_Device->verifyPin(tokenRole, &pin);
+					m_vecAuthenticatedRoles.push_back(tokenRole);
+					m_pToken->m_pSlot->setAuthenticationLost(false);
+				}
+				else if (m_pToken->getTokenInfo().flags & CKF_PROTECTED_AUTHENTICATION_PATH)
+				{
+					if ((m_pToken->m_pSlot->isAuthenticationLost() || !m_pToken->m_Device->isAuthenticated(tokenRole)))
+					{
+						u1Array pin(0);
+						m_pToken->m_Device->verifyPin(tokenRole, &pin);
+						if (m_pToken->IsPinCacheDisabled(tokenRole))
+							m_pToken->m_pSlot->setAuthenticationLost(true);
+						else
+							m_pToken->m_pSlot->setAuthenticationLost(false);
+					}
+					else if (m_pToken->IsPinCacheDisabled(tokenRole))
+					{
+						m_pToken->m_pSlot->setAuthenticationLost(true);
+					}
+				}
+				else if ( m_pToken->IsPinCacheDisabled(tokenRole) )
+				{
+					u1ArraySecure pin(tokenSecuredPin.GetLength());
+					tokenSecuredPin.CopyTo(pin.GetBuffer());
+					m_pToken->m_Device->verifyPin(tokenRole, &pin);
+					m_vecAuthenticatedRoles.push_back(tokenRole);
+					m_pToken->m_pSlot->setAuthenticationLost(false);
+				}
+		    }
+		    catch(MiniDriverException& a_Exception)
+		    {
+				if ( (a_Exception.getError( ) == SCARD_W_CANCELLED_BY_USER) || (a_Exception.getError( ) == SCARD_E_TIMEOUT) )
+				{
+					throw PKCS11Exception(CKR_FUNCTION_CANCELED);
+				}
+
+				if( (a_Exception.getError( ) == SCARD_W_CARD_NOT_AUTHENTICATED) || (a_Exception.getError( )  == SCARD_W_WRONG_CHV))
+			    {
+				    // clear PIN
+				    tokenSecuredPin.Reset();
+
+					throw PKCS11Exception(CKR_PIN_INCORRECT);
+			    }
+				else
+					throw PKCS11Exception(checkException(a_Exception));
+
+		    }
+			catch(PKCS11Exception& )
+			{
+				throw;
+			}
+		    catch(...)
+			{
+				throw PKCS11Exception(CKR_FUNCTION_FAILED);
+			}
+	    }
+        else if (   bIsForWriteOperation
+                &&  (tokenRole != MiniDriverAuthentication::PIN_USER)
+                &&  !m_pToken->m_Device->isNoPin(MiniDriverAuthentication::PIN_USER)
+                &&  (!m_pToken->m_Device->isSSO(MiniDriverAuthentication::PIN_USER) || !m_pToken->m_Device->isAuthenticated(MiniDriverAuthentication::PIN_USER))
+                )
+        {
+			if (authenticateRole(MiniDriverAuthentication::PIN_USER))
+			{
+				if((specificRole != 0) && !m_pToken->m_Device->isNoPin((MiniDriverAuthentication::ROLES) specificRole))
+					authenticateRole((MiniDriverAuthentication::ROLES) specificRole);
+			}
+        }
+        else if (   (specificRole != 0)
+                &&  (m_pToken->getUserRole() == MiniDriverAuthentication::PIN_USER)
+                &&  (!m_pToken->m_Device->isSSO((MiniDriverAuthentication::ROLES) specificRole) || !m_pToken->m_Device->isAuthenticated((MiniDriverAuthentication::ROLES) specificRole))
+                )
+        {
+			// special case for enrollement on PIN_USER slot using container associated to another role
+			// used to signature/decryption
+			bool bContinuePinLoop = false;
+			bool bIsPinPad = m_pToken->isRoleUsingProtectedAuthenticationPath((MiniDriverAuthentication::ROLES) specificRole);
+			do
+			{
+				CSecureString securedPin = m_pToken->m_Device->getSecuredPin((MiniDriverAuthentication::ROLES) specificRole);
+
+				if (securedPin.IsEmpty())
+				{
+					if (!bIsPinPad)
+					{
+						throw PKCS11Exception(CKR_FUNCTION_CANCELED);
+					}
+				}
+
+				try
+				{
+					u1ArraySecure pin(securedPin.GetLength());
+					securedPin.CopyTo(pin.GetBuffer());
+					m_pToken->m_Device->verifyPin((MiniDriverAuthentication::ROLES) specificRole, &pin);
+
+					m_vecAuthenticatedRoles.push_back((MiniDriverAuthentication::ROLES) specificRole);
+					bContinuePinLoop = false;
+				}
+				catch(MiniDriverException& a_Exception)
+				{
+					if( (a_Exception.getError( ) == SCARD_W_CARD_NOT_AUTHENTICATED) || (a_Exception.getError( )  == SCARD_W_WRONG_CHV))
+					{
+						m_pToken->m_Device->getSecuredPin((MiniDriverAuthentication::ROLES) specificRole).Reset();
+						// if PIN was given from GUI, show error and retry
+						throw PKCS11Exception(CKR_PIN_INCORRECT);
+					}
+					else
+					{
+						throw PKCS11Exception(checkException(a_Exception));
+					}
+				}
+				catch(...)
+				{
+					throw PKCS11Exception(CKR_FUNCTION_FAILED);
+				}
+			}
+			while (bContinuePinLoop);
+        }
+    }
+}
+
+bool Token::CAtomicLogin::authenticateRole(MiniDriverAuthentication::ROLES role )
+{
+	bool bSuccess = false;
+	bool bContinuePinLoop = false;
+	// bool bIsPinPad = m_pToken->isRoleUsingProtectedAuthenticationPath(role);
+
+	{
+		do
+		{
+			CSecureString securedUserPin = m_pToken->m_Device->getSecuredPin(role);
+			if (securedUserPin.IsEmpty())
+			{
+				throw PKCS11Exception(CKR_FUNCTION_CANCELED);
+			}
+
+			try
+			{
+				if (!securedUserPin.IsEmpty())
+				{
+					u1ArraySecure pin(securedUserPin.GetLength());
+					securedUserPin.CopyTo(pin.GetBuffer());
+					m_pToken->m_Device->verifyPin(role, &pin);
+					m_vecAuthenticatedRoles.push_back(role); // We don't loggout in case of PinPAD
+
+					if (role == m_pToken->getUserRole())
+						m_pToken->m_pSlot->setAuthenticationLost(false);
+				}
+				bSuccess = true;
+				bContinuePinLoop = false;
+			}
+			catch(MiniDriverException& a_Exception)
+			{
+				if ( (a_Exception.getError( ) == SCARD_W_CANCELLED_BY_USER) || (a_Exception.getError( ) == SCARD_E_TIMEOUT) )
+				{
+					throw PKCS11Exception(CKR_FUNCTION_CANCELED);
+				}
+
+				if( (a_Exception.getError( ) == SCARD_W_CARD_NOT_AUTHENTICATED) || (a_Exception.getError( )  == SCARD_W_WRONG_CHV))
+				{
+					// clear PIN from device
+					m_pToken->m_Device->getSecuredPin(role).Reset();
+					throw PKCS11Exception(CKR_PIN_INCORRECT);
+				}
+			}
+			catch(...)
+			{
+				throw PKCS11Exception(CKR_FUNCTION_FAILED);
+			}
+		}
+		while (bContinuePinLoop);
+	}
+
+	return bSuccess;
+}
 
 /*
 */
@@ -72,23 +339,24 @@ Token::Token( Slot* a_pSlot, Device* a_pDevice ) {
 
     g_stPathTokenInfo = "tinfo";
 
-    g_stPrefixData = "dat";
-    g_stPrefixKeyPublic = "puk";
-    g_stPrefixKeyPrivate = "prk";
+    g_stPrefixData = "dat"; // Stands for "DATa".
+    g_stPrefixKeyPublic = "puk"; // Stands for "PUblic Key".
+    g_stPrefixKeyPrivate = "prk"; // Stands for "PRivate Key".
+    g_stPrefixKeySecret = "sek"; // Stands for "SEcret Key".
     // Use the default key exchange certificate extension as root certificate extension
     g_stPrefixRootCertificate = szUSER_KEYEXCHANGE_CERT_PREFIX;
 
-    g_stPrefixPublicObject = "pub";
-    g_stPrefixPrivateObject = "pri";
+    g_stPrefixPublicObject = "pub";  // Stands for "PUBlic".
+    g_stPrefixPrivateObject = "pri";  // Stands for "PRIvate".
 
     m_Device = a_pDevice;
 
     // Set the seed for the random generator
-    Marshaller::u1Array challenge( 8 );
+    u1Array challenge( 8 );
     generateRandom( challenge.GetBuffer( ), 8 );
     Util::SeedRandom( challenge );
 
-    // Set the default role 
+    // Set the default role
     m_RoleLogged = CK_UNAVAILABLE_INFORMATION;
 
     // Check if the PKCS11 directory and the token information file are present
@@ -137,7 +405,9 @@ void Token::initializeObjectIndex( void ) {
 
     unsigned char idx = 0xFF;
 
-    BOOST_FOREACH( const std::string& s, fs ) {
+    // BOOST_FOREACH( const std::string& s, fs ) {
+	for (MiniDriverFiles::FILES_NAME::iterator iter = fs.begin () ; iter != fs.end (); ++iter) {
+		std::string& s = (std::string&)*iter;
 
         if( s.find( g_stPrefixData ) != std::string::npos ) {
 
@@ -241,7 +511,7 @@ void Token::checkTokenInfo( void ) {
 
                 try {
 
-                    m_Device->readFile( g_stPathPKCS11, g_stPathTokenInfo );
+                   std::unique_ptr<u1Array> p(m_Device->readFile( g_stPathPKCS11, g_stPathTokenInfo ));
 
                 } catch( MiniDriverException& x ) {
 
@@ -263,9 +533,9 @@ void Token::checkTokenInfo( void ) {
 
                 m_bCreateDirectoryP11 = false;
                 m_bCreateTokenInfoFile = true;
-                m_bWriteTokenInfoFile = true;      
+                m_bWriteTokenInfoFile = true;
             }
-        
+
         } catch( ... ) { }
     }
 
@@ -294,13 +564,13 @@ void Token::writeTokenInfo( void ) {
     Util::PushBBoolInVector( &v, _version );
 
     // Label
-    Marshaller::u1Array l( sizeof( m_TokenInfo.label ) );
+    u1Array l( sizeof( m_TokenInfo.label ) );
     l.SetBuffer( m_TokenInfo.label );
     Util::PushByteArrayInVector( &v, &l );
 
     size_t z = v.size( );
 
-    Marshaller::u1Array objData( z );
+    u1Array objData( z );
 
     for( unsigned int i = 0 ; i < z ; ++i ) {
 
@@ -349,7 +619,7 @@ void Token::readTokenInfo( void ) {
 
     try {
 
-        Marshaller::u1Array* fileData = m_Device->readFile( g_stPathPKCS11, g_stPathTokenInfo );
+        std::unique_ptr<u1Array> fileData ( m_Device->readFile( g_stPathPKCS11, g_stPathTokenInfo ) );
 
         std::vector< unsigned char > v;
 
@@ -374,7 +644,7 @@ void Token::readTokenInfo( void ) {
         /*CK_BBOOL _version =*/ Util::ReadBBoolFromVector( v, &idx );
 
         // label
-        std::auto_ptr< Marshaller::u1Array > label( Util::ReadByteArrayFromVector( v, &idx ) );
+        std::unique_ptr< u1Array > label( Util::ReadByteArrayFromVector( v, &idx ) );
 
         memset( m_TokenInfo.label, ' ', sizeof( m_TokenInfo.label ) );
 
@@ -446,6 +716,7 @@ void Token::createTokenInfo( void ) {
 }
 
 
+
 /*
 */
 /*
@@ -463,10 +734,10 @@ void Token::initializeTokenInfo( void ) {
 
     // Set the default label
     memset( m_TokenInfo.label, ' ', sizeof( m_TokenInfo.label ) );
-    m_TokenInfo.label[0] = '.';
-    m_TokenInfo.label[1] = 'N';
-    m_TokenInfo.label[2] = 'E';
-    m_TokenInfo.label[3] = 'T';
+    m_TokenInfo.label[0] = 'C';
+    m_TokenInfo.label[1] = 'a';
+    m_TokenInfo.label[2] = 'r';
+    m_TokenInfo.label[3] = 'd';
     m_TokenInfo.label[4] = ' ';
     m_TokenInfo.label[5] = '#';
     memcpy( &m_TokenInfo.label[6], m_TokenInfo.serialNumber, sizeof( m_TokenInfo.serialNumber ) );
@@ -483,19 +754,19 @@ void Token::initializeTokenInfo( void ) {
 
     // Set model
     memset( m_TokenInfo.model, ' ', sizeof( m_TokenInfo.model ) );
-    m_TokenInfo.model[0] = '.';
-    m_TokenInfo.model[1] = 'N';
-    m_TokenInfo.model[2] = 'E';
-    m_TokenInfo.model[3] = 'T';
-    m_TokenInfo.model[4] = ' ';
-    m_TokenInfo.model[5] = 'C';
-    m_TokenInfo.model[6] = 'a';
-    m_TokenInfo.model[7] = 'r';
-    m_TokenInfo.model[8] = 'd';
+    m_TokenInfo.model[0] = 'I';
+    m_TokenInfo.model[1] = 'D';
+    m_TokenInfo.model[2] = ' ';
+    m_TokenInfo.model[3] = 'P';
+    m_TokenInfo.model[4] = 'r';
+    m_TokenInfo.model[5] = 'i';
+    m_TokenInfo.model[6] = 'm';
+    m_TokenInfo.model[7] = 'e';
+    m_TokenInfo.model[8] = ' ';
 
     // Set flags
     m_TokenInfo.flags  =  CKF_LOGIN_REQUIRED | CKF_TOKEN_INITIALIZED | CKF_USER_PIN_INITIALIZED; // | CKF_RNG
-    
+
     try {
 
             if( !m_Device->isPinInitialized( ) ) {
@@ -561,13 +832,13 @@ void Token::setTokenInfo( void )
     memset( m_TokenInfo.serialNumber, ' ', sizeof( m_TokenInfo.serialNumber ) );
 
     // If serial number length is too big to fit in 16 (hex) digit field, then use the 8 first bytes of MD5 hash of the original serial number.
-    const Marshaller::u1Array* sn = NULL;
+    u1Array* sn = NULL;
 
     try {
 
         if( m_Device ) {
 
-            sn = m_Device->getSerialNumber( );
+            sn = (u1Array *) m_Device->getSerialNumber( );
         }
 
     } catch( MiniDriverException& x ) {
@@ -585,10 +856,11 @@ void Token::setTokenInfo( void )
 
         if( l > 8 ) {
 
-            CMD5 md5;
+            CDigest* md5 = CDigest::getInstance(CDigest::MD5);
             CK_BYTE hash[ 16 ];
-            md5.hashCore( p, 0, l );
-            md5.hashFinal( hash );
+            md5->hashUpdate( p, 0, l );
+            md5->hashFinal( hash );
+            delete md5;
             Util::ConvAscii( hash, 8, m_TokenInfo.serialNumber );
 
         } else {
@@ -597,20 +869,30 @@ void Token::setTokenInfo( void )
         }
     } else {
 
-        CK_CHAR emptySerialNumber[ ] = { 0x30, 0x30, 0x30, 0x30, 0x30, 0x30, 0x30, 0x30, 0x30, 0x30, 0x30, 0x30, 0x30, 0x30, 0x30, 0x30 }; 
+        CK_CHAR emptySerialNumber[ ] = { 0x30, 0x30, 0x30, 0x30, 0x30, 0x30, 0x30, 0x30, 0x30, 0x30, 0x30, 0x30, 0x30, 0x30, 0x30, 0x30 };
 
         memcpy( m_TokenInfo.serialNumber, emptySerialNumber, sizeof( emptySerialNumber ) );
     }
 
     // Set the default label
     memset( m_TokenInfo.label, ' ', sizeof( m_TokenInfo.label ) );
-    m_TokenInfo.label[0] = '.';
-    m_TokenInfo.label[1] = 'N';
-    m_TokenInfo.label[2] = 'E';
-    m_TokenInfo.label[3] = 'T';
+    m_TokenInfo.label[0] = 'C';
+    m_TokenInfo.label[1] = 'a';
+    m_TokenInfo.label[2] = 'r';
+    m_TokenInfo.label[3] = 'd';
     m_TokenInfo.label[4] = ' ';
     m_TokenInfo.label[5] = '#';
     memcpy( &m_TokenInfo.label[6], m_TokenInfo.serialNumber, sizeof( m_TokenInfo.serialNumber ) );
+
+    MiniDriverAuthentication::ROLES userRole = getUserRole();
+    if (MiniDriverAuthentication::PIN_USER != userRole)
+    {
+        // Add PIN type to the label of the virtual slot
+        std::string roleDesc = MiniDriverAuthentication::getRoleDescription(userRole);
+        m_TokenInfo.label[23] = '(';
+        memcpy(&m_TokenInfo.label[24], roleDesc.c_str(), min((int) roleDesc.length(), 6));
+        m_TokenInfo.label[24 + min((int) roleDesc.length(), 6)] = ')';
+    }
 
     // Try to read the token information from the smart card (only read the label)
     try {
@@ -635,30 +917,53 @@ void Token::setTokenInfo( void )
 
     // Set model
     memset( m_TokenInfo.model, ' ', sizeof( m_TokenInfo.model ) );
-    m_TokenInfo.model[0] = '.';
-    m_TokenInfo.model[1] = 'N';
-    m_TokenInfo.model[2] = 'E';
-    m_TokenInfo.model[3] = 'T';
-    m_TokenInfo.model[4] = ' ';
-    m_TokenInfo.model[5] = 'C';
-    m_TokenInfo.model[6] = 'a';
-    m_TokenInfo.model[7] = 'r';
-    m_TokenInfo.model[8] = 'd';
+    m_TokenInfo.model[0] = 'I';
+    m_TokenInfo.model[1] = 'D';
+    m_TokenInfo.model[2] = ' ';
+    m_TokenInfo.model[3] = 'P';
+    m_TokenInfo.model[4] = 'r';
+    m_TokenInfo.model[5] = 'i';
+    m_TokenInfo.model[6] = 'm';
+    m_TokenInfo.model[7] = 'e';
+    m_TokenInfo.model[8] = ' ';
 
     // Set flags
     m_TokenInfo.flags  = /*CKF_RNG |*/ CKF_LOGIN_REQUIRED | CKF_TOKEN_INITIALIZED /*| CKF_USER_PIN_INITIALIZED*/;
+    MiniDriverAuthentication::ROLES role = getUserRole();
 
     try {
 
         if( m_Device && m_pSlot ) {
 
-            Log::log( "Token::Token - No Pin <%d>", m_Device->isNoPin( ) );
-            Log::log( "Token::Token - SSO <%d>", m_Device->isSSO( ) );
-            Log::log( "Token::Token - External <%d>", m_Device->isExternalPin( ) );
-            Log::log( "Token::Token - isAuthenticated <%d>", m_pSlot->isAuthenticated( ) );
-            Log::log( "Token::Token - isReadOnly <%d>", m_Device->isReadOnly( ) );
-            Log::log( "Token::Token - isPinInitialized <%d>", m_Device->isPinInitialized( ) );
-            Log::log( "Token::Token - isVerifyPinSecured <%d>", m_Device->isVerifyPinSecured( ) );
+            if (Log::s_bEnableLog)
+            {
+                Log::log( "Token::Token - No Pin <%d>", m_Device->isNoPin( role ) );
+                Log::log( "Token::Token - SSO <%d>", m_Device->isSSO( role ) );
+                Log::log( "Token::Token - External <%d>", m_Device->isExternalPin( role ) );
+                Log::log( "Token::Token - isAuthenticated <%d>", m_pSlot->isAuthenticated( ) );
+                Log::log( "Token::Token - isReadOnly <%d>", m_Device->isReadOnly( ) );
+                Log::log( "Token::Token - isPinInitialized <%d>", m_Device->isPinInitialized( getUserRole()) );
+                Log::log( "Token::Token - isVerifyPinSecured <%d>", m_Device->isVerifyPinSecured( ) );
+				Log::log( "Token::Token - isDotNetCard <%d>", m_Device->isDotNetCard( ) );
+            }
+
+			// update the module of the card in token info
+			if (m_Device->isDotNetCard())
+			{
+				m_TokenInfo.model[ 9] = '.';
+				m_TokenInfo.model[10] = 'N';
+				m_TokenInfo.model[11] = 'E';
+				m_TokenInfo.model[12] = 'T';
+			}
+			else
+			{
+				m_TokenInfo.model[ 9] = 'M';
+				m_TokenInfo.model[10] = 'D';
+			}
+
+			// Set RNG flag to MD cards
+			if (!m_Device->isDotNetCard())
+				m_TokenInfo.flags  |= CKF_RNG;
 
             if( m_Device->isReadOnly( ) ) {
 
@@ -666,30 +971,27 @@ void Token::setTokenInfo( void )
                 m_TokenInfo.flags |= CKF_WRITE_PROTECTED;
             }
 
-            if( m_Device->isPinInitialized( ) ) {
+            if( m_Device->isPinInitialized( role ) ) {
 
                 Log::log( "Token::setTokenInfo - Enable CKF_USER_PIN_INITIALIZED" );
                 m_TokenInfo.flags |= CKF_USER_PIN_INITIALIZED;
             }
 
             // Is login required ?
-            if(  m_Device->isNoPin( ) || ( m_Device->isSSO( ) && m_pSlot->isAuthenticated( ) ) ) {
+            if(  m_Device->isNoPin( role ) || ( m_Device->isSSO( role ) && m_pSlot->isAuthenticated( ) ) ) {
 
                 m_TokenInfo.flags &= ~CKF_LOGIN_REQUIRED;
                 Log::log( "Token::setTokenInfo - No login required" );
             }
 
             // Check if the CKF_PROTECTED_AUTHENTICATION_PATH flag must be raised
-//            if( m_Device->isExternalPin( ) || ( ( m_Device->isModePinOnly( ) && m_Device->isVerifyPinSecured( ) ) || m_Device->isModeNotPinOnly( ) ) ) 
-            if(  (  (m_Device->isExternalPin()) 
-                  &&(m_Device->isVerifyPinSecured())
-                 )
-               ||(m_Device->isModeNotPinOnly())
-              ) 
+            if ( isRoleUsingProtectedAuthenticationPath( role ) )
             {
                 Log::log( "Token::setTokenInfo - Enable CKF_PROTECTED_AUTHENTICATION_PATH" );
                 m_TokenInfo.flags  |= CKF_PROTECTED_AUTHENTICATION_PATH;
             }
+
+            updatePinFlags();
         }
 
     } catch( MiniDriverException& x ) {
@@ -709,9 +1011,16 @@ void Token::setTokenInfo( void )
     try {
         if( m_Device ) {
 
-            m_TokenInfo.ulMaxPinLen = m_Device->getPinMaxPinLength( );
-
-            m_TokenInfo.ulMinPinLen = m_Device->getPinMinPinLength( );
+            if ( !m_Device->isNoPin( role ))
+            {
+                m_TokenInfo.ulMaxPinLen = m_Device->getPinMaxPinLength( role );
+                m_TokenInfo.ulMinPinLen = m_Device->getPinMinPinLength( role );
+            }
+            else
+            {
+                m_TokenInfo.ulMaxPinLen = CK_UNAVAILABLE_INFORMATION;
+                m_TokenInfo.ulMinPinLen = CK_UNAVAILABLE_INFORMATION;
+            }
         }
 
     } catch( MiniDriverException& x ) {
@@ -731,7 +1040,7 @@ void Token::setTokenInfo( void )
     m_TokenInfo.hardwareVersion.major  = 0;
     m_TokenInfo.hardwareVersion.minor  = 0;
 
-    // Set the version of Card Module applicaton
+    // Set the version of Card Module application
     m_TokenInfo.firmwareVersion.major  = 0;
     m_TokenInfo.firmwareVersion.minor  = 0;
 
@@ -742,7 +1051,7 @@ void Token::setTokenInfo( void )
 
 /*
 */
-void Token::authenticateUser( Marshaller::u1Array* a_pPin ) {
+void Token::authenticateUser( u1Array* a_pPin ) {
 
     Log::begin( "Token::authenticateUser" );
     Timer t;
@@ -755,7 +1064,7 @@ void Token::authenticateUser( Marshaller::u1Array* a_pPin ) {
 
     try {
 
-        m_Device->verifyPin( a_pPin );
+        m_Device->verifyPin( getUserRole(), a_pPin );
 
         m_TokenInfo.flags &= ~CKF_USER_PIN_LOCKED;
         m_TokenInfo.flags &= ~CKF_USER_PIN_FINAL_TRY;
@@ -777,6 +1086,60 @@ void Token::authenticateUser( Marshaller::u1Array* a_pPin ) {
 
 /*
 */
+void Token::updatePinFlags()
+{
+    if (m_Device)
+    {
+        int userTriesRemaining, soTriesRemaining;
+
+        try {
+
+            if (m_TokenInfo.flags & CKF_LOGIN_REQUIRED)
+            {
+                userTriesRemaining = m_Device->getTriesRemaining( getUserRole() );
+                // Update the token information structure
+                if( 0 == userTriesRemaining ) {
+
+                    // PIN is blocked
+                    m_TokenInfo.flags |= CKF_USER_PIN_LOCKED;
+                    m_TokenInfo.flags &= ~CKF_USER_PIN_FINAL_TRY;
+                    m_TokenInfo.flags &= ~CKF_USER_PIN_COUNT_LOW;
+                } else if( 1 == userTriesRemaining ) {
+
+                    // Last retry
+                    m_TokenInfo.flags &= ~CKF_USER_PIN_LOCKED;
+                    m_TokenInfo.flags |= CKF_USER_PIN_FINAL_TRY;
+                    m_TokenInfo.flags &= ~CKF_USER_PIN_COUNT_LOW;
+                }
+            }
+
+            MiniDriverAuthentication::ROLES unblockRole = m_Device->getPinUnblockRole(getUserRole());
+            if ( unblockRole == MiniDriverAuthentication::PIN_ADMIN)
+                soTriesRemaining = m_Device->administratorGetTriesRemaining( );
+            else
+                soTriesRemaining = m_Device->getTriesRemaining( unblockRole );
+            if( 0 == soTriesRemaining ) {
+
+                // Admin key/PUK is blocked
+                m_TokenInfo.flags |= CKF_SO_PIN_LOCKED;
+                m_TokenInfo.flags &= ~CKF_SO_PIN_FINAL_TRY;
+                m_TokenInfo.flags &= ~CKF_SO_PIN_COUNT_LOW;
+            } else if( 1 == soTriesRemaining ) {
+                // Last retry
+                m_TokenInfo.flags &= ~CKF_SO_PIN_LOCKED;
+                m_TokenInfo.flags |= CKF_SO_PIN_FINAL_TRY;
+                m_TokenInfo.flags &= ~CKF_SO_PIN_COUNT_LOW;
+            }
+        } catch( MiniDriverException& ) {
+
+            Log::error( "Token::updatePinFlags", "MiniDriverException" );
+        }
+
+    }
+}
+
+/*
+*/
 void Token::checkAuthenticationStatus( CK_ULONG a_ulRole, MiniDriverException& a_Exception ) {
 
     switch( a_Exception.getError( ) ) {
@@ -789,7 +1152,7 @@ void Token::checkAuthenticationStatus( CK_ULONG a_ulRole, MiniDriverException& a
 
             try {
 
-                triesRemaining = ( ( CKU_USER == a_ulRole ) ? m_Device->getTriesRemaining( ) : m_Device->administratorGetTriesRemaining( ) );                  
+                triesRemaining = ( ( CKU_USER == a_ulRole ) ? m_Device->getTriesRemaining( getUserRole() ) : m_Device->administratorGetTriesRemaining( ) );
 
             } catch( MiniDriverException& x ) {
 
@@ -836,8 +1199,8 @@ void Token::checkAuthenticationStatus( CK_ULONG a_ulRole, MiniDriverException& a
                 if( CKU_USER == a_ulRole ) {
 
                     m_TokenInfo.flags &= ~CKF_USER_PIN_LOCKED;
-                    m_TokenInfo.flags |= CKF_USER_PIN_FINAL_TRY;
-                    m_TokenInfo.flags &= ~CKF_USER_PIN_COUNT_LOW;
+                    m_TokenInfo.flags &= ~CKF_USER_PIN_FINAL_TRY;
+                    m_TokenInfo.flags |= CKF_USER_PIN_COUNT_LOW;
 
                 } else {
 
@@ -864,7 +1227,7 @@ void Token::checkAuthenticationStatus( CK_ULONG a_ulRole, MiniDriverException& a
 
 /*
 */
-void Token::authenticateAdmin( Marshaller::u1Array* a_pPin ) {
+void Token::authenticateAdmin( u1Array* a_pPin ) {
 
     Log::begin( "Token::authenticateAdmin" );
     Timer t;
@@ -912,8 +1275,7 @@ void Token::logout( void ) {
     try {
 
         if( m_pSlot->isAuthenticated( ) ) {
-
-            m_Device->logOut( );
+            m_Device->logOut( getUserRole() , true);
 
         } else if( m_pSlot->administratorIsAuthenticated( ) ) {
 
@@ -923,7 +1285,7 @@ void Token::logout( void ) {
 
             Log::log( "Token::logout - user not logged in" );
             throw PKCS11Exception( CKR_USER_NOT_LOGGED_IN );
-        }    
+        }
 
     } catch( MiniDriverException& x ) {
 
@@ -937,7 +1299,7 @@ void Token::logout( void ) {
 
 /*
 */
-void Token::login( const CK_ULONG& a_ulUserType, Marshaller::u1Array* a_pPin ) {
+void Token::login( const CK_ULONG& a_ulUserType, u1Array* a_pPin ) {
 
     Log::begin( "Token::login" );
     Timer t;
@@ -960,6 +1322,12 @@ void Token::login( const CK_ULONG& a_ulUserType, Marshaller::u1Array* a_pPin ) {
             if( m_pSlot->administratorIsAuthenticated( ) ) {
 
                 throw PKCS11Exception( CKR_USER_ANOTHER_ALREADY_LOGGED_IN );
+            }
+
+            if (m_Device->isPinExpired(getUserRole()))
+            {
+               m_TokenInfo.flags &= ~CKF_USER_PIN_INITIALIZED;
+               throw PKCS11Exception( CKR_USER_PIN_NOT_INITIALIZED );
             }
 
             if( m_pSlot->isAuthenticated( ) ) {
@@ -986,8 +1354,11 @@ void Token::login( const CK_ULONG& a_ulUserType, Marshaller::u1Array* a_pPin ) {
             }
 
             if( !m_pSlot->administratorIsAuthenticated( ) ) {
-
+				MiniDriverAuthentication::ROLES unblockRole = m_Device->getPinUnblockRole(getUserRole());
+				if ( unblockRole == MiniDriverAuthentication::PIN_ADMIN)
                 authenticateAdmin( a_pPin );
+				else
+					m_Device->verifyPin( unblockRole,a_pPin);
 
                 m_pSlot->setUserType( a_ulUserType );
             }
@@ -1011,9 +1382,11 @@ void Token::login( const CK_ULONG& a_ulUserType, Marshaller::u1Array* a_pPin ) {
             m_ObjectsToCreate.clear( );
 
             synchronizeObjects( );
-        } 
+        }
 
-        BOOST_FOREACH( StorageObject* p, m_ObjectsToCreate ) {
+        // BOOST_FOREACH( StorageObject* p, m_ObjectsToCreate ) {
+		for (std::vector<StorageObject*>::iterator iter = m_ObjectsToCreate.begin () ; iter != m_ObjectsToCreate.end (); ++iter) {
+			StorageObject* p = (StorageObject*)*iter;
 
             Log::log( "Token::login - *** CREATE LATER *** <%s>", p->m_stFileName.c_str( ) );
 
@@ -1032,16 +1405,28 @@ void Token::login( const CK_ULONG& a_ulUserType, Marshaller::u1Array* a_pPin ) {
         synchronizePrivateObjects( );
         //}
 
-    } catch( ... ) { 
+    } catch( ... ) {
 
     }
 
-    if( !Log::s_bEnableLog ) {
+    if( Log::s_bEnableLog ) {
 
         Log::log(" Token::login - <<<<< P11 OBJ LIST >>>>>");
         BOOST_FOREACH( const TOKEN_OBJECTS::value_type& o, m_Objects ) { printObject( o.second ); }
         Log::log(" Token::login - <<<<< P11 OBJ LIST >>>>>");
     }
+
+    if (a_pPin && (a_pPin->GetLength() != 0))
+	{
+		if (CKU_USER == a_ulUserType)
+			m_Device->logOut( getUserRole() , false);
+		if (CKU_SO == a_ulUserType)
+		{
+			MiniDriverAuthentication::ROLES unblockRole = m_Device->getPinUnblockRole(getUserRole());
+			if ( unblockRole != MiniDriverAuthentication::PIN_ADMIN)
+				m_Device->logOut( unblockRole , false);
+		}
+	}
 
     t.stop( "Token::login" );
     Log::end( "Token::login" );
@@ -1056,6 +1441,20 @@ void Token::generateRandom( CK_BYTE_PTR a_pRandomData, const CK_ULONG& a_ulLen )
     Timer t;
     t.start( );
 
+    if( !m_Device ) {
+
+        throw PKCS11Exception( CKR_TOKEN_NOT_PRESENT );
+    }
+
+    try {
+
+        // Initialize the PIN
+        m_Device->GetRandom((unsigned char*) a_pRandomData, (unsigned int) a_ulLen);
+
+    } catch( ... ) {
+
+		 // fallback to software random
+
     // Initialize the range from the 0 to 255 for the generator
     boost::uniform_smallint< > range( 0, 255 );
 
@@ -1066,6 +1465,7 @@ void Token::generateRandom( CK_BYTE_PTR a_pRandomData, const CK_ULONG& a_ulLen )
     for( CK_ULONG i = 0 ; i < a_ulLen ; ++i ) {
 
         a_pRandomData[ i ] = (CK_BYTE)generator( );
+    }
     }
 
     t.stop( "Token::generateRandom" );
@@ -1093,14 +1493,14 @@ void Token::findObjects( Session* a_pSession, CK_OBJECT_HANDLE_PTR a_phObject, c
     // For each P11 object
     BOOST_FOREACH( const TOKEN_OBJECTS::value_type& o, m_Objects ) {
 
-        // Check if the search has reached the allowed maximum of objects to search 
+        // Check if the search has reached the allowed maximum of objects to search
         if( *a_pulObjectCount >= a_ulMaxObjectCount ) {
 
             break;
         }
 
         // Check if this object has been already compared to the search template
-        if( m_TokenObjectsReturnedInSearch.end( ) != m_TokenObjectsReturnedInSearch.find( o->first ) ) {
+        if( a_pSession->m_TokenObjectsReturnedInSearch.end( ) != a_pSession->m_TokenObjectsReturnedInSearch.find( o->first ) ) {
 
             // This object has already been analysed by a previous call of findObjects for this template
             continue;
@@ -1109,13 +1509,13 @@ void Token::findObjects( Session* a_pSession, CK_OBJECT_HANDLE_PTR a_phObject, c
         // If the object is private and the user is not logged in
         if( ( !bUserAuthenticated ) && o->second->isPrivate( ) )
         {
-            // Then avoid this element. 
+            // Then avoid this element.
             // Do not add it the list of already explored objects (may be a C_Login can occur)
             continue;
         }
 
         // Add the object to the list of the objects compared to the search template
-        m_TokenObjectsReturnedInSearch.insert( o->first );
+        a_pSession->m_TokenObjectsReturnedInSearch.insert( o->first );
 
         // If the template is NULL then return all objects
         if( !a_pSession->_searchTempl ) {
@@ -1191,7 +1591,7 @@ void Token::computeObjectFileName( StorageObject* a_pObject, std::string& a_stFi
     }
 
     a_stFileName = stName;
-    
+
     Log::log( "Token::computeObjectFileName - Name <%s>", a_stFileName.c_str( ) );
     t.stop( "Token::computeObjectFileName" );
     Log::end( "Token::computeObjectFileName" );
@@ -1209,9 +1609,9 @@ void Token::computeObjectNameData( std::string& a_stFileName, /*const*/ StorageO
     a_stFileName.append( g_stPrefixData );
 
     MiniDriverFiles::FILES_NAME filesPKCS11;
-    
+
     if( !m_bCreateDirectoryP11 ) {
-        
+
         filesPKCS11 = m_Device->enumFiles( g_stPathPKCS11 );
     }
 
@@ -1220,16 +1620,16 @@ void Token::computeObjectNameData( std::string& a_stFileName, /*const*/ StorageO
     std::string s;
 
     do {
-        
+
         s = a_stFileName;
-        
+
         incrementObjectIndex( );
 
         // Add the index of the data object
         Util::toStringHex( m_uiObjectIndex, s );
 
         if( isObjectNameValid( s, filesPKCS11 ) ) {
-        
+
             bGoodNameFound = true;
 
             a_stFileName = s;
@@ -1245,12 +1645,12 @@ bool Token::isObjectNameValid( const std::string& a_stFileName, const MiniDriver
 
     bool bReturn = true;
 
-    BOOST_FOREACH( const std::string& s, a_filesList ) {
+    // BOOST_FOREACH( const std::string& s, a_filesList ) {
+	for (MiniDriverFiles::FILES_NAME::iterator iter = a_filesList.begin () ; iter != a_filesList.end (); ++iter) {
+		std::string& s = (std::string&)*iter;
 
         if( s.compare( a_stFileName ) == 0 ) {
-
             bReturn = false;
-
             break;
         }
     }
@@ -1272,9 +1672,9 @@ void Token::computeObjectNamePublicKey( std::string& a_stFileName, /*const*/ Sto
     unsigned char ucContainerIndex = ( (Pkcs11ObjectKeyPublicRSA*) a_pObject )->m_ucContainerIndex;
 
     MiniDriverFiles::FILES_NAME filesPKCS11;
-    
+
     if( !m_bCreateDirectoryP11 ) {
-        
+
         filesPKCS11 = m_Device->enumFiles( g_stPathPKCS11 );
     }
 
@@ -1293,16 +1693,16 @@ void Token::computeObjectNamePublicKey( std::string& a_stFileName, /*const*/ Sto
 
         // In the case of the public is created before te private key, there is no container index available
         do {
-        
+
             s = a_stFileName;
-        
+
             incrementObjectIndex( );
 
             // Add the index of the data object
             Util::toStringHex( uiStartIndex + m_uiObjectIndex, s );
 
             if( isObjectNameValid( s, filesPKCS11 ) ) {
-        
+
                 bGoodNameFound = true;
 
                 a_stFileName = s;
@@ -1337,7 +1737,7 @@ void Token::computeObjectNameCertificate( std::string& a_stFileName, /*const*/ S
     // Add the public or private prefix
     a_stFileName = ( a_pObject->isPrivate( ) ? g_stPrefixPrivateObject : g_stPrefixPublicObject );
 
-    a_stFileName.append( a_pObject->m_stFileName );
+    a_stFileName.append( ((CertificateObject*) a_pObject)->m_stCertificateName );
 }
 
 
@@ -1361,7 +1761,8 @@ void Token::writeObject( StorageObject* a_pObject ) {
     std::vector< unsigned char > to;
     a_pObject->serialize( &to );
 
-    Marshaller::u1Array o( to );
+    u1Array o(to.size());
+    o.SetBuffer(&to[0]);
 
     try {
 
@@ -1375,12 +1776,12 @@ void Token::writeObject( StorageObject* a_pObject ) {
             try {
 
                 // If the user is authenticated then create the file on card
-                m_Device->createFile( g_stPathPKCS11, a_pObject->m_stFileName, a_pObject->isPrivate( ) );
+                m_Device->createFile( g_stPathPKCS11, a_pObject->m_stFileName, a_pObject->isPrivate( )  && (CKO_PRIVATE_KEY != a_pObject->getClass()) );
 
             } catch( MiniDriverException& e ) {
 
                 // The file may be already created. In this case the file must only be written.
-                // It could be the case for the public key which is created 
+                // It could be the case for the public key which is created
                 // but not deleted by the application (for example Firefox)
                 if( SCARD_E_WRITE_TOO_MANY != e.getError( ) ) {
 
@@ -1394,7 +1795,16 @@ void Token::writeObject( StorageObject* a_pObject ) {
                 m_Device->cacheDisable( a_pObject->m_stFileName );
             }
 
-            m_Device->writeFile( g_stPathPKCS11, a_pObject->m_stFileName, &o );
+			try
+			{
+				m_Device->writeFile( g_stPathPKCS11, a_pObject->m_stFileName, &o );
+			}
+			catch(MiniDriverException& x)
+			{
+				Log::log( "Token::writeObject - exception occured while writing <%s>. Deleting it.", a_pObject->m_stFileName.c_str( ) );
+				m_Device->deleteFile(g_stPathPKCS11, a_pObject->m_stFileName);
+				throw x;
+			}
 
             Log::log( "Token::writeObject - Create & write <%s>", a_pObject->m_stFileName.c_str( ) );
 
@@ -1438,7 +1848,7 @@ void Token::addObject( StorageObject* a_pObject, CK_OBJECT_HANDLE_PTR a_pHandle,
         // Add the object into the list of managed objects
         if( a_bRegisterObject ) {
 
-            *a_pHandle = registerStorageObject( a_pObject );
+            *a_pHandle = registerStorageObject( a_pObject , false); // don't check existence since we have just created a new filename for it and thus it is unique
         }
 
     } catch( MiniDriverException &x ) {
@@ -1453,7 +1863,7 @@ void Token::addObject( StorageObject* a_pObject, CK_OBJECT_HANDLE_PTR a_pHandle,
 
 /* AddPrivateKeyObject
 */
-void Token::addObjectPrivateKey( RSAPrivateKeyObject* a_pObject, CK_OBJECT_HANDLE_PTR a_phObject ) {
+void Token::addObjectPrivateKey( PrivateKeyObject* a_pObject, CK_OBJECT_HANDLE_PTR a_phObject ) {
 
     Log::begin( "Token::addObjectPrivateKey" );
     Timer t;
@@ -1463,6 +1873,10 @@ void Token::addObjectPrivateKey( RSAPrivateKeyObject* a_pObject, CK_OBJECT_HANDL
 
         throw PKCS11Exception( CKR_TOKEN_NOT_PRESENT );
     }
+    else if (m_Device->isReadOnly())
+    {
+        throw PKCS11Exception( CKR_TOKEN_WRITE_PROTECTED );
+    }
 
     // No private key for public object
     if( !a_pObject->isPrivate( ) ) {
@@ -1470,274 +1884,403 @@ void Token::addObjectPrivateKey( RSAPrivateKeyObject* a_pObject, CK_OBJECT_HANDL
         throw PKCS11Exception( CKR_ATTRIBUTE_VALUE_INVALID );
     }
 
+    u1Array* pPublicKeyValue = NULL;
+    if (a_pObject->_keyType == CKK_RSA)
+	{
+		RSAPrivateKeyObject* pRsaPrvKey = (RSAPrivateKeyObject*) a_pObject;
+        pPublicKeyValue = pRsaPrvKey->m_pModulus.get();
+		if (	pRsaPrvKey->m_pPublicExponent.get()
+			&&  !Util::compareArraysAsBigIntegers(pRsaPrvKey->m_pPublicExponent.get(), (const unsigned char*) "\x01\x00\x01", 3)
+		   )
+		{
+			throw PKCS11Exception( CKR_ATTRIBUTE_VALUE_INVALID );
+		}
+	}
+    else
+    {
+        ((ECCPrivateKeyObject*) a_pObject)->computePublicPoint();
+        pPublicKeyValue = ((ECCPrivateKeyObject*) a_pObject)->m_pPublicPoint.get();
+    }
+
     // Public key modulus is mandatory
-    if( !a_pObject->m_pModulus ) {
+    if( !pPublicKeyValue) {
 
         throw PKCS11Exception( CKR_TEMPLATE_INCOMPLETE );
     }
 
-    // Check the modulus length
-    unsigned int uiModulusLength = a_pObject->m_pModulus->GetLength( );
+    if (a_pObject->_keyType == CKK_RSA)
+    {
+        RSAPrivateKeyObject* rsaKey = (RSAPrivateKeyObject*) a_pObject;
+        // Check the modulus length
+        unsigned int uiModulusLength = rsaKey->m_pModulus->GetLength( );
+		int minRsa = 1024, maxRsa = 2048, minRsaGen = 0, maxRsaGen = 0;
+		m_Device->getRSAMinMax(minRsa, maxRsa, minRsaGen, maxRsaGen, getUserRole());
 
-    if( ( ( uiModulusLength * 8 ) < MiniDriver::s_iMinLengthKeyRSA ) || ( (uiModulusLength * 8 ) > MiniDriver::s_iMaxLengthKeyRSA ) ) {
+        if( ( ( uiModulusLength * 8 ) < (unsigned int) minRsa ) || ( (uiModulusLength * 8 ) > (unsigned int) maxRsa ) ) {
 
-        throw PKCS11Exception( CKR_ATTRIBUTE_VALUE_INVALID );
+            throw PKCS11Exception( CKR_ATTRIBUTE_VALUE_INVALID );
+        }
+
+        // Get the middle size
+        unsigned int uiKeyHalfSize = uiModulusLength / 2;
+
+        // Check the Prime P (PKCS11 prime 1 attribute) size
+        unsigned int uiPrimePLength = rsaKey->m_pPrime1->GetLength( );
+
+        if( uiPrimePLength > uiKeyHalfSize ) {
+
+            throw PKCS11Exception( CKR_ATTRIBUTE_VALUE_INVALID );
+        }
+
+        if( uiPrimePLength < uiKeyHalfSize ) {
+
+            // Pad with zeros in the front since big endian
+            u1Array* val = new u1Array( uiKeyHalfSize );
+
+            memset( val->GetBuffer( ), 0, uiKeyHalfSize );
+
+            size_t i = uiKeyHalfSize - uiPrimePLength;
+
+            memcpy( val->GetBuffer( ) + i, rsaKey->m_pPrime1->GetBuffer( ), uiPrimePLength );
+
+            rsaKey->m_pPrime1.reset( val );
+
+            uiPrimePLength = uiKeyHalfSize;
+        }
+
+        // Check the Prime Q (PKCS11 prime 2 attribute) size
+        unsigned int uiPrimeQLength = rsaKey->m_pPrime2->GetLength( );
+
+        if( uiPrimeQLength > uiKeyHalfSize ) {
+
+            throw PKCS11Exception( CKR_ATTRIBUTE_VALUE_INVALID );
+        }
+
+        if( uiPrimeQLength < uiKeyHalfSize ) {
+
+            // Pad with zeros in the front since big endian
+            u1Array* val = new u1Array( uiKeyHalfSize );
+
+            memset( val->GetBuffer( ), 0, uiKeyHalfSize );
+
+            size_t i = uiKeyHalfSize - uiPrimeQLength;
+
+            memcpy( val->GetBuffer( ) + i, rsaKey->m_pPrime2->GetBuffer( ), uiPrimeQLength );
+
+            rsaKey->m_pPrime2.reset( val );
+
+            uiPrimeQLength = uiKeyHalfSize;
+        }
+
+        // Check the Inverse Q (PKCS11 coefficient attribute) size
+        unsigned int uiInverseQLength = rsaKey->m_pCoefficient->GetLength( );
+
+        if( uiInverseQLength > uiKeyHalfSize ) {
+
+            throw PKCS11Exception( CKR_ATTRIBUTE_VALUE_INVALID );
+        }
+
+        if( uiInverseQLength < uiKeyHalfSize ) {
+
+            // Pad with zeros in the front since big endian
+            u1Array* val = new u1Array( uiKeyHalfSize );
+
+            memset( val->GetBuffer( ), 0, uiKeyHalfSize );
+
+            size_t i = uiKeyHalfSize - uiInverseQLength;
+
+            memcpy( val->GetBuffer( ) + i, rsaKey->m_pCoefficient->GetBuffer( ), uiInverseQLength );
+
+            rsaKey->m_pCoefficient.reset( val );
+
+            uiInverseQLength = uiKeyHalfSize;
+        }
+
+        // Check the DP Length (PKCS11 CKA_EXPONENT_1 attribute) size
+        unsigned int uiDPLength = rsaKey->m_pExponent1->GetLength( );
+
+        if( uiDPLength > uiKeyHalfSize ) {
+
+            throw PKCS11Exception( CKR_ATTRIBUTE_VALUE_INVALID );
+        }
+
+        if( uiDPLength < uiKeyHalfSize ) {
+
+            // Pad with zeros in the front since big endian
+            u1Array* val = new u1Array( uiKeyHalfSize );
+
+            memset( val->GetBuffer( ), 0, uiKeyHalfSize );
+
+            size_t i = uiKeyHalfSize - uiDPLength;
+
+            memcpy( val->GetBuffer( ) + i, rsaKey->m_pExponent1->GetBuffer( ), uiDPLength );
+
+            rsaKey->m_pExponent1.reset( val );
+
+            uiDPLength = uiKeyHalfSize;
+        }
+
+        // Check the DQ Length (PKCS11 CKA_EXPONENT_2 attribute) size
+        unsigned int uiDQLength = rsaKey->m_pExponent2->GetLength( );
+
+        if( uiDQLength > uiKeyHalfSize ) {
+
+            throw PKCS11Exception( CKR_ATTRIBUTE_VALUE_INVALID );
+        }
+
+        if( uiDQLength < uiKeyHalfSize ) {
+
+            // Pad with zeros in the front since big endian
+            u1Array* val = new u1Array( uiKeyHalfSize );
+
+            memset( val->GetBuffer( ), 0, uiKeyHalfSize );
+
+            size_t i = uiKeyHalfSize - uiDQLength;
+
+            memcpy( val->GetBuffer( ) + i, rsaKey->m_pExponent2->GetBuffer( ), uiDQLength );
+
+            rsaKey->m_pExponent2.reset( val );
+
+            uiDQLength = uiKeyHalfSize;
+        }
+
+        // Check the Private Exponent Length (PKCS11 CKA_PRIVATE_EXPONENT attribute) size
+        unsigned int uiPrivateExponentLength = rsaKey->m_pPrivateExponent->GetLength( );
+
+        if( uiPrivateExponentLength > uiModulusLength ) {
+
+            throw PKCS11Exception( CKR_ATTRIBUTE_VALUE_INVALID );
+        }
+
+        if( uiPrivateExponentLength < uiModulusLength ) {
+
+            // Pad with zeros in the front since big endian
+            u1Array* val = new u1Array( uiModulusLength );
+
+            memset( val->GetBuffer( ), 0, uiPrivateExponentLength );
+
+            size_t i = uiModulusLength - uiPrivateExponentLength;
+
+            memcpy( val->GetBuffer( ) + i, rsaKey->m_pPrivateExponent->GetBuffer( ), uiPrivateExponentLength );
+
+            rsaKey->m_pPrivateExponent.reset( val );
+
+            uiPrivateExponentLength = uiModulusLength;
+        }
+
+        // Check the public exponent size
+        unsigned int uiPublicExponentLength = rsaKey->m_pPublicExponent->GetLength( );
+
+        if( ( uiPublicExponentLength < 1 ) || ( uiPublicExponentLength > 4 ) ) {
+
+            throw PKCS11Exception( CKR_ATTRIBUTE_VALUE_INVALID );
+        }
+
+        // Check the public key exponent size
+        u1Array* pPublicExponent = rsaKey->m_pPublicExponent.get( );
+
+        if( uiPublicExponentLength < 4 ) {
+
+            // Pad with zeros in the front since big endian
+            pPublicExponent = new u1Array( 4 );
+
+            memset( pPublicExponent->GetBuffer( ), 0, 4 );
+
+            size_t i = 4 - uiPublicExponentLength;
+
+            memcpy( pPublicExponent->GetBuffer( ) + i, rsaKey->m_pPublicExponent->GetBuffer( ), uiPublicExponentLength );
+
+            uiPublicExponentLength = 4;
+        }
+
+        //if( uiPublicExponentLength < 4 ) {
+
+        //    // Pad with zeros in the front since big endian
+        //    u1Array* exp = new u1Array( 4 );
+
+        //    memset( exp->GetBuffer( ), 0, 4 );
+
+        //    size_t i = 4 - uiPublicExponentLength;
+
+        //    memcpy( exp->GetBuffer( ) + i, rsaKey->m_pPublicExponent->GetBuffer( ), uiPublicExponentLength );
+
+        //    rsaKey->m_pPublicExponent.reset( exp );
+
+        //    uiPublicExponentLength = 4;
+        //}
+
+        // compute the total length;
+        unsigned int uiKeyLength = uiPrimePLength + uiPrimeQLength + uiInverseQLength + uiDPLength + uiDQLength + uiPrivateExponentLength + uiModulusLength + 4;
+
+        // Prepare the keyValue
+        u1Array keyValue( uiKeyLength );
+
+        unsigned char* p = keyValue.GetBuffer( );
+
+        memset( p, 0, uiKeyLength );
+
+        // Add the Prime P
+        memcpy( p, rsaKey->m_pPrime1->GetBuffer( ), uiPrimePLength );
+
+        int offset = uiPrimePLength;
+
+        // Add the the Prime Q
+        memcpy( p + offset, rsaKey->m_pPrime2->GetBuffer( ), uiPrimeQLength );
+
+        offset += uiPrimeQLength;
+
+        // Add the inverse Q
+        memcpy( p + offset, rsaKey->m_pCoefficient->GetBuffer( ), uiInverseQLength );
+
+        offset += uiInverseQLength;
+
+        // Add the DP
+        memcpy( p + offset, rsaKey->m_pExponent1->GetBuffer( ), uiDPLength );
+
+        offset += uiDPLength;
+
+        // Add the DQ
+        memcpy( p + offset, rsaKey->m_pExponent2->GetBuffer( ), uiDQLength );
+
+        offset += uiDQLength;
+
+        // Addt he private exponent D
+        memcpy( p + offset, rsaKey->m_pPrivateExponent->GetBuffer( ), uiPrivateExponentLength );
+
+        offset += uiPrivateExponentLength;
+
+        // Add the modulus
+        memcpy( p + offset, rsaKey->m_pModulus->GetBuffer( ), uiModulusLength );
+
+        offset += uiModulusLength;
+
+        // Add the public exponent
+        //memcpy( p + offset, rsaKey->m_pPublicExponent->GetBuffer( ), uiPublicExponentLength );
+        memcpy( p + offset, pPublicExponent->GetBuffer( ), uiPublicExponentLength );
+
+        // Specify what is able to do the key (sign only or sign & decrypt)
+        rsaKey->m_ucKeySpec = (unsigned char)( rsaKey->_decrypt ? MiniDriverContainer::KEYSPEC_EXCHANGE : MiniDriverContainer::KEYSPEC_SIGNATURE );
+
+        // Create the on card key container
+        // This method checks if a certificate with the same public key exists.
+        // In this case this new key must be imported into the key container already associated with this certificate and the key spec is also updated
+        rsaKey->m_ucContainerIndex = MiniDriverContainerMapFile::CONTAINER_INDEX_INVALID;
+
+        try {
+
+            m_Device->containerCreate( getUserRole(), rsaKey->m_ucContainerIndex, true, rsaKey->m_ucKeySpec, pPublicKeyValue, ( uiModulusLength * 8 ), &keyValue );
+
+        } catch( MiniDriverException& x ) {
+
+            Log::error( "Token::addObjectPrivateKey", "MiniDriverException" );
+            throw PKCS11Exception( checkException( x ) );
+        }
+    }
+    else
+    {
+        ECCPrivateKeyObject* eccKey = (ECCPrivateKeyObject*) a_pObject;
+        boost::shared_ptr< u1Array > params = eccKey->m_pParams;
+        int keyBitSize = 0;
+        unsigned char ucKeySpec;
+        CK_BBOOL bIsExchangeKey = (eccKey->_decrypt || eccKey->_derive)? TRUE : FALSE;
+
+        if (Util::compareU1Arrays(params.get(), g_pbECC256_OID, sizeof(g_pbECC256_OID)))
+        {
+            keyBitSize = 256;
+            ucKeySpec = (bIsExchangeKey)? MiniDriverContainer::KEYSPEC_ECDHE_256 : MiniDriverContainer::KEYSPEC_ECDSA_256;
+        }
+        else if (Util::compareU1Arrays(params.get(), g_pbECC384_OID, sizeof(g_pbECC384_OID)))
+        {
+            keyBitSize = 384;
+            ucKeySpec = bIsExchangeKey? MiniDriverContainer::KEYSPEC_ECDHE_384 : MiniDriverContainer::KEYSPEC_ECDSA_384;
+        }
+        else if (Util::compareU1Arrays(params.get(), g_pbECC521_OID, sizeof(g_pbECC521_OID)))
+        {
+            keyBitSize = 521;
+            ucKeySpec = bIsExchangeKey? MiniDriverContainer::KEYSPEC_ECDHE_521 : MiniDriverContainer::KEYSPEC_ECDSA_521;
+        }
+        else
+        {
+            throw PKCS11Exception(CKR_ATTRIBUTE_VALUE_INVALID);
+        }
+
+        int keyByteLen = (keyBitSize + 7) / 8;
+		int minEcc = 256, maxEcc = 521, minEccGen, maxEccGen;
+
+		m_Device->getECCMinMax(minEcc, maxEcc, minEccGen, maxEccGen, getUserRole());
+
+		if ((keyBitSize < minEcc) || (keyBitSize > maxEcc))
+        {
+            throw PKCS11Exception(CKR_ATTRIBUTE_VALUE_INVALID);
+        }
+
+        // compute the total length;
+        unsigned int uiKeyLength = 8 + 3*keyByteLen;
+
+        // Prepare the keyValue
+        u1Array keyValue( uiKeyLength );
+
+        unsigned char* p = keyValue.GetBuffer( );
+        memset( p, 0, uiKeyLength );
+
+        // get the uncompressed point representation
+        const unsigned char* pPoint = eccKey->m_pPublicPoint->GetBuffer();
+        long len = eccKey->m_pPublicPoint->GetLength();
+        ASN1_OCTET_STRING* oct = d2i_ASN1_OCTET_STRING(NULL, &pPoint, len);
+        if (oct && (pPoint == eccKey->m_pPublicPoint->GetBuffer() + len))
+        {
+            pPoint = oct->data;
+            len = oct->length;
+        }
+        else
+        {
+            pPoint = eccKey->m_pPublicPoint->GetBuffer();
+            len = eccKey->m_pPublicPoint->GetLength();
+        }
+
+        if (pPoint[0] != 0x04)
+        {
+            if (oct) ASN1_OCTET_STRING_free(oct);
+            throw PKCS11Exception(CKR_ATTRIBUTE_VALUE_INVALID);
+        }
+
+        pPoint++;
+        len--;
+
+        if ((len % 2) || (len > 2*keyByteLen) || ((int) eccKey->m_pPrivateValue->GetLength() > keyByteLen))
+        {
+            if (oct) ASN1_OCTET_STRING_free(oct);
+            throw PKCS11Exception(CKR_ATTRIBUTE_VALUE_INVALID);
+        }
+
+        // copy the coordinates X and Y
+        memcpy(p + 8 + keyByteLen - (len/2), pPoint, len/2);
+        memcpy(p + 8 + 2*keyByteLen - (len/2), pPoint + len/2, len/2);
+
+        if (oct) ASN1_OCTET_STRING_free(oct);
+
+        // copy the private key value
+        memcpy(p + 8 + 3*keyByteLen - eccKey->m_pPrivateValue->GetLength(), eccKey->m_pPrivateValue->GetBuffer(), eccKey->m_pPrivateValue->GetLength());
+
+        // Specify what is able to do the key (sign only or sign & decrypt)
+        eccKey->m_ucKeySpec = ucKeySpec;
+
+        // Create the on card key container
+        // This method checks if a certificate with the same public key exists.
+        // In this case this new key must be imported into the key container already associated with this certificate and the key spec is also updated
+        eccKey->m_ucContainerIndex = MiniDriverContainerMapFile::CONTAINER_INDEX_INVALID;
+
+        try {
+
+            m_Device->containerCreate( getUserRole(), eccKey->m_ucContainerIndex, true, eccKey->m_ucKeySpec, pPublicKeyValue, keyBitSize, &keyValue );
+
+        } catch( MiniDriverException& x ) {
+
+            Log::error( "Token::addObjectPrivateKey", "MiniDriverException" );
+            throw PKCS11Exception( checkException( x ) );
+        }
     }
 
-    // Get the middle size
-    unsigned int uiKeyHalfSize = uiModulusLength / 2;
-
-    // Check the Prime P (PKCS11 prime 1 attribute) size
-    unsigned int uiPrimePLength = a_pObject->m_pPrime1->GetLength( );
-
-    if( uiPrimePLength > uiKeyHalfSize ) {
-
-        throw PKCS11Exception( CKR_ATTRIBUTE_VALUE_INVALID );
-    }
-
-    if( uiPrimePLength < uiKeyHalfSize ) {
-
-        // Pad with zeros in the front since big endian
-        Marshaller::u1Array* val = new Marshaller::u1Array( uiKeyHalfSize );
-
-        memset( val->GetBuffer( ), 0, uiKeyHalfSize );
-
-        size_t i = uiKeyHalfSize - uiPrimePLength;
-
-        memcpy( val->GetBuffer( ) + i, a_pObject->m_pPrime1->GetBuffer( ), uiPrimePLength );
-
-        a_pObject->m_pPrime1.reset( val );
-
-        uiPrimePLength = uiKeyHalfSize;
-    }
-
-    // Check the Prime Q (PKCS11 prime 2 attribute) size
-    unsigned int uiPrimeQLength = a_pObject->m_pPrime2->GetLength( );
-
-    if( uiPrimeQLength > uiKeyHalfSize ) {
-
-        throw PKCS11Exception( CKR_ATTRIBUTE_VALUE_INVALID );
-    }
-
-    if( uiPrimeQLength < uiKeyHalfSize ) {
-
-        // Pad with zeros in the front since big endian
-        Marshaller::u1Array* val = new Marshaller::u1Array( uiKeyHalfSize );
-
-        memset( val->GetBuffer( ), 0, uiKeyHalfSize );
-
-        size_t i = uiKeyHalfSize - uiPrimeQLength;
-
-        memcpy( val->GetBuffer( ) + i, a_pObject->m_pPrime2->GetBuffer( ), uiPrimeQLength );
-
-        a_pObject->m_pPrime2.reset( val );
-
-        uiPrimeQLength = uiKeyHalfSize;
-    }
-
-    // Check the Inverse Q (PKCS11 coefficient attribute) size
-    unsigned int uiInverseQLength = a_pObject->m_pCoefficient->GetLength( );
-
-    if( uiInverseQLength > uiKeyHalfSize ) {
-
-        throw PKCS11Exception( CKR_ATTRIBUTE_VALUE_INVALID );
-    }
-
-    if( uiInverseQLength < uiKeyHalfSize ) {
-
-        // Pad with zeros in the front since big endian
-        Marshaller::u1Array* val = new Marshaller::u1Array( uiKeyHalfSize );
-
-        memset( val->GetBuffer( ), 0, uiKeyHalfSize );
-
-        size_t i = uiKeyHalfSize - uiInverseQLength;
-
-        memcpy( val->GetBuffer( ) + i, a_pObject->m_pCoefficient->GetBuffer( ), uiInverseQLength );
-
-        a_pObject->m_pCoefficient.reset( val );
-
-        uiInverseQLength = uiKeyHalfSize;
-    }
-
-    // Check the DP Length (PKCS11 CKA_EXPONENT_1 attribute) size
-    unsigned int uiDPLength = a_pObject->m_pExponent1->GetLength( );
-
-    if( uiDPLength > uiKeyHalfSize ) {
-
-        throw PKCS11Exception( CKR_ATTRIBUTE_VALUE_INVALID );
-    }
-
-    if( uiDPLength < uiKeyHalfSize ) {
-
-        // Pad with zeros in the front since big endian
-        Marshaller::u1Array* val = new Marshaller::u1Array( uiKeyHalfSize );
-
-        memset( val->GetBuffer( ), 0, uiKeyHalfSize );
-
-        size_t i = uiKeyHalfSize - uiDPLength;
-
-        memcpy( val->GetBuffer( ) + i, a_pObject->m_pExponent1->GetBuffer( ), uiDPLength );
-
-        a_pObject->m_pExponent1.reset( val );
-
-        uiDPLength = uiKeyHalfSize;
-    }
-
-    // Check the DQ Length (PKCS11 CKA_EXPONENT_2 attribute) size
-    unsigned int uiDQLength = a_pObject->m_pExponent2->GetLength( );
-
-    if( uiDQLength > uiKeyHalfSize ) {
-
-        throw PKCS11Exception( CKR_ATTRIBUTE_VALUE_INVALID );
-    }
-
-    if( uiDQLength < uiKeyHalfSize ) {
-
-        // Pad with zeros in the front since big endian
-        Marshaller::u1Array* val = new Marshaller::u1Array( uiKeyHalfSize );
-
-        memset( val->GetBuffer( ), 0, uiKeyHalfSize );
-
-        size_t i = uiKeyHalfSize - uiDQLength;
-
-        memcpy( val->GetBuffer( ) + i, a_pObject->m_pExponent2->GetBuffer( ), uiDQLength );
-
-        a_pObject->m_pExponent2.reset( val );
-
-        uiDQLength = uiKeyHalfSize;
-    }
-
-    // Check the Private Exponent Length (PKCS11 CKA_PRIVATE_EXPONENT attribute) size
-    unsigned int uiPrivateExponentLength = a_pObject->m_pPrivateExponent->GetLength( );
-
-    if( uiPrivateExponentLength > uiModulusLength ) {
-
-        throw PKCS11Exception( CKR_ATTRIBUTE_VALUE_INVALID );
-    }
-
-    if( uiPrivateExponentLength < uiModulusLength ) {
-
-        // Pad with zeros in the front since big endian
-        Marshaller::u1Array* val = new Marshaller::u1Array( uiModulusLength );
-
-        memset( val->GetBuffer( ), 0, uiPrivateExponentLength );
-
-        size_t i = uiModulusLength - uiPrivateExponentLength;
-
-        memcpy( val->GetBuffer( ) + i, a_pObject->m_pPrivateExponent->GetBuffer( ), uiPrivateExponentLength );
-
-        a_pObject->m_pPrivateExponent.reset( val );
-
-        uiPrivateExponentLength = uiModulusLength;
-    }
-
-    // Check the public exponent size
-    unsigned int uiPublicExponentLength = a_pObject->m_pPublicExponent->GetLength( );
-
-    if( ( uiPublicExponentLength < 1 ) || ( uiPublicExponentLength > 4 ) ) {
-
-        throw PKCS11Exception( CKR_ATTRIBUTE_VALUE_INVALID );
-    }
-
-    // Check the public key exponent size    
-    Marshaller::u1Array* pPublicExponent = a_pObject->m_pPublicExponent.get( );
-
-    if( uiPublicExponentLength < 4 ) {
-
-        // Pad with zeros in the front since big endian
-        pPublicExponent = new Marshaller::u1Array( 4 );
-
-        memset( pPublicExponent->GetBuffer( ), 0, 4 );
-
-        size_t i = 4 - uiPublicExponentLength;
-
-        memcpy( pPublicExponent->GetBuffer( ) + i, a_pObject->m_pPublicExponent->GetBuffer( ), uiPublicExponentLength );
-
-        uiPublicExponentLength = 4;
-    }
-
-    //if( uiPublicExponentLength < 4 ) {
-
-    //    // Pad with zeros in the front since big endian
-    //    Marshaller::u1Array* exp = new Marshaller::u1Array( 4 );
-
-    //    memset( exp->GetBuffer( ), 0, 4 );
-
-    //    size_t i = 4 - uiPublicExponentLength;
-
-    //    memcpy( exp->GetBuffer( ) + i, a_pObject->m_pPublicExponent->GetBuffer( ), uiPublicExponentLength );
-
-    //    a_pObject->m_pPublicExponent.reset( exp );
-
-    //    uiPublicExponentLength = 4;
-    //}
-
-    // compute the total length;
-    unsigned int uiKeyLength = uiPrimePLength + uiPrimeQLength + uiInverseQLength + uiDPLength + uiDQLength + uiPrivateExponentLength + uiModulusLength + 4;
-
-    // Prepare the keyValue
-    Marshaller::u1Array keyValue( uiKeyLength );
-
-    unsigned char* p = keyValue.GetBuffer( );
-
-    memset( p, 0, uiKeyLength );
-
-    // Add the Prime P
-    memcpy( p, a_pObject->m_pPrime1->GetBuffer( ), uiPrimePLength );
-
-    int offset = uiPrimePLength;
-
-    // Add the the Prime Q
-    memcpy( p + offset, a_pObject->m_pPrime2->GetBuffer( ), uiPrimeQLength );
-
-    offset += uiPrimeQLength;
-
-    // Add the inverse Q
-    memcpy( p + offset, a_pObject->m_pCoefficient->GetBuffer( ), uiInverseQLength );
-
-    offset += uiInverseQLength;
-
-    // Add the DP
-    memcpy( p + offset, a_pObject->m_pExponent1->GetBuffer( ), uiDPLength );
-
-    offset += uiDPLength;
-
-    // Add the DQ
-    memcpy( p + offset, a_pObject->m_pExponent2->GetBuffer( ), uiDQLength );
-
-    offset += uiDQLength;
-
-    // Addt he private exponent D
-    memcpy( p + offset, a_pObject->m_pPrivateExponent->GetBuffer( ), uiPrivateExponentLength );
-
-    offset += uiPrivateExponentLength;
-
-    // Add the modulus
-    memcpy( p + offset, a_pObject->m_pModulus->GetBuffer( ), uiModulusLength );
-
-    offset += uiModulusLength;
-
-    // Add the public exponent
-    //memcpy( p + offset, a_pObject->m_pPublicExponent->GetBuffer( ), uiPublicExponentLength );
-    memcpy( p + offset, pPublicExponent->GetBuffer( ), uiPublicExponentLength );
-
-    // Specify what is able to do the key (sign only or sign & decrypt)
-    a_pObject->m_ucKeySpec = (unsigned char)( a_pObject->_decrypt ? MiniDriverContainer::KEYSPEC_EXCHANGE : MiniDriverContainer::KEYSPEC_SIGNATURE );
-
-    // Create the on card key container
-    // This method checks if a certificate with the same public key exists.
-    // In this case this new key must be imported into the key container already associated with this certificate and the key spec is also updated
-    a_pObject->m_ucContainerIndex = MiniDriverContainerMapFile::CONTAINER_INDEX_INVALID;
-
-    try {
-
-        m_Device->containerCreate( a_pObject->m_ucContainerIndex, true, a_pObject->m_ucKeySpec, a_pObject->m_pModulus.get( ), ( uiModulusLength * 8 ), &keyValue );
-
-    } catch( MiniDriverException& x ) {
-
-        Log::error( "Token::addObjectPrivateKey", "MiniDriverException" );
-        throw PKCS11Exception( checkException( x ) );
-    }
 
     if( a_pObject->m_ucContainerIndex == MiniDriverContainerMapFile::CONTAINER_INDEX_INVALID ) {
 
@@ -1752,7 +2295,7 @@ void Token::addObjectPrivateKey( RSAPrivateKeyObject* a_pObject, CK_OBJECT_HANDL
     a_pObject->_local = CK_FALSE;
 
     // Create the associated PKCS#11 key object
-    addObject( a_pObject, a_phObject ); 
+    addObject( a_pObject, a_phObject );
 
     t.stop( "Token::addObjectPrivateKey" );
     Log::end( "Token::addObjectPrivateKey" );
@@ -1771,6 +2314,10 @@ void Token::addObjectCertificate( X509PubKeyCertObject* a_pObject, CK_OBJECT_HAN
 
         throw PKCS11Exception( CKR_TOKEN_NOT_PRESENT );
     }
+    else if (m_Device->isReadOnly())
+    {
+        throw PKCS11Exception( CKR_TOKEN_WRITE_PROTECTED );
+    }
 
     // Private certificate object is not allowed
     if( !a_pObject || a_pObject->isPrivate( ) ) {
@@ -1787,7 +2334,7 @@ void Token::addObjectCertificate( X509PubKeyCertObject* a_pObject, CK_OBJECT_HAN
     // Actually the certificates attributes have been provided by the creation template.
     // But some of then can be not set.
     // Get all empty attributes from the certificate
-    // Set the same CKA_LABEL, CKA_ID and CKA_SUBJECT for this certificate 
+    // Set the same CKA_LABEL, CKA_ID and CKA_SUBJECT for this certificate
     // than an existing private key using the same public key modulus attribute
     setDefaultAttributesCertificate( a_pObject );
 
@@ -1795,10 +2342,46 @@ void Token::addObjectCertificate( X509PubKeyCertObject* a_pObject, CK_OBJECT_HAN
     Log::log( "Token::addObjectCertificate - root <%d>", a_pObject->m_bIsRoot );
     Log::log( "Token::addObjectCertificate - index <%d>", a_pObject->m_ucContainerIndex );
 
+    bool bIsRSA = a_pObject->m_bIsRSA;
+    MiniDriverAuthentication::ROLES roleToUse = getUserRole();
+    if (roleToUse == MiniDriverAuthentication::PIN_USER)
+    {
+        // See if there is a private key that has been generated with a specific role and that should
+        // be associated with our certificate
+        BOOST_FOREACH( const TOKEN_OBJECTS::value_type& obj, m_Objects ) {
+            if( CKO_PRIVATE_KEY == obj->second->getClass( ) ) {
+
+                PrivateKeyObject* objPrivateKey = (PrivateKeyObject*) obj->second;
+                if (bIsRSA == (objPrivateKey->_keyType == CKK_RSA))
+                {
+                    if (objPrivateKey->m_role != 0)
+                    {
+                        u1Array* pPublicKeyValue = NULL;
+                        if (objPrivateKey->_keyType == CKK_RSA)
+                            pPublicKeyValue = ((RSAPrivateKeyObject*) objPrivateKey)->m_pModulus.get();
+                        else
+                            pPublicKeyValue = ((ECCPrivateKeyObject*) objPrivateKey)->m_pPublicPoint.get();
+                        // customized role
+                        // check if it has the same modulus as our certificate
+                        if(     pPublicKeyValue
+                            &&  a_pObject->m_pPublicKeyValue.get()
+                            &&  (pPublicKeyValue->GetLength() == a_pObject->m_pPublicKeyValue->GetLength())
+                            &&  (0 == memcmp(pPublicKeyValue->GetBuffer(), a_pObject->m_pPublicKeyValue->GetBuffer(), a_pObject->m_pPublicKeyValue->GetLength()))
+                          )
+                        {
+                            roleToUse = (MiniDriverAuthentication::ROLES) objPrivateKey->m_role;
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     //unsigned char ucContainerIndex = MiniDriverContainerMapFile::CONTAINER_INDEX_INVALID;
     //unsigned char ucKeySpec = MiniDriverContainer::KEYSPEC_EXCHANGE;
     std::string stFileName = "";
-    m_Device->containerGetMatching( a_pObject->m_ucContainerIndex, a_pObject->m_ucKeySpec, stFileName, a_pObject->m_pModulus.get( ) );
+    m_Device->containerGetMatching( roleToUse, a_pObject->m_ucContainerIndex, a_pObject->m_ucKeySpec, stFileName, a_pObject->m_pPublicKeyValue.get( ) );
     Log::log( "Token::addObjectCertificate - m_ucContainerIndex <%d>", a_pObject->m_ucContainerIndex );
     Log::log( "Token::addObjectCertificate - m_ucKeySpec <%d>", a_pObject->m_ucKeySpec );
     Log::log( "Token::addObjectCertificate - stFileName <%s>", stFileName.c_str( ) );
@@ -1813,9 +2396,7 @@ void Token::addObjectCertificate( X509PubKeyCertObject* a_pObject, CK_OBJECT_HAN
             // If a container already exists using the same public key modulus then the container index will be updated with the index of this container.
             // The keyspec will also be updated
             // The file name will anyway built automaticaly
-            m_Device->createCertificate( a_pObject->m_ucContainerIndex, a_pObject->m_ucKeySpec, a_pObject->m_stFileName, a_pObject->m_pValue.get( ), a_pObject->m_pModulus.get( ), a_pObject->m_bIsSmartCardLogon );
-
-            a_pObject->m_stCertificateName = a_pObject->m_stFileName;//.substr( 3, 5 );
+            m_Device->createCertificate( roleToUse, a_pObject->m_ucContainerIndex, a_pObject->m_ucKeySpec, a_pObject->m_stCertificateName, a_pObject->m_pValue.get( ), a_pObject->m_pPublicKeyValue.get( ), a_pObject->m_bIsSmartCardLogon );
 
         } catch( MiniDriverException& x ) {
 
@@ -1828,12 +2409,30 @@ void Token::addObjectCertificate( X509PubKeyCertObject* a_pObject, CK_OBJECT_HAN
 
         Log::log( "Token::addObjectCertificate - Create a ROOT certificate" );
 
+         // check that it doesn't already exists
+         bool bFound = false;
+         BOOST_FOREACH( const TOKEN_OBJECTS::value_type& obj, m_Objects ) {
+            if( CKO_CERTIFICATE == obj->second->getClass( ) ) {
+
+                X509PubKeyCertObject* objCert = (X509PubKeyCertObject*) obj->second;
+                if (objCert->m_pValue->IsEqual(a_pObject->m_pValue.get( )))
+                {
+                   bFound = true;
+                   break;
+                }
+            }
+         }
+
+         if (bFound)
+         {
+            Log::error( "Token::addObjectCertificate", "Root certificate already exists" );
+            throw PKCS11Exception( CKR_FUNCTION_FAILED );
+         }
+
         // Create the ROOT certificate into the smart card
         try {
 
-            m_Device->createCertificateRoot( a_pObject->m_stFileName, a_pObject->m_pValue.get( ) );
-
-            a_pObject->m_stCertificateName = a_pObject->m_stFileName;
+            m_Device->createCertificateRoot( a_pObject->m_stCertificateName, a_pObject->m_pValue.get( ) );
 
         } catch( MiniDriverException& x ) {
 
@@ -1853,7 +2452,7 @@ void Token::addObjectCertificate( X509PubKeyCertObject* a_pObject, CK_OBJECT_HAN
 
 /*
 */
-void Token::addObjectPublicKey( Pkcs11ObjectKeyPublicRSA* a_pObject, CK_OBJECT_HANDLE_PTR a_phObject ) {
+void Token::addObjectPublicKey( Pkcs11ObjectKeyPublic* a_pObject, CK_OBJECT_HANDLE_PTR a_phObject ) {
 
     Log::begin( "Token::addObjectPublicKey" );
     Timer t;
@@ -1863,6 +2462,10 @@ void Token::addObjectPublicKey( Pkcs11ObjectKeyPublicRSA* a_pObject, CK_OBJECT_H
 
         throw PKCS11Exception( CKR_TOKEN_NOT_PRESENT );
     }
+    else if (m_Device->isReadOnly())
+    {
+        throw PKCS11Exception( CKR_TOKEN_WRITE_PROTECTED );
+    }
 
     // Private public key object is not allowed
     if( a_pObject->isPrivate( ) ) {
@@ -1870,13 +2473,28 @@ void Token::addObjectPublicKey( Pkcs11ObjectKeyPublicRSA* a_pObject, CK_OBJECT_H
         throw PKCS11Exception( CKR_ATTRIBUTE_VALUE_INVALID );
     }
 
+    u1Array* pPublicKeyValue = NULL;
+    if (a_pObject->_keyType == CKK_RSA)
+	{
+		Pkcs11ObjectKeyPublicRSA* pRsaPubKey = (Pkcs11ObjectKeyPublicRSA*) a_pObject;
+        pPublicKeyValue = pRsaPubKey->m_pModulus.get();
+		if (	pRsaPubKey->m_pPublicExponent.get()
+			&&  !Util::compareArraysAsBigIntegers(pRsaPubKey->m_pPublicExponent.get(), (const unsigned char*) "\x01\x00\x01", 3)
+		   )
+		{
+			throw PKCS11Exception( CKR_ATTRIBUTE_VALUE_INVALID );
+		}
+	}
+    else
+        pPublicKeyValue = ((Pkcs11ObjectKeyPublicECC*) a_pObject)->m_pPublicPoint.get();
+
     // Create the certificate into the smart card
     try {
 
         // If a container already exists using the same public key modulus then the container index will be updated with the index of this container.
         // The keyspec will also be updated
         // The file name will anyway be build automaticaly
-        m_Device->containerGetMatching( a_pObject->m_ucContainerIndex, a_pObject->m_ucKeySpec, a_pObject->m_stFileName, a_pObject->m_pModulus.get( ) );
+        m_Device->containerGetMatching( getUserRole(), a_pObject->m_ucContainerIndex, a_pObject->m_ucKeySpec, a_pObject->m_stFileName, pPublicKeyValue );
 
     } catch( MiniDriverException& x ) {
 
@@ -1910,10 +2528,12 @@ void Token::deleteObject( const CK_OBJECT_HANDLE& a_hObject ) {
     }
 
     // Are we allowed to delete objects ? We must be logged in
-    if( !m_Device->isAuthenticated( ) ) {
+    if( m_pSlot && !m_pSlot->isAuthenticated( ) ) {
 
         throw PKCS11Exception( CKR_USER_NOT_LOGGED_IN );
     }
+
+	CAtomicLogin atomicLogin(this, true);
 
     StorageObject* o = getObject( a_hObject );
 
@@ -1955,20 +2575,38 @@ void Token::deleteObjectFromCard( StorageObject* a_pObject ) {
                 // Delete the certificate file
                 //try {
 
-                try {
-                    
-                    // Check if the container is still valid. Throw an exception if not.
-                    MiniDriverContainer c = m_Device->containerGet( t->m_ucContainerIndex );
-                
-                    // Delete the associated certificate
-                    m_Device->certificateDelete( t->m_ucContainerIndex );
+                if (t->m_stCertificateName == szROOT_STORE_FILE)
+                {
+                   X509PubKeyCertObject* pCert = static_cast< X509PubKeyCertObject* >( a_pObject );
+                   // delete certificate from msroots
+                   if (pCert->m_pValue)
+                     m_Device->deleteCertificateRoot (pCert->m_pValue.get());
+                }
+                else
+                {
+                   try {
 
-                } catch( MiniDriverException ) {
-                
-                    // The container is not associated to this certitifcate object
-                    // Delete the MiniDriver file from the PKCS11 object file name
-                    m_Device->deleteFile( std::string( szBASE_CSP_DIR ), t->m_stCertificateName );
+                       // Check if the container is still valid. Throw an exception if not.
+                       MiniDriverContainer c = m_Device->containerGet( t->m_ucContainerIndex );
+                       if (m_Device->containerReadOnly (t->m_ucContainerIndex))
+                           throw PKCS11Exception( CKR_FUNCTION_FAILED );
 
+                       // Delete the associated certificate
+					   m_Device->certificateDelete( t->m_ucContainerIndex, t->m_ucKeySpec );
+
+                   } catch( MiniDriverException ) {
+
+                       // The container is not associated to this certitifcate object
+                       // Delete the MiniDriver file from the PKCS11 object file name
+                       m_Device->deleteFile( std::string( szBASE_CSP_DIR ), t->m_stCertificateName );
+
+                       // delete it from msroots if present there
+                        X509PubKeyCertObject* pCert = reinterpret_cast< X509PubKeyCertObject* >( a_pObject );
+                        // delete certificate from msroots
+                        if (pCert && pCert->m_pValue && pCert->m_bIsRoot)
+                           m_Device->deleteCertificateRoot (pCert->m_pValue.get());
+
+                   }
                 }
 
                 //if( 0xFF == t->m_ucContainerIndex ) {
@@ -1996,9 +2634,10 @@ void Token::deleteObjectFromCard( StorageObject* a_pObject ) {
         case CKO_PRIVATE_KEY:
             {
                 RSAPrivateKeyObject * v = static_cast< RSAPrivateKeyObject* >( a_pObject );
-
+                if (m_Device->containerReadOnly (v->m_ucContainerIndex))
+                    throw PKCS11Exception( CKR_FUNCTION_FAILED );
                 // Delete the key container
-                m_Device->containerDelete( v->m_ucContainerIndex );
+				m_Device->containerDelete( v->m_ucContainerIndex, v->m_ucKeySpec );
             }
             break;
 
@@ -2085,15 +2724,17 @@ void Token::setAttributeValue( const CK_OBJECT_HANDLE& a_hObject, CK_ATTRIBUTE_P
         throw PKCS11Exception( CKR_USER_NOT_LOGGED_IN );
     }
 
-    for( CK_ULONG i = 0 ; i < a_ulCount ; ++i ) {
-
-        o->setAttribute( a_pTemplate[ i ], false );
-    }
+	CAtomicLogin atomicLogin(this, true);
 
     // Check if the object is not read-only
     if( ! o->isModifiable( ) ) {
 
         throw PKCS11Exception( CKR_ATTRIBUTE_READ_ONLY );
+    }
+
+    for( CK_ULONG i = 0 ; i < a_ulCount ; ++i ) {
+
+        o->setAttribute( a_pTemplate[ i ], false );
     }
 
     // Compute this attribute for backward compatibilit with old version of the P11 library
@@ -2103,7 +2744,7 @@ void Token::setAttributeValue( const CK_OBJECT_HANDLE& a_hObject, CK_ATTRIBUTE_P
     std::vector< unsigned char > v;
     o->serialize( &v );
     size_t l =  v.size( );
-    Marshaller::u1Array d( l );
+    u1Array d( l );
     for( unsigned int i = 0 ; i <l ; ++i ) {
 
         d.SetU1At( i, v.at( i ) );
@@ -2114,11 +2755,52 @@ void Token::setAttributeValue( const CK_OBJECT_HANDLE& a_hObject, CK_ATTRIBUTE_P
         throw PKCS11Exception( CKR_TOKEN_NOT_PRESENT );
     }
 
+	bool bFileCreated = false;
+
     try {
 
         if( o->m_bOffCardObject ) {
 
-            m_Device->createFile( g_stPathPKCS11, o->m_stFileName, ( o->m_Private == CK_TRUE ) );
+			// Build the name of the file
+			computeObjectFileName( o, o->m_stFileName );
+
+			if( m_bCreateDirectoryP11 ) {
+
+				// Create the P11 directory into the smart card
+				try {
+					m_Device->createDirectory( std::string( "root" ), g_stPathPKCS11 );
+					m_bCreateDirectoryP11 = false;
+				} catch( MiniDriverException& x ) {
+					Log::error( "Token::setAttributeValue", "MiniDriverException while creating PKCS11 directory" );
+					throw PKCS11Exception( checkException( x ) );
+				}
+			}
+			else if (o->getClass( ) == CKO_CERTIFICATE)
+			{
+				MiniDriverFiles::FILES_NAME filesPKCS11;
+				try {
+					filesPKCS11 = m_Device->enumFiles( g_stPathPKCS11 );
+				}
+				catch(...)
+				{}
+
+				if (isFileExists( o->m_stFileName, filesPKCS11 ))
+				{
+					// if the P11 certificate object already exists, it means it was rejected because it is inconsistent with the real certificate
+					// we delete it here
+					try
+					{
+						Log::log("Token::setAttributeValue - old P11 certificate object with the same name exists (\"%s\"). Deleting it", o->m_stFileName.c_str());
+						m_Device->deleteFile(g_stPathPKCS11, o->m_stFileName);
+					}
+					catch(...)
+					{}
+				}
+			}
+
+         m_Device->createFile( g_stPathPKCS11, o->m_stFileName, ( o->m_Private == CK_TRUE ) && (CKO_PRIVATE_KEY != o->getClass()));
+
+			bFileCreated = true;
 
             o->m_bOffCardObject = false;
         }
@@ -2126,7 +2808,8 @@ void Token::setAttributeValue( const CK_OBJECT_HANDLE& a_hObject, CK_ATTRIBUTE_P
         m_Device->writeFile( g_stPathPKCS11, o->m_stFileName, &d );
 
     } catch( MiniDriverException& x ) {
-
+		if (bFileCreated)
+			m_Device->deleteFile(g_stPathPKCS11, o->m_stFileName);
         Log::error( "Token::setAttributeValue", "MiniDriverException" );
         throw PKCS11Exception( checkException( x ) );
     }
@@ -2140,7 +2823,7 @@ void Token::setAttributeValue( const CK_OBJECT_HANDLE& a_hObject, CK_ATTRIBUTE_P
 
 /*
 */
-void Token::generateKeyPair( Pkcs11ObjectKeyPublicRSA* a_pObjectPublicKeyRSA, RSAPrivateKeyObject* a_pObjectPrivateKeyRSA, CK_OBJECT_HANDLE_PTR a_pHandlePublicKeyRSA, CK_OBJECT_HANDLE_PTR a_pHandlePrivateKeyRSA ) {
+void Token::generateKeyPair( Pkcs11ObjectKeyPublic* a_pObjectPublicKey, PrivateKeyObject* a_pObjectPrivateKey, CK_OBJECT_HANDLE_PTR a_pHandlePublicKeyRSA, CK_OBJECT_HANDLE_PTR a_pHandlePrivateKeyRSA ) {
 
     Log::begin( "Token::generateKeyPair" );
     Timer t;
@@ -2150,20 +2833,93 @@ void Token::generateKeyPair( Pkcs11ObjectKeyPublicRSA* a_pObjectPublicKeyRSA, RS
 
         throw PKCS11Exception( CKR_TOKEN_NOT_PRESENT );
     }
+    else if (m_Device->isReadOnly())
+    {
+        throw PKCS11Exception( CKR_TOKEN_WRITE_PROTECTED );
+    }
 
-    if( ( a_pObjectPublicKeyRSA->m_ulModulusBits < MiniDriver::s_iMinLengthKeyRSA ) || ( a_pObjectPublicKeyRSA->m_ulModulusBits > MiniDriver::s_iMaxLengthKeyRSA ) ) {
+    bool bIsRSA = (a_pObjectPublicKey->_keyType == CKK_RSA);
+    int keyBitSize = 0;
+    unsigned char ucKeySpec = MiniDriverContainer::KEYSPEC_EXCHANGE;
+	 bool bIsForSignOnly = (TRUE == a_pObjectPrivateKey->_sign) && (FALSE == a_pObjectPrivateKey->_decrypt) && (FALSE == a_pObjectPrivateKey->_derive);
 
-        throw PKCS11Exception(CKR_ATTRIBUTE_VALUE_INVALID);
+    if (bIsRSA)
+    {
+		Pkcs11ObjectKeyPublicRSA* pRsaPubKey = (Pkcs11ObjectKeyPublicRSA*) a_pObjectPublicKey;
+        CK_ULONG modulusBits = pRsaPubKey->m_ulModulusBits;
+		int minRsa = 1024, maxRsa = 2048, minRsaGen = 0, maxRsaGen = 0;
+		m_Device->getRSAMinMax(minRsa, maxRsa, minRsaGen, maxRsaGen, getUserRole());
+
+        if( ( modulusBits < (CK_ULONG) minRsaGen ) || ( modulusBits > (CK_ULONG) maxRsaGen ) ) {
+
+            throw PKCS11Exception(CKR_ATTRIBUTE_VALUE_INVALID);
+        }
+
+        keyBitSize = modulusBits;
+		ucKeySpec = (bIsForSignOnly)? MiniDriverContainer::KEYSPEC_SIGNATURE : MiniDriverContainer::KEYSPEC_EXCHANGE;
+
+		// check that the public exponent has the only supported value 0x010001
+		if (	pRsaPubKey->m_pPublicExponent.get()
+			&&	!Util::compareArraysAsBigIntegers(pRsaPubKey->m_pPublicExponent.get(), (const unsigned char*) "\x01\x00\x01", 3)
+		   )
+		{
+			throw PKCS11Exception(CKR_ATTRIBUTE_VALUE_INVALID);
+		}
+
+    }
+    else
+    {
+        boost::shared_ptr< u1Array > params = ((Pkcs11ObjectKeyPublicECC*) a_pObjectPublicKey)->m_pParams;
+
+        if (Util::compareU1Arrays(params.get(), g_pbECC256_OID, sizeof(g_pbECC256_OID)))
+        {
+            keyBitSize = 256;
+			ucKeySpec = (bIsForSignOnly)? MiniDriverContainer::KEYSPEC_ECDSA_256: MiniDriverContainer::KEYSPEC_ECDHE_256;
+        }
+        else if (Util::compareU1Arrays(params.get(), g_pbECC384_OID, sizeof(g_pbECC384_OID)))
+        {
+            keyBitSize = 384;
+            ucKeySpec = (bIsForSignOnly)? MiniDriverContainer::KEYSPEC_ECDSA_384: MiniDriverContainer::KEYSPEC_ECDHE_384;
+        }
+        else if (Util::compareU1Arrays(params.get(), g_pbECC521_OID, sizeof(g_pbECC521_OID)))
+        {
+            keyBitSize = 521;
+            ucKeySpec = (bIsForSignOnly)? MiniDriverContainer::KEYSPEC_ECDSA_521: MiniDriverContainer::KEYSPEC_ECDHE_521;
+        }
+        else
+        {
+            throw PKCS11Exception(CKR_ATTRIBUTE_VALUE_INVALID);
+        }
+
+		int minEcc = 256, maxEcc = 521, minEccGen, maxEccGen;
+		m_Device->getECCMinMax(minEcc, maxEcc, minEccGen, maxEccGen, getUserRole());
+
+		if ((keyBitSize < minEccGen) || (keyBitSize > maxEccGen))
+        {
+            throw PKCS11Exception(CKR_ATTRIBUTE_VALUE_INVALID);
+        }
     }
 
     // Create a smart card container to generate and store the new key pair
     unsigned char ucContainerIndex = MiniDriverContainerMapFile::CONTAINER_INDEX_INVALID;
+    if (a_pObjectPublicKey->m_pID.get()->GetLength() == 1) // 1 byte ID , use it container index for IoT Safe
+    {
+        ucContainerIndex = (unsigned char) a_pObjectPublicKey->m_pID.get()->GetBuffer()[0];
+    }
 
-    unsigned char ucKeySpec = MiniDriverContainer::KEYSPEC_EXCHANGE;
+    MiniDriverAuthentication::ROLES roleToUse = getUserRole();
+    if (roleToUse == MiniDriverAuthentication::PIN_USER)
+    {
+		if (!Token::s_bForcePinUser && !m_pSlot->isStaticProfile() && m_Device->IsMultiPinSupported())
+			throw PKCS11Exception(CKR_FUNCTION_CANCELED);
+    }
+
+	CAtomicLogin atomicLogin(this, true, (getUserRole() == MiniDriverAuthentication::PIN_USER)? 0 : getUserRole());
+
 
     try {
 
-        m_Device->containerCreate( ucContainerIndex, false, ucKeySpec, a_pObjectPublicKeyRSA->m_pModulus.get( ), a_pObjectPublicKeyRSA->m_ulModulusBits, 0 );
+        m_Device->containerCreate( roleToUse, ucContainerIndex, false, ucKeySpec, NULL, keyBitSize, 0 );
 
     } catch( MiniDriverException& x ) {
 
@@ -2176,13 +2932,19 @@ void Token::generateKeyPair( Pkcs11ObjectKeyPublicRSA* a_pObjectPublicKeyRSA, RS
         throw PKCS11Exception( CKR_DEVICE_MEMORY );
     }
 
-    a_pObjectPrivateKeyRSA->m_ucContainerIndex = ucContainerIndex;
+    a_pObjectPrivateKey->m_ucContainerIndex = ucContainerIndex;
 
-    a_pObjectPrivateKeyRSA->m_ucKeySpec = ucKeySpec;
+    a_pObjectPrivateKey->m_ucKeySpec = ucKeySpec;
 
-    a_pObjectPublicKeyRSA->m_ucContainerIndex = ucContainerIndex;
+    a_pObjectPublicKey->m_ucContainerIndex = ucContainerIndex;
 
-    a_pObjectPublicKeyRSA->m_ucKeySpec = ucKeySpec;
+    a_pObjectPublicKey->m_ucKeySpec = ucKeySpec;
+
+    if (roleToUse != getUserRole())
+    {
+        a_pObjectPrivateKey->m_role = (CK_BYTE) roleToUse;
+        a_pObjectPublicKey->m_role = (CK_BYTE) roleToUse;
+    }
 
     try {
 
@@ -2190,24 +2952,36 @@ void Token::generateKeyPair( Pkcs11ObjectKeyPublicRSA* a_pObjectPublicKeyRSA, RS
         MiniDriverContainer c = m_Device->containerGet( ucContainerIndex );
 
         // Fill the PKCS#11 object with the information about the new key pair
-        a_pObjectPublicKeyRSA->_local = CK_TRUE;
+        a_pObjectPublicKey->_local = CK_TRUE;
 
         ///// ???
         //a_pObjectPublicKeyRSA->m_pPublicExponent = c.getExchangePublicKeyExponent( );
-
-        a_pObjectPublicKeyRSA->m_pModulus = c.getExchangePublicKeyModulus( );
+        if (bIsRSA)
+        {
+            ((Pkcs11ObjectKeyPublicRSA*) a_pObjectPublicKey)->m_pModulus = (bIsForSignOnly)? c.getSignaturePublicKeyModulus() : c.getExchangePublicKeyModulus( );
+        }
+        else
+        {
+            ((Pkcs11ObjectKeyPublicECC*) a_pObjectPublicKey)->m_pPublicPoint = (bIsForSignOnly)? c.getEcdsaPointDER() : c.getEcdhePointDER();
+        }
 
         // Copy these modulus and exponent in the private key component also
-        a_pObjectPrivateKeyRSA->_local = CK_TRUE;
+        a_pObjectPrivateKey->_local = CK_TRUE;
 
-        //// ???
-        //a_pObjectPrivateKeyRSA->m_pPublicExponent = c.getExchangePublicKeyExponent( );
+        if (bIsRSA)
+        {
+            ((RSAPrivateKeyObject*) a_pObjectPrivateKey)->m_pPublicExponent = (bIsForSignOnly)? c.getSignaturePublicKeyExponent() : c.getExchangePublicKeyExponent( );
+            ((RSAPrivateKeyObject*) a_pObjectPrivateKey)->m_pModulus = (bIsForSignOnly)? c.getSignaturePublicKeyModulus() : c.getExchangePublicKeyModulus( );
+        }
+        else
+        {
+            ((ECCPrivateKeyObject*) a_pObjectPrivateKey)->m_pParams = ((Pkcs11ObjectKeyPublicECC*) a_pObjectPublicKey)->m_pParams;
+            ((ECCPrivateKeyObject*) a_pObjectPrivateKey)->m_pPublicPoint = ((Pkcs11ObjectKeyPublicECC*) a_pObjectPublicKey)->m_pPublicPoint;
+        }
 
-        a_pObjectPrivateKeyRSA->m_pModulus = c.getExchangePublicKeyModulus( );
+        setDefaultAttributesKeyPrivate( a_pObjectPrivateKey );
 
-        setDefaultAttributesKeyPrivate( a_pObjectPrivateKeyRSA );
-
-        setDefaultAttributesKeyPublic( a_pObjectPublicKeyRSA );
+        setDefaultAttributesKeyPublic( a_pObjectPublicKey );
 
     } catch( MiniDriverException& x ) {
 
@@ -2216,24 +2990,24 @@ void Token::generateKeyPair( Pkcs11ObjectKeyPublicRSA* a_pObjectPublicKeyRSA, RS
     }
 
     // The public key may be a session object, in that case, don't save it.
-    if( a_pObjectPublicKeyRSA->isToken( ) ) {
+    if( a_pObjectPublicKey->isToken( ) ) {
 
-        addObject( a_pObjectPublicKeyRSA, a_pHandlePublicKeyRSA );
+        addObject( a_pObjectPublicKey, a_pHandlePublicKeyRSA );
     }
 
     try {
 
-        addObject( a_pObjectPrivateKeyRSA, a_pHandlePrivateKeyRSA );
+        addObject( a_pObjectPrivateKey, a_pHandlePrivateKeyRSA );
 
     } catch( MiniDriverException& x ) {
 
-        if( a_pObjectPublicKeyRSA->isToken( ) ) {
+        if( a_pObjectPublicKey->isToken( ) ) {
 
             deleteObject( *a_pHandlePublicKeyRSA );
 
             try {
 
-                m_Device->containerDelete( ucContainerIndex );
+                m_Device->containerDelete( ucContainerIndex, ucKeySpec );
 
             } catch( MiniDriverException& ) {
 
@@ -2248,10 +3022,97 @@ void Token::generateKeyPair( Pkcs11ObjectKeyPublicRSA* a_pObjectPublicKeyRSA, RS
     Log::end( "Token::generateKeyPair" );
 }
 
+/*
+*/
+void Token::deriveKey( PrivateKeyObject* a_pObjectPrivateKey, CK_ECDH1_DERIVE_PARAMS_PTR a_pEcdhParams, SecretKeyObject* a_pDerivedKey, CK_OBJECT_HANDLE_PTR a_pHandleDerivedKey)
+{
+    UNREFERENCED_PARAMETER(a_pHandleDerivedKey);
+
+    Log::begin( "Token::deriveKey" );
+    Timer t;
+    t.start( );
+
+    if (a_pObjectPrivateKey->_keyType != CKK_EC || a_pDerivedKey->_keyType != CKK_GENERIC_SECRET)
+    {
+        throw PKCS11Exception( CKR_ATTRIBUTE_VALUE_INVALID );
+    }
+
+    ECCPrivateKeyObject* eccPrvKey = (ECCPrivateKeyObject*) a_pObjectPrivateKey;
+    GenericSecretKeyObject* derivedKey = (GenericSecretKeyObject*) a_pDerivedKey;
+
+    u4 nLen = (eccPrvKey->getOrderBitLength() + 7) / 8;
+
+    // Set the other party public point
+    const unsigned char* ptr = a_pEcdhParams->pPublicData;
+    long len = a_pEcdhParams->ulPublicDataLen;
+    ASN1_OCTET_STRING* oct = d2i_ASN1_OCTET_STRING(NULL, &ptr, len);
+    if (oct && (ptr == a_pEcdhParams->pPublicData + len))
+    {
+        ptr = oct->data;
+        len = oct->length;
+    }
+    else
+    {
+        ptr = a_pEcdhParams->pPublicData;
+        len = a_pEcdhParams->ulPublicDataLen;
+    }
+
+    CK_ULONG xLen = (len - 1)/2;
+    CK_ULONG yLen = xLen;
+
+    if (ptr[0] != 0x04 || ((len%2) != 1) || (xLen > nLen))
+    {
+        // we only suppport uncompressed format
+        if (oct) ASN1_OCTET_STRING_free(oct);
+        throw PKCS11Exception(CKR_MECHANISM_PARAM_INVALID);
+    }
+
+    // copy the x and y coordinates
+    u1Array Qx(nLen), Qy(nLen);
+
+    memcpy(Qx.GetBuffer() + (nLen - xLen), ptr + 1, xLen);
+    memcpy(Qy.GetBuffer() + (nLen - yLen), ptr + 1 + xLen, yLen);
+
+    // free the ASN.1 memory
+    if (oct) ASN1_OCTET_STRING_free(oct);
+
+    // compute ECDH value
+    boost::shared_ptr< u1Array > DHAgreement;
+    CAtomicLogin atomicLogin(this, false, eccPrvKey->m_role);
+
+    try {
+
+        DHAgreement = m_Device->constructDHAgreement( eccPrvKey->m_ucContainerIndex, &Qx, &Qy );
+
+    } catch( MiniDriverException& x ) {
+
+        Log::error( "Token::deriveKey", "MiniDriverException" );
+        throw PKCS11Exception( checkException( x ) );
+    }
+
+    u1Array SharedInfo(a_pEcdhParams->ulSharedDataLen);
+
+    SharedInfo.SetBuffer(a_pEcdhParams->pSharedData);
+
+    if (a_pEcdhParams->kdf == CKD_NULL)
+    {
+        derivedKey->NULL_drive(DHAgreement.get());
+    }
+    else
+    {
+        derivedKey->ANSI_X9_63_drive(DHAgreement.get(), &SharedInfo);
+    }
+
+    derivedKey->_local = TRUE;
+
+    t.stop( "Token::deriveKey" );
+    Log::end( "Token::deriveKey" );
+}
+
 
 /*
 */
-void Token::encrypt( const StorageObject* pubObj, Marshaller::u1Array* dataToEncrypt, const CK_ULONG& mechanism, CK_BYTE_PTR pEncryptedData ) {
+void Token::encrypt( const StorageObject* pubObj, u1Array* dataToEncrypt, const CK_ULONG& mechanism, CK_VOID_PTR pParameters, CK_BYTE_PTR pEncryptedData ) {
 
     Pkcs11ObjectKeyPublicRSA* object = ( Pkcs11ObjectKeyPublicRSA* )pubObj;
 
@@ -2261,38 +3122,84 @@ void Token::encrypt( const StorageObject* pubObj, Marshaller::u1Array* dataToEnc
             throw PKCS11Exception(CKR_DATA_LEN_RANGE);
         }
 
-        rsaPublicKey_t key;
+        u4 modulusLen = object->m_pModulus->GetLength();
 
-        key.modulus = object->m_pModulus->GetBuffer() ;
-        key.modulusLength = object->m_pModulus->GetLength() * 8 ;
-        key.publicExponent = object->m_pPublicExponent->GetBuffer();
-        key.publicExponentLength =  object->m_pPublicExponent->GetLength() * 8;
-
-        unsigned int outLength = object->m_pModulus->GetLength();
-
-        //DWORD rv ;
-        DWORD size ;
-        DWORD pubSize ;
-        R_RSA_PUBLIC_KEY	rsaKeyPublic ;
-
-        rsaKeyPublic.bits = key.modulusLength ;
-
-        size = (key.modulusLength + 7) / 8 ;
-        memcpy(rsaKeyPublic.modulus, key.modulus, size) ;
-
-        pubSize = (key.publicExponentLength + 7) / 8 ;
-        memset(rsaKeyPublic.exponent, 0, size) ;
-        memcpy(&rsaKeyPublic.exponent[size - pubSize], key.publicExponent, pubSize) ;
-
+        // do the padding ourselves
+        u1Array messageToEncrypt(modulusLen);
+        u1* ptrMsg = messageToEncrypt.GetBuffer();
+        u4 i, inputLen = dataToEncrypt->GetLength();
         R_RANDOM_STRUCT & randomStruct = Util::RandomStruct();
+        unsigned char byte;
 
-        RSAPublicEncrypt(
-            pEncryptedData,
-            &outLength,
-            (unsigned char*)dataToEncrypt->GetBuffer(),
-            dataToEncrypt->GetLength(),
-            &rsaKeyPublic,
-            &randomStruct);
+        ptrMsg[0] = 0;
+        ptrMsg[1] = 2;
+
+        for (i = 2; i < modulusLen - inputLen - 1; i++)
+        {
+            /**
+            * Find nonzero random byte.
+            */
+            do {
+               R_GenerateBytes (&byte, 1, &randomStruct);
+            } while (byte == 0);
+
+            ptrMsg[i] = byte;
+        }
+        ptrMsg[i++] = 0;
+        memcpy (ptrMsg + i, dataToEncrypt->GetBuffer(), inputLen);
+
+        RSA* rsa = RSA_new();
+        BIGNUM* rsa_n = BN_bin2bn(object->m_pModulus->GetBuffer(), object->m_pModulus->GetLength(), NULL);
+        BIGNUM* rsa_e = BN_bin2bn(object->m_pPublicExponent->GetBuffer(), object->m_pPublicExponent->GetLength(), NULL);
+	 RSA_set0_key(rsa,rsa_n,rsa_e,NULL);
+        int l = RSA_public_encrypt(modulusLen, ptrMsg, pEncryptedData, rsa, RSA_NO_PADDING);
+        RSA_free(rsa);
+
+        if (l < 0)
+        {
+            // should never happen
+            throw PKCS11Exception(CKR_FUNCTION_FAILED);
+        }
+    }
+    else if (mechanism == CKM_RSA_PKCS_OAEP){
+        const EVP_MD* dgst = NULL;
+        unsigned int modulusLen = object->m_pModulus->GetLength();
+        CK_RSA_PKCS_OAEP_PARAMS_PTR pParams = (CK_RSA_PKCS_OAEP_PARAMS_PTR) pParameters;
+
+        switch(pParams->hashAlg)
+        {
+            case CKM_SHA_1: dgst = EVP_sha1(); break;
+            case CKM_SHA256: dgst = EVP_sha256(); break;
+            case CKM_SHA384: dgst = EVP_sha384(); break;
+            case CKM_SHA512: dgst = EVP_sha512(); break;
+        }
+
+        if(dataToEncrypt->GetLength() > (modulusLen - 2 - (2*EVP_MD_size(dgst)))){
+            throw PKCS11Exception(CKR_DATA_LEN_RANGE);
+        }
+
+        u1Array encodedMessage(modulusLen);
+        memset(encodedMessage.GetBuffer(),0,modulusLen);
+
+        if (!EncodeOAEP(encodedMessage.GetBuffer(), modulusLen, dataToEncrypt->GetBuffer(), dataToEncrypt->GetLength(), dgst, NULL, 0))
+        {
+            // should never happen
+            throw PKCS11Exception(CKR_FUNCTION_FAILED);
+        }
+
+        // now perform raw RSA exponentiation
+        RSA* rsa = RSA_new();
+        BIGNUM* rsa_n = BN_bin2bn(object->m_pModulus->GetBuffer(), object->m_pModulus->GetLength(), NULL);
+        BIGNUM* rsa_e = BN_bin2bn(object->m_pPublicExponent->GetBuffer(), object->m_pPublicExponent->GetLength(), NULL);
+	RSA_set0_key(rsa,rsa_n,rsa_e,NULL);
+        int l = RSA_public_encrypt(encodedMessage.GetLength(), encodedMessage.GetBuffer(), pEncryptedData, rsa, RSA_NO_PADDING);
+        RSA_free(rsa);
+
+        if (l < 0)
+        {
+            // should never happen
+            throw PKCS11Exception(CKR_FUNCTION_FAILED);
+        }
 
     }else{
 
@@ -2303,7 +3210,7 @@ void Token::encrypt( const StorageObject* pubObj, Marshaller::u1Array* dataToEnc
         }
 
         // pre-pad with zeros
-        Marshaller::u1Array messageToEncrypt(modulusLen);
+        u1Array messageToEncrypt(modulusLen);
         memset(messageToEncrypt.GetBuffer(),0,modulusLen);
 
         s4 offsetMsgToEncrypt = modulusLen - dataToEncrypt->GetLength();
@@ -2314,31 +3221,26 @@ void Token::encrypt( const StorageObject* pubObj, Marshaller::u1Array* dataToEnc
             messageToEncrypt.GetBuffer()[j] = dataToEncrypt->GetBuffer()[i];
         }
 
-        // just block transform now
-        s4 size ;
-        s4 pubSize ;
-        R_RSA_PUBLIC_KEY	rsaKeyPublic ;
+        // now perform raw RSA exponentiation
+        RSA* rsa = RSA_new();
+        BIGNUM* rsa_n = BN_bin2bn(object->m_pModulus->GetBuffer(), object->m_pModulus->GetLength(), NULL);
+        BIGNUM* rsa_e = BN_bin2bn(object->m_pPublicExponent->GetBuffer(), object->m_pPublicExponent->GetLength(), NULL);
+	RSA_set0_key(rsa,rsa_n,rsa_e,NULL);
+        int status = RSA_public_encrypt(messageToEncrypt.GetLength(), messageToEncrypt.GetBuffer(), pEncryptedData, rsa, RSA_NO_PADDING);
+        RSA_free(rsa);
 
-        //Build the RSA public key context
-        rsaKeyPublic.bits = object->m_pModulus->GetLength() * 8;
-
-        size = (rsaKeyPublic.bits  + 7) / 8 ;
-        memcpy(rsaKeyPublic.modulus,object->m_pModulus->GetBuffer(),size) ;
-
-        pubSize = ((object->m_pPublicExponent->GetLength() * 8) + 7) / 8 ;
-        memset(rsaKeyPublic.exponent, 0, size) ;
-        memcpy(&rsaKeyPublic.exponent[size - pubSize], object->m_pPublicExponent->GetBuffer(), pubSize) ;
-
-        unsigned int outputLen = size;
-
-        RSAPublicBlock(pEncryptedData,&outputLen,messageToEncrypt.GetBuffer(),size,&rsaKeyPublic);
+        if (status < 0)
+        {
+            // should never happen
+            throw PKCS11Exception(CKR_FUNCTION_FAILED);
+        }
     }
 }
 
 
 /*
 */
-void Token::decrypt( const StorageObject* privObj, Marshaller::u1Array* dataToDecrypt, const CK_ULONG& mechanism, CK_BYTE_PTR pData, CK_ULONG_PTR pulDataLen ) {
+void Token::decrypt( const StorageObject* privObj, u1Array* dataToDecrypt, const CK_ULONG& mechanism, unsigned char algo, CK_BYTE_PTR pData, CK_ULONG_PTR pulDataLen ) {
 
     if( !m_Device ) {
 
@@ -2347,21 +3249,22 @@ void Token::decrypt( const StorageObject* privObj, Marshaller::u1Array* dataToDe
 
     RSAPrivateKeyObject* rsaKey = (RSAPrivateKeyObject*)privObj;
 
-    boost::shared_ptr< Marshaller::u1Array > data;
+    boost::shared_ptr< u1Array > data;
+    CAtomicLogin atomicLogin(this, false, rsaKey->m_role);
 
     try {
-
-        data = m_Device->privateKeyDecrypt( rsaKey->m_ucContainerIndex, rsaKey->m_ucKeySpec, dataToDecrypt );
+        if (CKM_RSA_PKCS_OAEP != mechanism)
+            data = m_Device->privateKeyDecrypt( rsaKey->m_ucContainerIndex, rsaKey->m_ucKeySpec, dataToDecrypt );
+        else
+            data = m_Device->privateKeyDecryptEx( rsaKey->m_ucContainerIndex, rsaKey->m_ucKeySpec, PADDING_OAEP, algo, dataToDecrypt );
 
     } catch( MiniDriverException& x ) {
 
         Log::error( "Token::decrypt", "MiniDriverException" );
-        throw PKCS11Exception( checkException( x ) );
-    }
-
-    if( !data ) {
-
-        throw PKCS11Exception( CKR_ENCRYPTED_DATA_INVALID );
+        if (x.getError() == SCARD_E_INVALID_PARAMETER)
+            throw PKCS11Exception( CKR_ENCRYPTED_DATA_INVALID );
+        else
+            throw PKCS11Exception( checkException( x ) );
     }
 
     unsigned int l = data->GetLength( );
@@ -2392,7 +3295,7 @@ void Token::decrypt( const StorageObject* privObj, Marshaller::u1Array* dataToDe
 
             l = l - mPos;
 
-            data.reset( new Marshaller::u1Array( l ) );
+            data.reset( new u1Array( l ) );
 
             p = data->GetBuffer( );
 
@@ -2422,373 +3325,422 @@ void Token::decrypt( const StorageObject* privObj, Marshaller::u1Array* dataToDe
 
 /*
 */
-void Token::verify( const StorageObject* pubObj, Marshaller::u1Array* dataToVerify, const CK_ULONG& mechanism, Marshaller::u1Array* signature) {
+void Token::verify( const StorageObject* pubObj, u1Array* dataToVerify, const CK_ULONG& mechanism, u1Array* signature) {
 
-    Pkcs11ObjectKeyPublicRSA* o = (Pkcs11ObjectKeyPublicRSA*)pubObj;
+    Pkcs11ObjectKeyPublic* o = (Pkcs11ObjectKeyPublic*)pubObj;
+    bool bIsRSA = o->_keyType == CKK_RSA;
 
-    if(((mechanism == CKM_RSA_PKCS) && (dataToVerify->GetLength() > (o->m_pModulus->GetLength() - 11))) ||
-        ((mechanism == CKM_RSA_X_509) && (dataToVerify->GetLength() > o->m_pModulus->GetLength())))
+    if (bIsRSA)
     {
-        throw PKCS11Exception(CKR_DATA_LEN_RANGE);
+        Pkcs11ObjectKeyPublicRSA* rsaKey = (Pkcs11ObjectKeyPublicRSA*) o;
+        if(((mechanism == CKM_RSA_PKCS) && (dataToVerify->GetLength() > (rsaKey->m_pModulus->GetLength() - 11))) ||
+            ((mechanism == CKM_RSA_X_509) && (dataToVerify->GetLength() > rsaKey->m_pModulus->GetLength())))
+        {
+            throw PKCS11Exception(CKR_DATA_LEN_RANGE);
+        }
+
+        if( signature->GetLength( ) != rsaKey->m_pModulus->GetLength( ) ){
+
+            throw PKCS11Exception(CKR_SIGNATURE_LEN_RANGE);
+        }
+
+        int size = rsaKey->m_pModulus->GetLength();
+        int bits = size * 8;
+        unsigned int messageToVerifyLen = size;
+        u1Array messageToVerify( messageToVerifyLen );
+
+        RSA* rsa = RSA_new();
+        BIGNUM* rsa_n = BN_bin2bn(rsaKey->m_pModulus->GetBuffer(), rsaKey->m_pModulus->GetLength(), NULL);
+        BIGNUM* rsa_e = BN_bin2bn(rsaKey->m_pPublicExponent->GetBuffer(), rsaKey->m_pPublicExponent->GetLength(), NULL);
+	RSA_set0_key(rsa,rsa_n,rsa_e,NULL);
+        int l = RSA_public_encrypt(size, signature->GetBuffer(), messageToVerify.GetBuffer(), rsa, RSA_NO_PADDING);
+        RSA_free(rsa);
+
+        if (l < 0)
+        {
+            // should never happen
+            throw PKCS11Exception( CKR_SIGNATURE_INVALID );
+        }
+
+        switch(mechanism){
+
+        case CKM_RSA_PKCS:
+            Pkcs11ObjectKeyPublicRSA::verifyRSAPKCS1v15( &messageToVerify,dataToVerify,size);
+            break;
+
+        case CKM_RSA_X_509:
+            Pkcs11ObjectKeyPublicRSA::verifyRSAX509( &messageToVerify,dataToVerify,size);
+            break;
+
+        case CKM_SHA1_RSA_PKCS:
+            Pkcs11ObjectKeyPublicRSA::verifyHash( &messageToVerify,dataToVerify,size,CKM_SHA_1);
+            break;
+
+        case CKM_SHA256_RSA_PKCS:
+            Pkcs11ObjectKeyPublicRSA::verifyHash( &messageToVerify,dataToVerify,size,CKM_SHA256);
+            break;
+
+        case CKM_SHA384_RSA_PKCS:
+            Pkcs11ObjectKeyPublicRSA::verifyHash( &messageToVerify,dataToVerify,size,CKM_SHA384);
+            break;
+
+        case CKM_SHA512_RSA_PKCS:
+            Pkcs11ObjectKeyPublicRSA::verifyHash( &messageToVerify,dataToVerify,size,CKM_SHA512);
+            break;
+
+        case CKM_MD5_RSA_PKCS:
+            Pkcs11ObjectKeyPublicRSA::verifyHash( &messageToVerify,dataToVerify,size,CKM_MD5);
+            break;
+
+        case CKM_RSA_PKCS_PSS:
+            {
+                const EVP_MD* Hash = NULL;
+                if (dataToVerify->GetLength() == 20)
+                    Hash = EVP_sha1();
+                else if (dataToVerify->GetLength() == 32)
+                    Hash = EVP_sha256();
+                else if (dataToVerify->GetLength() == 48)
+                    Hash = EVP_sha384();
+                else if (dataToVerify->GetLength() == 64)
+                    Hash = EVP_sha512();
+
+                const EVP_MD* Mgf1 = Hash; // We only support MGF1 based on the same hash
+
+                if (0 == VerifyPSS(bits, dataToVerify->GetBuffer(), Hash, Mgf1, messageToVerify.GetBuffer(), EVP_MD_size(Hash)))
+                    throw PKCS11Exception( CKR_SIGNATURE_INVALID );
+            }
+            break;
+        case CKM_SHA1_RSA_PKCS_PSS:
+            if (0 == VerifyPSS(bits, dataToVerify->GetBuffer(), EVP_sha1(), EVP_sha1(), messageToVerify.GetBuffer(), 20))
+                throw PKCS11Exception( CKR_SIGNATURE_INVALID );
+            break;
+        case CKM_SHA256_RSA_PKCS_PSS:
+            if (0 == VerifyPSS(bits, dataToVerify->GetBuffer(), EVP_sha256(), EVP_sha256(), messageToVerify.GetBuffer(), 32))
+                throw PKCS11Exception( CKR_SIGNATURE_INVALID );
+            break;
+        case CKM_SHA384_RSA_PKCS_PSS:
+            if (0 == VerifyPSS(bits, dataToVerify->GetBuffer(), EVP_sha384(), EVP_sha384(), messageToVerify.GetBuffer(), 48))
+                throw PKCS11Exception( CKR_SIGNATURE_INVALID );
+            break;
+        case CKM_SHA512_RSA_PKCS_PSS:
+            if (0 == VerifyPSS(bits, dataToVerify->GetBuffer(), EVP_sha512(), EVP_sha512(), messageToVerify.GetBuffer(), 64))
+                throw PKCS11Exception( CKR_SIGNATURE_INVALID );
+            break;
+
+        default:
+            throw PKCS11Exception( CKR_GENERAL_ERROR );
+        }
     }
-
-    if( signature->GetLength( ) != o->m_pModulus->GetLength( ) ){
-
-        throw PKCS11Exception(CKR_SIGNATURE_LEN_RANGE);
-    }
-
-    s4 size;
-    s4 pubSize;
-    R_RSA_PUBLIC_KEY rsaKeyPublic ;
-
-    //Build the RSA public key context
-    rsaKeyPublic.bits = o->m_pModulus->GetLength() * 8;
-
-    size = (rsaKeyPublic.bits  + 7) / 8 ;
-    memcpy(rsaKeyPublic.modulus, o->m_pModulus->GetBuffer(),size) ;
-
-    pubSize = ((o->m_pPublicExponent->GetLength() * 8) + 7) / 8 ;
-    memset(rsaKeyPublic.exponent, 0, size) ;
-    memcpy(&rsaKeyPublic.exponent[size - pubSize], o->m_pPublicExponent->GetBuffer(), pubSize) ;
-
-    unsigned int messageToVerifyLen = size;
-    Marshaller::u1Array messageToVerify( messageToVerifyLen );
-
-    RSAPublicBlock(messageToVerify.GetBuffer(),&messageToVerifyLen,signature->GetBuffer(),size,&rsaKeyPublic);
-
-    switch(mechanism){
-
-    case CKM_RSA_PKCS:
-        verifyRSAPKCS1v15( &messageToVerify,dataToVerify,size);
-        break;
-
-    case CKM_RSA_X_509:
-        verifyRSAX509( &messageToVerify,dataToVerify,size);
-        break;
-
-
-    case CKM_SHA1_RSA_PKCS:
-        verifyHash( &messageToVerify,dataToVerify,size,CKM_SHA_1);
-        break;
-
-    case CKM_SHA256_RSA_PKCS:
-        verifyHash( &messageToVerify,dataToVerify,size,CKM_SHA256);
-        break;
-
-    case CKM_MD5_RSA_PKCS:
-        verifyHash( &messageToVerify,dataToVerify,size,CKM_MD5);
-        break;
-
-    default:
-        throw PKCS11Exception( CKR_GENERAL_ERROR );
-    }
-}
-
-
-/*
-*/
-void Token::verifyHash( Marshaller::u1Array* messageToVerify, Marshaller::u1Array* dataToVerify, const unsigned int& modulusLen, const CK_ULONG& hashAlgo ) {
-
-    const unsigned char* msg  = messageToVerify->GetBuffer( );
-
-    // Check the decoded value against the expected data.
-    if( ( msg[ 0 ] != 0x00 ) || ( msg[ 1 ] != 0x01 ) ) {
-
-        throw PKCS11Exception( CKR_SIGNATURE_INVALID );
-    }
-    unsigned char DER_SHA1_Encoding[]   = {0x30,0x21,0x30,0x09,0x06,0x05,0x2B,0x0E,0x03,0x02,0x1A,0x05,0x00,0x04,0x14};
-    unsigned char DER_SHA256_Encoding[] = {0x30,0x31,0x30,0x0d,0x06,0x09,0x60,0x86,0x48,0x01,0x65,0x03,0x04,0x02,0x01,0x05,0x00,0x04,0x20};
-    unsigned char DER_MD5_Encoding[]    = {0x30,0x20,0x30,0x0C,0x06,0x08,0x2A,0x86,0x48,0x86,0xF7,0x0D,0x02,0x05,0x05,0x00,0x04,0x10};
-
-    s4  DER_Encoding_Len = 0;
-
-    switch(hashAlgo){
-    case CKM_SHA_1:
-        DER_Encoding_Len = sizeof(DER_SHA1_Encoding);
-        break;
-
-    case CKM_SHA256:
-        DER_Encoding_Len = sizeof(DER_SHA256_Encoding);
-        break;
-
-    case CKM_MD5:
-        DER_Encoding_Len = sizeof(DER_MD5_Encoding);
-        break;
-
-    }
-
-    const unsigned char* hash = dataToVerify->GetBuffer();
-    unsigned int hashLen = dataToVerify->GetLength();
-
-    s4 posn = modulusLen - DER_Encoding_Len - hashLen;
-
-    for(s4 i = 2; i < (posn - 1); i++)
+    else
     {
-        if(msg[i] != 0xFF){
-            throw PKCS11Exception( CKR_SIGNATURE_INVALID );
-        }
-    }
+        Pkcs11ObjectKeyPublicECC* eccKey = (Pkcs11ObjectKeyPublicECC*) o;
+        u4 nLen = (eccKey->getOrderBitLength() + 7) / 8;
+        u4 ulExpectedSigLen = 2 * nLen;
 
-    if(msg[posn - 1] != 0x00){
-        throw PKCS11Exception( CKR_SIGNATURE_INVALID );
-    }
-
-    for (unsigned int i = 0; i < hashLen; ++i){
-        if (msg[posn + i + DER_Encoding_Len] != hash[i]){
-            throw PKCS11Exception( CKR_SIGNATURE_INVALID );
+        if (mechanism == CKM_ECDSA)
+        {
+            if (dataToVerify->GetLength() != 20 && dataToVerify->GetLength() != 32 && dataToVerify->GetLength() != 48 && dataToVerify->GetLength() != 64)
+            {
+                throw PKCS11Exception( CKR_DATA_LEN_RANGE );
+            }
         }
+
+        if( (signature->GetLength() == 0) || (signature->GetLength( ) > ulExpectedSigLen) || (signature->GetLength() % 2 != 0)){
+
+            throw PKCS11Exception(CKR_SIGNATURE_LEN_RANGE);
+        }
+
+        if (!eccKey->verify(dataToVerify, signature))
+            throw PKCS11Exception( CKR_SIGNATURE_INVALID );
     }
 }
 
-
 /*
 */
-void Token::verifyRSAX509( Marshaller::u1Array* messageToVerify, Marshaller::u1Array* dataToVerify, const unsigned int& modulusLen ) {
-
-    // Reach the first non-zero bytes in data
-    unsigned int usDataLen = dataToVerify->GetLength( );
-    unsigned int pos1=0;
-    const unsigned char* pData = dataToVerify->GetBuffer( );
-    for( ; pos1 < usDataLen ; ++pos1 ) {
-
-        if( pData[ pos1 ] ) {
-
-            break;
-        }
-    }
-
-    // Reach the first non-zero bytes in decrypted signature
-    unsigned int usMessageLen = messageToVerify->GetLength( );
-    const unsigned char* pMessage = messageToVerify->GetBuffer( );
-    unsigned int pos2=0;
-    for( ; pos2 < usMessageLen ; ++pos2 ) {
-
-        if( pMessage[ pos2 ] ) {
-
-            break;
-        }
-    }
-
-    if( ( usDataLen - pos1 ) != ( modulusLen - pos2 ) ) {
-
-        throw PKCS11Exception( CKR_SIGNATURE_INVALID );
-    }
-
-
-    for( unsigned int i = pos1, j = pos2 ; i < ( modulusLen - pos2 ) ; ++i, ++j ) {
-
-        if( pData[ i ] != pMessage[ j ] ) {
-
-            throw PKCS11Exception( CKR_SIGNATURE_INVALID );
-        }
-    }
-}
-
-
-/*
-*/
-void Token::verifyRSAPKCS1v15( Marshaller::u1Array* messageToVerify, Marshaller::u1Array* dataToVerify, const unsigned int& modulusLen ) {
-
-    // Skip the PKCS block formatting data
-    unsigned int pos = 2;
-    const unsigned char* pMessage = messageToVerify->GetBuffer( ); 
-    for( ; pos < modulusLen ; ++pos) {
-
-        if( !pMessage[ pos ] ) { //== 0x00
-
-            ++pos;
-            break;
-        }
-    }
-
-    if( dataToVerify->GetLength( ) != ( modulusLen - pos ) ) {
-
-        throw PKCS11Exception( CKR_SIGNATURE_INVALID );
-    }
-
-    const unsigned char* pData = dataToVerify->GetBuffer( ); 
-    for( unsigned int i = 0, j = pos ; i < ( modulusLen - pos ) ; ++i, ++j ) {
-
-        if( pData[ i ] != pMessage[ j ] ) {
-
-            throw PKCS11Exception( CKR_SIGNATURE_INVALID );
-        }
-    }
-}
-
-
-/*
-*/
-void Token::sign( const RSAPrivateKeyObject* privObj, Marshaller::u1Array* dataToSign, const CK_ULONG& mechanism, CK_BYTE_PTR pSignature ) {
+void Token::sign( const KeyObject* keyObj, u1Array* dataToSign, u1Array* intermediateHash, u1Array* hashCounter, const CK_ULONG& mechanism, CK_BYTE_PTR pSignature ) {
 
     if( !m_Device ) {
 
         throw PKCS11Exception( CKR_TOKEN_NOT_PRESENT );
     }
 
-    boost::shared_ptr< Marshaller::u1Array > messageToSign;
+    if (keyObj->_keyType == CKK_AES){
 
-    RSAPrivateKeyObject* rsaKey = ( RSAPrivateKeyObject* ) privObj;
+        SecretKeyObjectAES* aesKey = ( SecretKeyObjectAES* ) keyObj;
 
-    if( !(rsaKey->m_pModulus) ) {
+        boost::shared_ptr< u1Array > signatureData;
+        CAtomicLogin atomicLogin(this, false, aesKey->m_role);
+        try {
 
-        throw PKCS11Exception( CKR_KEY_FUNCTION_NOT_PERMITTED );
+            // CMAC does not need hashing and any padding is done in the CMAC itself
+            signatureData = m_Device->privateKeySign( aesKey->m_ucContainerIndex, aesKey->m_ucKeySpec, 0, 0, dataToSign, intermediateHash, hashCounter );
+
+        } catch( MiniDriverException& x ) {
+
+            Log::error( "Token::sign", "MiniDriverException" );
+            throw PKCS11Exception( checkException( x ) );
+        }
+
+        if( !signatureData ) {
+
+            throw PKCS11Exception( CKR_FUNCTION_FAILED );
+        }
+
+        memcpy( pSignature, signatureData->GetBuffer( ), signatureData->GetLength( ) );
     }
+    else if (keyObj->_keyType == CKK_RSA)
+    {
+        boost::shared_ptr< u1Array > messageToSign;
 
-    CK_ULONG modulusLen = rsaKey->m_pModulus->GetLength( );
+        RSAPrivateKeyObject* rsaKey = ( RSAPrivateKeyObject* ) keyObj;
 
-    if( ( ( mechanism == CKM_RSA_PKCS ) && ( dataToSign->GetLength( ) > ( modulusLen - 11 ) ) ) || ( ( mechanism == CKM_RSA_X_509 ) && ( dataToSign->GetLength( ) > modulusLen ) ) ) {
+        if( !(rsaKey->m_pModulus) ) {
 
-        throw PKCS11Exception( CKR_DATA_LEN_RANGE );
+            throw PKCS11Exception( CKR_KEY_FUNCTION_NOT_PERMITTED );
+        }
+
+        CK_ULONG modulusLen = rsaKey->m_pModulus->GetLength( );
+
+        if( ( ( mechanism == CKM_RSA_PKCS ) && ( dataToSign->GetLength( ) > ( modulusLen - 11 ) ) ) || ( ( mechanism == CKM_RSA_X_509 ) && ( dataToSign->GetLength( ) > modulusLen ) ) ) {
+
+            throw PKCS11Exception( CKR_DATA_LEN_RANGE );
+        }
+
+        unsigned char ucAlgo = 0, ucPaddingType = 0;
+        bool bIsExplicitSign = (intermediateHash != NULL);
+
+        switch( mechanism ) {
+
+        case CKM_RSA_PKCS:
+            messageToSign.reset( RSAPrivateKeyObject::PadRSAPKCS1v15( dataToSign, modulusLen ) );
+            break;
+
+        case CKM_RSA_X_509:
+            messageToSign.reset( RSAPrivateKeyObject::PadRSAX509( dataToSign, modulusLen ) );
+            break;
+
+        case CKM_SHA1_RSA_PKCS:
+            if (bIsExplicitSign)
+            {
+                ucPaddingType = PADDING_PKCS1;
+                ucAlgo = ALGO_SHA_1;
+            }
+            else
+                messageToSign.reset( RSAPrivateKeyObject::EncodeHashForSigning( dataToSign, modulusLen, CKM_SHA_1 ) );
+            break;
+
+        case CKM_SHA256_RSA_PKCS:
+            if (bIsExplicitSign)
+            {
+                ucPaddingType = PADDING_PKCS1;
+                ucAlgo = ALGO_SHA_256;
+            }
+            else
+                messageToSign.reset( RSAPrivateKeyObject::EncodeHashForSigning( dataToSign, modulusLen, CKM_SHA256 ) );
+            break;
+
+        case CKM_SHA384_RSA_PKCS:
+            if (bIsExplicitSign)
+            {
+                ucPaddingType = PADDING_PKCS1;
+                ucAlgo = ALGO_SHA_384;
+            }
+            else
+                messageToSign.reset( RSAPrivateKeyObject::EncodeHashForSigning( dataToSign, modulusLen, CKM_SHA384 ) );
+            break;
+
+        case CKM_SHA512_RSA_PKCS:
+            if (bIsExplicitSign)
+            {
+                ucPaddingType = PADDING_PKCS1;
+                ucAlgo = ALGO_SHA_512;
+            }
+            else
+                messageToSign.reset( RSAPrivateKeyObject::EncodeHashForSigning( dataToSign, modulusLen, CKM_SHA512 ) );
+            break;
+
+        case CKM_MD5_RSA_PKCS:
+            messageToSign.reset( RSAPrivateKeyObject::EncodeHashForSigning( dataToSign, modulusLen, CKM_MD5 ) );
+            break;
+
+        case CKM_RSA_PKCS_PSS:
+            bIsExplicitSign = true;
+            ucPaddingType = PADDING_PSS;
+            if (dataToSign->GetLength() == 20)
+                ucAlgo = ALGO_SHA_1;
+            else if (dataToSign->GetLength() == 32)
+                ucAlgo = ALGO_SHA_256;
+            else if (dataToSign->GetLength() == 48)
+                ucAlgo = ALGO_SHA_384;
+            else if (dataToSign->GetLength() == 64)
+                ucAlgo = ALGO_SHA_512;
+            break;
+        case CKM_SHA1_RSA_PKCS_PSS:
+            bIsExplicitSign = true;
+            ucPaddingType = PADDING_PSS;
+            ucAlgo = ALGO_SHA_1;
+            break;
+        case CKM_SHA256_RSA_PKCS_PSS:
+            bIsExplicitSign = true;
+            ucPaddingType = PADDING_PSS;
+            ucAlgo = ALGO_SHA_256;
+            break;
+        case CKM_SHA384_RSA_PKCS_PSS:
+            bIsExplicitSign = true;
+            ucPaddingType = PADDING_PSS;
+            ucAlgo = ALGO_SHA_384;
+            break;
+        case CKM_SHA512_RSA_PKCS_PSS:
+            bIsExplicitSign = true;
+            ucPaddingType = PADDING_PSS;
+            ucAlgo = ALGO_SHA_512;
+            break;
+        }
+
+        boost::shared_ptr< u1Array > signatureData;
+        CAtomicLogin atomicLogin(this, false, rsaKey->m_role);
+        try {
+
+            if (bIsExplicitSign)
+                signatureData = m_Device->privateKeySign( rsaKey->m_ucContainerIndex, rsaKey->m_ucKeySpec, ucPaddingType, ucAlgo, dataToSign, intermediateHash, hashCounter );
+            else
+                signatureData = m_Device->privateKeyDecrypt( rsaKey->m_ucContainerIndex, rsaKey->m_ucKeySpec, messageToSign.get( ) );
+
+        } catch( MiniDriverException& x ) {
+
+            Log::error( "Token::sign", "MiniDriverException" );
+            throw PKCS11Exception( checkException( x ) );
+        }
+
+        if( !signatureData ) {
+
+            throw PKCS11Exception( CKR_FUNCTION_FAILED );
+        }
+
+        memcpy( pSignature, signatureData->GetBuffer( ), signatureData->GetLength( ) );
     }
+    else
+    {
+        ECCPrivateKeyObject* eccKey = ( ECCPrivateKeyObject* ) keyObj;
+        unsigned char ucAlgo;
 
-    switch( mechanism ) {
+        if( !(eccKey->m_pParams) ) {
 
-    case CKM_RSA_PKCS:
-        messageToSign.reset( PadRSAPKCS1v15( dataToSign, modulusLen ) );
-        break;
+            throw PKCS11Exception( CKR_KEY_FUNCTION_NOT_PERMITTED );
+        }
 
-    case CKM_RSA_X_509:
-        messageToSign.reset( PadRSAX509( dataToSign, modulusLen ) );
-        break;
+        if (!intermediateHash)
+        {
+            // full hash given in input
+            switch( dataToSign->GetLength() ) {
 
-    case CKM_SHA1_RSA_PKCS:
-        messageToSign.reset( EncodeHashForSigning( dataToSign, modulusLen, CKM_SHA_1 ) );
-        break;
+            case 20:
+                ucAlgo = ALGO_SHA_1;
+                break;
 
-    case CKM_SHA256_RSA_PKCS:
-        messageToSign.reset( EncodeHashForSigning( dataToSign, modulusLen, CKM_SHA256 ) );
-        break;
+            case 32:
+                ucAlgo = ALGO_SHA_256;
+                break;
 
-    case CKM_MD5_RSA_PKCS:
-        messageToSign.reset( EncodeHashForSigning( dataToSign, modulusLen, CKM_MD5 ) );
-        break;
+            case 48:
+                ucAlgo = ALGO_SHA_384;
+                break;
+
+            case 64:
+                ucAlgo = ALGO_SHA_512;
+                break;
+
+            default:
+                throw PKCS11Exception( CKR_DATA_LEN_RANGE );
+                break;
+            }
+        }
+        else
+        {
+            switch(mechanism)
+            {
+            case CKM_ECDSA_SHA1:
+                ucAlgo = ALGO_SHA_1;
+                break;
+            case CKM_ECDSA_SHA256:
+                ucAlgo = ALGO_SHA_256;
+                break;
+            case CKM_ECDSA_SHA384:
+                ucAlgo = ALGO_SHA_384;
+                break;
+            case CKM_ECDSA_SHA512:
+                ucAlgo = ALGO_SHA_512;
+                break;
+            default:
+                throw PKCS11Exception( CKR_GENERAL_ERROR );
+                break;
+            }
+        }
+
+        boost::shared_ptr< u1Array > signatureData;
+        CAtomicLogin atomicLogin(this, false, eccKey->m_role);
+        try {
+
+            signatureData = m_Device->privateKeySign( eccKey->m_ucContainerIndex, eccKey->m_ucKeySpec, 0, ucAlgo, dataToSign, intermediateHash, hashCounter );
+
+        } catch( MiniDriverException& x ) {
+
+            Log::error( "Token::sign", "MiniDriverException" );
+            throw PKCS11Exception( checkException( x ) );
+        }
+
+        if( !signatureData ) {
+
+            throw PKCS11Exception( CKR_FUNCTION_FAILED );
+        }
+
+        memcpy( pSignature, signatureData->GetBuffer( ), signatureData->GetLength( ) );
     }
-
-    boost::shared_ptr< Marshaller::u1Array > signatureData;
-
-    try {
-
-        signatureData = m_Device->privateKeyDecrypt( rsaKey->m_ucContainerIndex, rsaKey->m_ucKeySpec, messageToSign.get( ) );
-
-    } catch( MiniDriverException& x ) {
-
-        Log::error( "Token::sign", "MiniDriverException" );
-        throw PKCS11Exception( checkException( x ) );
-    }
-
-    if( !signatureData ) {
-
-        throw PKCS11Exception( CKR_FUNCTION_FAILED );
-    }
-
-    memcpy( pSignature, signatureData->GetBuffer( ), signatureData->GetLength( ) );
 }
 
+bool Token::CheckStorageObjectExisting( StorageObject* a_pObject)
+{
+	Log::begin( "Token::CheckStorageObjectExisting" );
 
-/*
-*/
-Marshaller::u1Array* Token::PadRSAPKCS1v15( Marshaller::u1Array* dataToSign, const CK_ULONG& modulusLen ) {
+	bool bRet = false;
 
-    Marshaller::u1Array* messageToSign = new Marshaller::u1Array( modulusLen );
+	// look for the object in our list
+    BOOST_FOREACH( const TOKEN_OBJECTS::value_type& o, m_Objects ) {
 
-    memset( messageToSign->GetBuffer( ), 0, modulusLen );
+		if (a_pObject->m_stFileName != "")
+		{
+			// we use the filename on the card
+			if (o->second->m_stFileName == a_pObject->m_stFileName)
+			{
+				Log::log( "CheckStorageObjectExisting - object found on internal list (filename check <%s>)", a_pObject->m_stFileName.c_str());
+				bRet = true;
+				break;
+			}
+		}
+		else
+		{
+			// we use the object attributes
+			if (o->second->isEqual(a_pObject))
+			{
+				Log::log( "CheckStorageObjectExisting - object found on internal list (attributes check)");
+				bRet = true;
+				break;
+			}
+		}
+	}
 
-    messageToSign->SetU1At( 1, 1 );
+	if (!bRet)
+	{
+		Log::log( "CheckStorageObjectExisting - object doesn't exist");
+	}
 
-    s4 offsetMessageToSign = modulusLen - dataToSign->GetLength( ) - 3;
-
-    for( s4 i = 0 ; i < offsetMessageToSign ; ++i ) {
-
-        messageToSign->SetU1At( 2 + i, 0xFF );
-    }
-
-    offsetMessageToSign += 3;
-
-    memcpy( (unsigned char*)&messageToSign->GetBuffer( )[ offsetMessageToSign ], dataToSign->GetBuffer( ), dataToSign->GetLength( ) );
-
-    return messageToSign;
+	Log::end( "Token::CheckStorageObjectExisting" );
+	return bRet;
 }
-
-
-/*
-*/
-Marshaller::u1Array* Token::PadRSAX509( Marshaller::u1Array* dataToSign, const CK_ULONG& modulusLen ) {
-
-    Marshaller::u1Array* messageToSign = new Marshaller::u1Array( modulusLen );
-
-    memset( messageToSign->GetBuffer( ), 0, modulusLen );
-
-    s4 offsetMessageToSign = modulusLen - dataToSign->GetLength( );
-
-    memcpy( (unsigned char*)&messageToSign->GetBuffer( )[ offsetMessageToSign ], dataToSign->GetBuffer( ), dataToSign->GetLength( ) );
-
-    return messageToSign;
-}
-
-
-/*
-*/
-Marshaller::u1Array* Token::EncodeHashForSigning( Marshaller::u1Array* hashedData, const CK_ULONG& modulusLen, const CK_ULONG& hashAlgo ) {
-
-    unsigned char DER_SHA1_Encoding[ ]   = { 0x30, 0x21, 0x30, 0x09, 0x06, 0x05, 0x2B, 0x0E, 0x03, 0x02, 0x1A, 0x05, 0x00, 0x04, 0x14 };
-
-    unsigned char DER_SHA256_Encoding[ ] = { 0x30, 0x31, 0x30, 0x0d, 0x06, 0x09, 0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x01, 0x05, 0x00, 0x04, 0x20 };
-
-    unsigned char DER_MD5_Encoding[ ]    = { 0x30, 0x20, 0x30, 0x0C, 0x06, 0x08, 0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x02, 0x05, 0x05, 0x00, 0x04, 0x10 };
-
-    unsigned char* DER_Encoding = NULL_PTR;
-
-    s4 DER_Encoding_Len = 0;
-
-    switch( hashAlgo ) {
-
-    case CKM_SHA_1:
-        DER_Encoding_Len = sizeof(DER_SHA1_Encoding);
-        DER_Encoding = new unsigned char[DER_Encoding_Len]; //(unsigned char*)malloc(DER_Encoding_Len);
-        memcpy(DER_Encoding,DER_SHA1_Encoding,DER_Encoding_Len);
-        break;
-
-    case CKM_SHA256:
-        DER_Encoding_Len = sizeof(DER_SHA256_Encoding);
-        DER_Encoding = new unsigned char[DER_Encoding_Len]; //(unsigned char*)malloc(DER_Encoding_Len);
-        memcpy(DER_Encoding,DER_SHA256_Encoding,DER_Encoding_Len);
-        break;
-
-    case CKM_MD5:
-        DER_Encoding_Len = sizeof(DER_MD5_Encoding);
-        DER_Encoding = new unsigned char[DER_Encoding_Len]; //(unsigned char*)malloc(DER_Encoding_Len);
-        memcpy(DER_Encoding,DER_MD5_Encoding,DER_Encoding_Len);
-        break;
-
-    }
-
-    Marshaller::u1Array* messageToSign = new Marshaller::u1Array( modulusLen );
-
-    memset( messageToSign->GetBuffer( ), 0, modulusLen );
-
-    messageToSign->SetU1At( 1, 1 );
-
-    // caluclate pos
-    int pos = modulusLen - DER_Encoding_Len - hashedData->GetLength( );
-
-    for( int i = 2 ; i < (pos - 1) ; ++i ) {
-
-        messageToSign->SetU1At( i, 0xFF );
-    }
-
-    memcpy((unsigned char*)&messageToSign->GetBuffer()[pos],DER_Encoding,DER_Encoding_Len);
-    memcpy((unsigned char*)&messageToSign->GetBuffer()[pos+DER_Encoding_Len],hashedData->GetBuffer(),hashedData->GetLength());
-
-    delete DER_Encoding;
-
-    return messageToSign;
-}
-
 
 /* Add a PKCS11 object to the token object list
-*/ 
-CK_OBJECT_HANDLE Token::registerStorageObject( StorageObject* a_pObject ) {
+*/
+CK_OBJECT_HANDLE Token::registerStorageObject( StorageObject* a_pObject , bool bCheckExistence) {
 
     Log::begin( "Token::registerStorageObject" );
     Timer t;
@@ -2797,17 +3749,30 @@ CK_OBJECT_HANDLE Token::registerStorageObject( StorageObject* a_pObject ) {
     if( !a_pObject ) {
 
         Log::error( "Token::registerStorageObject", "Invalid object" );
+		Log::end( "Token::registerStorageObject" );
         return CK_UNAVAILABLE_INFORMATION;
     }
 
-    // increment the object index
-    CK_OBJECT_HANDLE h = computeObjectHandle( a_pObject->getClass( ), a_pObject->isPrivate( ) );
+	CK_OBJECT_HANDLE h = CK_INVALID_HANDLE;
 
-    // Expand the object list
-    m_Objects.insert( h, a_pObject );
+	// check if the object already exists
+	if ( bCheckExistence && CheckStorageObjectExisting(a_pObject) )
+	{
+        Log::log( "Token::registerStorageObject - object already exists. Skipping." );
+		// we delete the object to free its memory
+		delete a_pObject;
+	}
+	else
+	{
+		// increment the object index
+		h = computeObjectHandle( a_pObject->getClass( ), a_pObject->isPrivate( ) );
 
-    Log::log( "registerStorageObject - Handle <%#02x> - Type <%ld> - File <%s>", h, a_pObject->getClass( ), a_pObject->m_stFileName.c_str( ) );
-    printObject( a_pObject );
+		// Expand the object list
+		m_Objects.insert( h, a_pObject );
+
+		Log::log( "registerStorageObject - Handle <%#02x> - Type <%ld> - File <%s>", h, a_pObject->getClass( ), a_pObject->m_stFileName.c_str( ) );
+		printObject( a_pObject );
+	}
 
     t.stop( "Token::registerStorageObject" );
     Log::end( "Token::registerStorageObject" );
@@ -2829,26 +3794,32 @@ void Token::printObject( StorageObject* a_pObject ) {
     Log::log( "    ====" );
 
     switch( a_pObject->getClass( ) ) {
+        case CKO_DATA:
+            Log::log( "Object CKO_DATA" );
+            ( (DataObject*) a_pObject )->print( );
+            break;
 
-    case CKO_DATA:
-        Log::log( "Object CKO_DATA" );
-        ( (DataObject*) a_pObject )->print( );
-        break;
+        case CKO_CERTIFICATE:
+            Log::log( "Object CKO_CERTIFICATE" );
+            ( (X509PubKeyCertObject*) a_pObject )->print( );
+            break;
 
-    case CKO_CERTIFICATE:
-        Log::log( "Object CKO_CERTIFICATE" );
-        ( (X509PubKeyCertObject*) a_pObject )->print( );
-        break;
+        case CKO_PRIVATE_KEY:
+            Log::log( "Object CKO_PRIVATE_KEY" );
+            ( (PrivateKeyObject*) a_pObject )->print( );
+            //( (RSAPrivateKeyObject*) a_pObject )->print( );
+            break;
 
-    case CKO_PRIVATE_KEY:
-        Log::log( "Object CKO_PRIVATE_KEY" );
-        ( (RSAPrivateKeyObject*) a_pObject )->print( );
-        break;
+        case CKO_PUBLIC_KEY:
+            Log::log( "Object CKO_PUBLIC_KEY" );
+            ( (Pkcs11ObjectKeyPublic*) a_pObject )->print( );
+            //( (Pkcs11ObjectKeyPublicRSA*) a_pObject )->print( );
+            break;
 
-    case CKO_PUBLIC_KEY:
-        Log::log( "Object CKO_PUBLIC_KEY" );
-        ( (Pkcs11ObjectKeyPublicRSA*) a_pObject )->print( );
-        break;
+        case CKO_SECRET_KEY:
+            Log::log( "Object CKO_SECRET_KEY" );
+            ( (SecretKeyObject*) a_pObject )->print( );
+            break;
     };
 
     Log::log( "    ====" );
@@ -2880,7 +3851,7 @@ void Token::unregisterStorageObject( const CK_OBJECT_HANDLE& a_pObject ) {
 
 /*
 */
-void Token::initPIN( Marshaller::u1Array* a_PinSo, Marshaller::u1Array* a_PinUser ) {
+void Token::initPIN( u1Array* a_PinSo, u1Array* a_PinUser ) {
 
     Log::begin( "Token::initPIN" );
     Timer t;
@@ -2891,12 +3862,27 @@ void Token::initPIN( Marshaller::u1Array* a_PinSo, Marshaller::u1Array* a_PinUse
         throw PKCS11Exception( CKR_TOKEN_NOT_PRESENT );
     }
 
+    MiniDriverAuthentication::ROLES unblockRole;
+    bool bPukAuthenticated = false;
     try {
 
+        // if SO is a PUK, authenticate it first
+        unblockRole = m_Device->getPinUnblockRole(getUserRole());
+        if ( (unblockRole != MiniDriverAuthentication::PIN_ADMIN) && (a_PinSo->GetLength() > 0) && m_Device->isDotNetCard( ))
+        {
+            m_Device->verifyPin( unblockRole, a_PinSo);
+            bPukAuthenticated = true;
+        }
         // Initialize the PIN
-        m_Device->unblockPin( a_PinSo, a_PinUser );
+        m_Device->unblockPin( getUserRole(), a_PinSo, a_PinUser );
 
-        // ??? TO DO ??? Utiliser la proprieté card pin initalize
+        if ( bPukAuthenticated )
+        {
+            try { m_Device->logOut( unblockRole , false); } catch (...) {}
+            bPukAuthenticated = false;
+        }
+
+        // ??? TO DO ??? Utiliser la proprietÃ© card pin initalize
         m_TokenInfo.flags |= CKF_USER_PIN_INITIALIZED;
 
         // Reset some User PIN flags
@@ -2904,44 +3890,12 @@ void Token::initPIN( Marshaller::u1Array* a_PinSo, Marshaller::u1Array* a_PinUse
         m_TokenInfo.flags &= ~CKF_USER_PIN_FINAL_TRY;
         m_TokenInfo.flags &= ~CKF_USER_PIN_COUNT_LOW;
 
-    } catch( MiniDriverException& ) {
-
-        // incorrect pin
-        unsigned char triesRemaining = 0;
-
-        try {
-
-            triesRemaining = m_Device->administratorGetTriesRemaining( );
-
-        } catch( MiniDriverException& x ) {
-
-            Log::error( "Token::initPIN", "MiniDriverException" );
-            throw PKCS11Exception( checkException( x ) );
-        }
-
-        // blocked
-        if(triesRemaining == 0) {
-
-            // update tokeninfo flahs
-            m_TokenInfo.flags |= CKF_SO_PIN_LOCKED;
-            m_TokenInfo.flags &= ~CKF_SO_PIN_FINAL_TRY;
-            m_TokenInfo.flags &= ~CKF_SO_PIN_COUNT_LOW;
-
-        } else if( triesRemaining == 1 ) {
-
-            m_TokenInfo.flags &= ~CKF_SO_PIN_LOCKED;
-            m_TokenInfo.flags |= CKF_SO_PIN_FINAL_TRY;
-            m_TokenInfo.flags &= ~CKF_SO_PIN_COUNT_LOW;
-
-        }else /*if( triesRemaining < MAX_SO_PIN_TRIES )*/ {
-
-            m_TokenInfo.flags &= ~CKF_SO_PIN_LOCKED;
-            m_TokenInfo.flags &= ~CKF_SO_PIN_FINAL_TRY;
-            m_TokenInfo.flags |= CKF_SO_PIN_COUNT_LOW;
-
-        }
-
-        throw PKCS11Exception( CKR_PIN_INCORRECT );
+    } catch( MiniDriverException& a_pEx) {
+		if ( bPukAuthenticated )
+		{
+			try { m_Device->logOut( unblockRole , false); } catch (...) {}
+		}
+		checkAuthenticationStatus(CKU_SO, a_pEx);
     }
 
     t.stop( "Token::initPIN" );
@@ -2951,7 +3905,7 @@ void Token::initPIN( Marshaller::u1Array* a_PinSo, Marshaller::u1Array* a_PinUse
 
 /*
 */
-void Token::setPIN( Marshaller::u1Array* a_pOldPIN, Marshaller::u1Array* a_pNewPIN ) {
+void Token::setPIN( u1Array* a_pOldPIN, u1Array* a_pNewPIN ) {
 
     Log::begin( "Token::setPIN" );
     Timer t;
@@ -2962,26 +3916,30 @@ void Token::setPIN( Marshaller::u1Array* a_pOldPIN, Marshaller::u1Array* a_pNewP
         throw PKCS11Exception( CKR_TOKEN_NOT_PRESENT );
     }
 
+    CK_ULONG usedRole = CKU_USER;
     // According the logical state of the slot the PIN is set for the user or the administrator
     // The logical state is based on the PKCS11 state of the slot's sessions
     try {
 
         if( m_pSlot->isAuthenticated( ) ) {
-
-            m_Device->changePin( a_pOldPIN, a_pNewPIN );
+            m_Device->changePin( getUserRole(), a_pOldPIN, a_pNewPIN );
 
         } else if( m_pSlot->administratorIsAuthenticated( ) ) {
-
-            m_Device->administratorChangeKey( a_pOldPIN, a_pNewPIN );
+            usedRole = CKU_SO;
+			MiniDriverAuthentication::ROLES unblockRole = m_Device->getPinUnblockRole(getUserRole());
+			if (unblockRole == MiniDriverAuthentication::PIN_ADMIN)
+				m_Device->administratorChangeKey( a_pOldPIN, a_pNewPIN );
+			else
+			{
+				m_Device->changePin( unblockRole, a_pOldPIN, a_pNewPIN );
+			}
 
         } else {
-
-            throw PKCS11Exception( CKR_USER_NOT_LOGGED_IN );
+            m_Device->changePin( getUserRole(), a_pOldPIN, a_pNewPIN );
         }
 
     } catch( MiniDriverException& x ) {
-
-        checkAuthenticationStatus( m_RoleLogged, x );
+        checkAuthenticationStatus( usedRole, x );
     }
 
     t.stop( "Token::setPIN" );
@@ -2991,7 +3949,7 @@ void Token::setPIN( Marshaller::u1Array* a_pOldPIN, Marshaller::u1Array* a_pNewP
 
 /*
 */
-void Token::initToken( Marshaller::u1Array* a_pinSO, Marshaller::u1Array* a_label ) {
+void Token::initToken( u1Array* a_pinSO, u1Array* a_label ) {
 
     Log::begin( "Token::initToken" );
     Timer t;
@@ -3016,8 +3974,8 @@ void Token::initToken( Marshaller::u1Array* a_pinSO, Marshaller::u1Array* a_labe
     // actual authentication
     authenticateAdmin( a_pinSO );
 
-    try {
-
+    try
+    {
         // Synchronize all private objects to delete them
         synchronizePrivateDataObjects( );
 
@@ -3080,7 +4038,7 @@ void Token::initToken( Marshaller::u1Array* a_pinSO, Marshaller::u1Array* a_labe
 
 /*
 */
-CK_OBJECT_HANDLE Token::computeObjectHandle( const CK_OBJECT_CLASS& a_ulClass, const bool& a_bIsPrivate ) { 
+CK_OBJECT_HANDLE Token::computeObjectHandle( const CK_OBJECT_CLASS& a_ulClass, const bool& a_bIsPrivate ) {
 
     // Increment the object counter
     incrementObjectIndex( );
@@ -3090,12 +4048,12 @@ CK_OBJECT_HANDLE Token::computeObjectHandle( const CK_OBJECT_CLASS& a_ulClass, c
 
     // Register the object class and if the object is private:
     // Private Data	        1000 [08] = set class to CKO_DATA (0x00) and Private to TRUE (0x08)
-    // Public Data	        0000 [00] = set class to CKO_DATA (0x00) and Private to FALSE (0x00)	
+    // Public Data	        0000 [00] = set class to CKO_DATA (0x00) and Private to FALSE (0x00)
     // Private Certificate	1001 [09] = set class to CKO_CERTIFICATE (0x01) and Private to TRUE (0x08)
-    // Public Certificate	0001 [01] = set class to CKO_CERTIFICATE (0x01) and Private to FALSE (0x00)		
+    // Public Certificate	0001 [01] = set class to CKO_CERTIFICATE (0x01) and Private to FALSE (0x00)
     // Private Public Key	1010 [0A] = set class to CKO_PUBLIC_KEY (0x02) and Private to TRUE (0x08)
-    // Public Public Key	0010 [02] = set class to CKO_PUBLIC_KEY (0x02) and Private to FALSE (0x00)    
-    // Private Private Key	1011 [0B] = set class to CKO_PRIVATE_KEY (0x03) and Private to TRUE (0x08)			
+    // Public Public Key	0010 [02] = set class to CKO_PUBLIC_KEY (0x02) and Private to FALSE (0x00)
+    // Private Private Key	1011 [0B] = set class to CKO_PRIVATE_KEY (0x03) and Private to TRUE (0x08)
     // Public Private Key	0011 [03] = set class to CKO_PRIVATE_KEY (0x03) and Private to FALSE (0x00)
     unsigned char ucByte2 = (unsigned char)a_ulClass | ( a_bIsPrivate ? 0x10 : 0x00 );
 
@@ -3104,23 +4062,18 @@ CK_OBJECT_HANDLE Token::computeObjectHandle( const CK_OBJECT_CLASS& a_ulClass, c
 
     // Register the slot id
     unsigned char ucByte4 = 0xFF;
-    try {
 
-        if( m_Device ) {
+    if( m_Device ) {
 
-            ucByte4 = (unsigned char) ( 0x000000FF & m_Device->getDeviceID( ) );
-        }
-
-    } catch( MiniDriverException& x ) {
-
-        Log::error( "Token::computeObjectHandle", "MiniDriverException" );
-        throw PKCS11Exception( checkException( x ) );
+       ucByte4 = (unsigned char) ( 0x000000FF & m_pSlot->getSlotId() );
     }
 
-    // Compute the object handle: byte4 as Slot Id, byte3 as Token/Session, byte2 as attributes and byte1 as object Id					
+
+
+    // Compute the object handle: byte4 as Slot Id, byte3 as Token/Session, byte2 as attributes and byte1 as object Id
     CK_OBJECT_HANDLE h = ( ucByte4 << 24 ) + ( ucByte3 << 16 ) + ( ucByte2 << 8 )+ ucByte1;
 
-    return h; 
+    return h;
 }
 
 
@@ -3141,24 +4094,6 @@ StorageObject* Token::getObject( const CK_OBJECT_HANDLE& a_hObject ) {
 
 /*
 */
-bool isFileExists( const std::string& a_stFileName, const MiniDriverFiles::FILES_NAME& a_stFilesList ) {
-
-    // Look if the file name is present intot the list
-    BOOST_FOREACH( const std::string& fileName, a_stFilesList ) {
-
-        // The file name has been found
-        if( std::string::npos != a_stFileName.find( fileName ) ) {
-
-            return true;
-        }
-    }
-
-    return false;
-}
-
-
-/*
-*/
 void Token::synchronizeObjects( void ) {
 
     Log::begin( "Token::synchronizeObjects" );
@@ -3170,7 +4105,7 @@ void Token::synchronizeObjects( void ) {
         initializeObjectIndex( );
 
         // PIN changed, so re-synchronize
-        synchronizePIN( );		
+        synchronizePIN( );
 
         // Remove all PKCS11 objects
         m_Objects.clear( );
@@ -3180,7 +4115,7 @@ void Token::synchronizeObjects( void ) {
         synchronizePublicObjects( );
 
         m_bSynchronizeObjectsPrivate = true;
-        synchronizePrivateObjects( );	
+        synchronizePrivateObjects( );
 
     } catch( ... ) {
 
@@ -3217,7 +4152,7 @@ bool Token::synchronizeIfSmartCardContentHasChanged( void ) {
         if( MiniDriverCardCacheFile::PINS == pins ) {
 
             // PIN changed, so re-synchronize
-            synchronizePIN( );		
+            synchronizePIN( );
         }
 
         if( ( MiniDriverCardCacheFile::CONTAINERS == containers ) || ( MiniDriverCardCacheFile::FILES == files ) ) {
@@ -3240,6 +4175,11 @@ bool Token::synchronizeIfSmartCardContentHasChanged( void ) {
     return bSynchronizationPerformed;
 }
 
+MiniDriverAuthentication::ROLES Token::getUserRole() const
+{
+    return m_pSlot->getUserRole();
+}
+
 
 /* Synchronise the cache with the smart card content
 */
@@ -3257,9 +4197,12 @@ void Token::synchronizePublicObjects( void ) {
         Timer t;
         t.start( );
 
-        synchronizeRootCertificateObjects( );
+        if (getUserRole() == MiniDriverAuthentication::PIN_USER)
+        {
+            synchronizeRootCertificateObjects( );
 
-        synchronizePublicDataObjects( );
+            synchronizePublicDataObjects( );
+        }
 
         synchronizePublicCertificateAndKeyObjects( );
 
@@ -3289,7 +4232,13 @@ void Token::synchronizePrivateObjects( void ) {
     try {
 
         // Synchronization of the private objects is only possible is the user is logged in
-        if( m_pSlot && !m_pSlot->isAuthenticated( ) ) {
+
+        //========= TEST
+        if( m_pSlot && !m_pSlot->isAuthenticated()
+            && (!m_Device->isSmartCardRecognized( ) || !m_Device->isNoPin( getUserRole()))
+
+           ) {
+        //if( !m_Device->isAuthenticated( ) ) {
 
             return;
         }
@@ -3298,9 +4247,14 @@ void Token::synchronizePrivateObjects( void ) {
         Timer t;
         t.start( );
 
-        synchronizePrivateDataObjects( );
+        if (getUserRole() == MiniDriverAuthentication::PIN_USER)
+        {
+            synchronizePrivateDataObjects( );
+        }
 
         synchronizePrivateKeyObjects( );
+
+        synchronizeSecretKeyObjects( );
 
         m_bSynchronizeObjectsPrivate = false;
 
@@ -3311,6 +4265,8 @@ void Token::synchronizePrivateObjects( void ) {
 
         m_bSynchronizeObjectsPrivate = true;
     }
+
+    //m_bSynchronizeObjectsPrivate = false;
 }
 
 
@@ -3343,12 +4299,6 @@ void Token::synchronizeRootCertificateObjects( void ) {
     Timer t;
     t.start( );
 
-    // No directory ? So object to load
-    if( m_bCreateDirectoryP11 ) {
-
-        return;
-    }
-
     if( !m_Device ) {
 
         return;
@@ -3359,50 +4309,136 @@ void Token::synchronizeRootCertificateObjects( void ) {
 
     try {
 
-        // Get all PKCS11 object files from the PKCS11 directory into the smart card
-        MiniDriverFiles::FILES_NAME filesPKCS11 = m_Device->enumFiles( g_stPathPKCS11 );
+        // read roots from P11 only if p11 directory exists
+        if( !m_bCreateDirectoryP11 ) {
 
-        // Get all certificate files from the smart card
-        MiniDriverFiles::FILES_NAME filesMiniDriver = m_Device->enumFiles( std::string( szBASE_CSP_DIR ) );
+           // Get all PKCS11 object files from the PKCS11 directory into the smart card
+           MiniDriverFiles::FILES_NAME filesPKCS11 = m_Device->enumFiles( g_stPathPKCS11 );
 
-        std::string stPrefixMiniDriver = std::string( szUSER_KEYEXCHANGE_CERT_PREFIX );
+           // Get all certificate files from the smart card
+           MiniDriverFiles::FILES_NAME filesMiniDriver = m_Device->enumFiles( std::string( szBASE_CSP_DIR ) );
 
-        std::string stPrefixPKCS11 = g_stPrefixPublicObject + g_stPrefixRootCertificate;
+           std::string stPrefixMiniDriver = std::string( szUSER_KEYEXCHANGE_CERT_PREFIX );
 
-        std::string stFilePKCS11 = "";
+           std::string stPrefixPKCS11 = g_stPrefixPublicObject + g_stPrefixRootCertificate;
 
-        BOOST_FOREACH( const std::string& stFileMiniDriver, filesMiniDriver ) {
+           std::string stFilePKCS11 = "";
 
-            // All files must begin with a fixed prefix for public objects
-            if( stFileMiniDriver.find( stPrefixMiniDriver ) != 0 ) {
+           // BOOST_FOREACH( const std::string& stFileMiniDriver, filesMiniDriver ) {
+		   for (MiniDriverFiles::FILES_NAME::iterator iter = filesMiniDriver.begin () ; iter != filesMiniDriver.end (); ++iter) {
+			   std::string& stFileMiniDriver = (std::string&)*iter;
 
-                // Only deal with objects corresponding to the incoming prefix
-                continue;
-            }
+               // All files must begin with a fixed prefix for public objects
+               if( stFileMiniDriver.find( stPrefixMiniDriver ) != 0 ) {
 
-            // The index of a root certificate is out of the range of the valid MiniDriver containers
-            ucIndex = computeIndex( stFileMiniDriver );
-            if ( ucIndex <= ucIndexMax ) {
+                   // Only deal with objects corresponding to the incoming prefix
+                   continue;
+               }
 
-                continue;
-            }
+               // The index of a root certificate is out of the range of the valid MiniDriver containers
+               ucIndex = computeIndex( stFileMiniDriver );
+               if ( ucIndex <= ucIndexMax ) {
 
-            stFilePKCS11 = stPrefixPKCS11;
-            Util::toStringHex( ucIndex, stFilePKCS11 );
+                   continue;
+               }
 
-            MiniDriverFiles::FILES_NAME::iterator it = filesPKCS11.find( stFilePKCS11 );
+               stFilePKCS11 = stPrefixPKCS11;
+               Util::toStringHex( ucIndex, stFilePKCS11 );
 
-            if( it != filesPKCS11.end( ) ) {
+               MiniDriverFiles::FILES_NAME::iterator it = filesPKCS11.find( stFilePKCS11 );
 
-                // The PKCS11 object exists. Load it.
-                createCertificateFromPKCS11ObjectFile( stFilePKCS11, stFileMiniDriver );
+ 	       boost::shared_ptr<u1Array> pOID;
 
-            } else {
+               if( it != filesPKCS11.end( ) ) {
+                   // The PKCS11 object exists. Load it.
+                   if (!createCertificateFromPKCS11ObjectFile( stFilePKCS11, stFileMiniDriver ))
+                   {
+                     // The PKCS11 object is not consistent with the one in the minidriver file. Create a memory object from the MiniDriver file.
+                     createCertificateFromMiniDriverFile( stFileMiniDriver, MiniDriverContainerMapFile::CONTAINER_INDEX_INVALID,  MiniDriverContainer::KEYSPEC_SIGNATURE,pOID );
+                   }
 
-                // The PKCS11 object does not exists. Create a memory object from the MiniDriver file.
-                createCertificateFromMiniDriverFile( stFileMiniDriver, MiniDriverContainerMapFile::CONTAINER_INDEX_INVALID,  MiniDriverContainer::KEYSPEC_SIGNATURE );
-            }
+               } else {
+
+                   // The PKCS11 object does not exists. Create a memory object from the MiniDriver file.
+                   createCertificateFromMiniDriverFile( stFileMiniDriver, MiniDriverContainerMapFile::CONTAINER_INDEX_INVALID,  MiniDriverContainer::KEYSPEC_SIGNATURE , pOID);
+               }
+           }
         }
+
+         std::string stPathCertificateRoot( szROOT_STORE_FILE );
+         std::unique_ptr< u1Array > pCompressedRoots;
+
+         try {
+
+            pCompressedRoots.reset( m_Device->readFile( std::string( szBASE_CSP_DIR ), stPathCertificateRoot ) );
+            // Parse the msroot to get the list of existing root certificates
+            std::list<X509*> certList;
+
+            if ( pCompressedRoots.get() && (pCompressedRoots->GetLength() > 4) )
+            {
+               std::unique_ptr< u1Array > pRoots;
+               if ( 0 == memcmp(pCompressedRoots->GetBuffer(), "\x01\x00", 2) )
+               {
+                  unsigned long ulOrigLen = pCompressedRoots->ReadU1At( 3 ) * 256 + pCompressedRoots->ReadU1At( 2 );
+
+                  pRoots.reset( new u1Array( ulOrigLen ) );
+
+                  uncompress( pRoots->GetBuffer( ), &ulOrigLen, pCompressedRoots->GetBuffer( ) + 4, pCompressedRoots->GetLength( ) - 4 );
+               }
+               else
+               {
+                  // Not compressed : juste copy the whole value
+                  pRoots.reset( new u1Array( pCompressedRoots->GetLength() ) );
+                  pRoots->SetBuffer(pCompressedRoots->GetBuffer());
+               }
+
+               if (Util::ParsePkcs7(pRoots->GetBuffer(), pRoots->GetLength(), certList))
+               {
+	               for (std::list<X509*>::iterator It = certList.begin(); It != certList.end(); It++)
+	               {
+	                  // check if it exists
+	                  bool bFound = false;
+                     BOOST_FOREACH( const TOKEN_OBJECTS::value_type& o, m_Objects )
+                     {
+                        if( CKO_CERTIFICATE == o->second->getClass( ) )
+                        {
+                           X509PubKeyCertObject* objCertificate = (X509PubKeyCertObject*) o->second;
+                           if (objCertificate->m_pValue)
+                           {
+                              unsigned char* ptr = objCertificate->m_pValue->GetBuffer();
+                              X509* pCert = d2i_X509(NULL, (const unsigned char**) &ptr, objCertificate->m_pValue->GetLength());
+                              if (pCert)
+                              {
+                                 if (X509_cmp(pCert, *It) == 0)
+                                    bFound = true;
+                                 X509_free(pCert);
+                                 if (bFound)
+                                    break;
+                              }
+                           }
+		                  }
+	                  }
+
+                     if (!bFound)
+                     {
+                        // The Root certificate object does not exists. Create a memory object from the certificate value.
+                        unsigned char* pbCert = NULL;
+                        int certLen = i2d_X509(*It, &pbCert);
+                        try
+                        {
+                           createRootCertificateFromValue( pbCert, certLen, MiniDriverContainer::KEYSPEC_SIGNATURE );
+                        }
+                        catch(...) {}
+                        if (pbCert)
+                           OPENSSL_free(pbCert);
+                     }
+	               }
+
+                  Util::FreeCertList(certList);
+               }
+            }
+
+         } catch( ... ) {}
 
     } catch( MiniDriverException& x ) {
 
@@ -3440,7 +4476,9 @@ void Token::synchronizePublicDataObjects( void ) {
 
         std::string a_stPrefix = g_stPrefixPublicObject + g_stPrefixData;
 
-        BOOST_FOREACH( const std::string& s, files ) {
+        // BOOST_FOREACH( const std::string& s, files ) {
+		for (MiniDriverFiles::FILES_NAME::iterator iter = files.begin () ; iter != files.end (); ++iter) {
+			std::string& s = (std::string&)*iter;
 
             // All files must begin with a fixed prefix for public objects
             if( s.find( a_stPrefix ) != 0 ) {
@@ -3450,7 +4488,7 @@ void Token::synchronizePublicDataObjects( void ) {
             }
 
             // Read the file
-            Marshaller::u1Array* f = m_Device->readFile( g_stPathPKCS11, s );
+            std::unique_ptr<u1Array> f ( m_Device->readFile( g_stPathPKCS11, s ) );
 
             // Construct the PKCS11 object attributes from the file
             std::vector< unsigned char > attributes;
@@ -3469,7 +4507,7 @@ void Token::synchronizePublicDataObjects( void ) {
             CK_ULONG idx = 0;
             o->deserialize( attributes, &idx );
 
-            // Save the fileName in the object 
+            // Save the fileName in the object
             o->m_stFileName = s;
 
             Log::log( "Found %s - Public data object created", s.c_str( ) );
@@ -3513,7 +4551,9 @@ void Token::synchronizePrivateDataObjects( void ) {
 
         std::string a_stPrefix = g_stPrefixPrivateObject + g_stPrefixData;
 
-        BOOST_FOREACH( const std::string& s, files ) {
+        // BOOST_FOREACH( const std::string& s, files ) {
+		for (MiniDriverFiles::FILES_NAME::iterator iter = files.begin () ; iter != files.end (); ++iter) {
+			std::string& s = (std::string&)*iter;
 
             // All files must begin with a fixed prefix for public objects
             if( s.find( a_stPrefix ) != 0 ) {
@@ -3523,7 +4563,7 @@ void Token::synchronizePrivateDataObjects( void ) {
             }
 
             // Read the file
-            Marshaller::u1Array* f = m_Device->readFile( g_stPathPKCS11, s );
+            std::unique_ptr<u1Array> f ( m_Device->readFile( g_stPathPKCS11, s ) );
 
             // Construct the PKCS11 object attributes from the file
             std::vector< unsigned char > attributes;
@@ -3542,7 +4582,7 @@ void Token::synchronizePrivateDataObjects( void ) {
             CK_ULONG idx = 0;
             o->deserialize( attributes, &idx );
 
-            // Save the fileName in the object 
+            // Save the fileName in the object
             o->m_stFileName = s;
 
             Log::log( "Found %s - Private data created", s.c_str( ) );
@@ -3571,16 +4611,19 @@ bool Token::checkSmartCardContent( void ) {
     t.start( );
 
     if( m_bCheckSmartCardContentDone ) {
-     
+
         return false;
     }
 
-    Log::log(" Token::checkSmartCardContent -$$$$$$$$$$$$$ Obj BEFORE P11 clean");
-    BOOST_FOREACH( const TOKEN_OBJECTS::value_type& o, m_Objects ) {
+    if (Log::s_bEnableLog)
+    {
+        Log::log(" Token::checkSmartCardContent -$$$$$$$$$$$$$ Obj BEFORE P11 clean");
+        BOOST_FOREACH( const TOKEN_OBJECTS::value_type& o, m_Objects ) {
 
-        printObject( o.second );
+            printObject( o.second );
+        }
+        Log::log(" Token::checkSmartCardContent -$$$$$$$$$$$$$ Obj BEFORE P11 clean");
     }
-    Log::log(" Token::checkSmartCardContent -$$$$$$$$$$$$$ Obj BEFORE P11 clean");
 
 
     bool bReturn = false;
@@ -3602,300 +4645,352 @@ bool Token::checkSmartCardContent( void ) {
         } catch( ... ) { }
     }
 
-    // Get all certificate files from the smart card
-    MiniDriverFiles::FILES_NAME filesMiniDriver = m_Device->enumFiles( std::string( szBASE_CSP_DIR ) );
+    // We don't perform this check in virtual slots because it is already done on the main slot
+    // and it involves only moving certificates associated to empty containers to the PKCS11 tree
+    if (!m_pSlot->isVirtual())
+    {
+        // Get all certificate files from the smart card
+        MiniDriverFiles::FILES_NAME filesMiniDriver = m_Device->enumFiles( std::string( szBASE_CSP_DIR ) );
 
-    std::string stContainerIndex = "";
-    unsigned char ucKeySpec = MiniDriverContainer::KEYSPEC_EXCHANGE;
-    std::string stPrefix = "";
-    std::string stCertificateFileName = "";
-    std::string stObjectPKCS11 = "";
-    std::string stPublicCertificateExchange = g_stPrefixPublicObject + std::string( szUSER_KEYEXCHANGE_CERT_PREFIX );
-    std::string stPublicCertificateSignature = g_stPrefixPublicObject + std::string( szUSER_SIGNATURE_CERT_PREFIX );
-    std::string stPublicKey = g_stPrefixPublicObject + g_stPrefixKeyPublic;
-    std::string stPrivateKey = g_stPrefixPrivateObject + g_stPrefixKeyPrivate;
-    unsigned char ucKeyContainerIndexReal = MiniDriverContainerMapFile::CONTAINER_INDEX_INVALID;
-    std::string stFileName = "";
+        std::string stContainerIndex = "";
+        unsigned char ucKeySpec = MiniDriverContainer::KEYSPEC_EXCHANGE;
+        std::string stPrefix = "";
+        std::string stCertificateFileName = "";
+        std::string stObjectPKCS11 = "";
+        std::string stPublicCertificateExchange = g_stPrefixPublicObject + std::string( szUSER_KEYEXCHANGE_CERT_PREFIX );
+        std::string stPublicCertificateSignature = g_stPrefixPublicObject + std::string( szUSER_SIGNATURE_CERT_PREFIX );
+        std::string stPublicKey = g_stPrefixPublicObject + g_stPrefixKeyPublic;
+        std::string stPrivateKey = g_stPrefixPrivateObject + g_stPrefixKeyPrivate;
+        unsigned char ucKeyContainerIndexReal = MiniDriverContainerMapFile::CONTAINER_INDEX_INVALID;
+        std::string stFileName = "";
 
-    try {
+        try {
 
-        // Explore each smart card key container to fix any CMapFile anomaly or wrong associated certificate
-        unsigned char ucContainerCount = m_Device->containerCount( );
+            // Explore each smart card key container to fix any CMapFile anomaly or wrong associated certificate
+            unsigned char ucContainerCount = m_Device->containerCount( );
 
-        for( unsigned char ucContainerIndex = 0 ; ucContainerIndex < ucContainerCount ; ++ucContainerIndex ) {
+            for( unsigned char ucContainerIndex = 0 ; ucContainerIndex < ucContainerCount ; ++ucContainerIndex ) {
 
-            stContainerIndex = "";
-            Util::toStringHex( ucContainerIndex, stContainerIndex );
+                stContainerIndex = "";
+                Util::toStringHex( ucContainerIndex, stContainerIndex );
 
-            // Get the current container
-            MiniDriverContainer cont = m_Device->containerGet( ucContainerIndex );
+                // Get the current container
+                MiniDriverContainer cont = m_Device->containerGet( ucContainerIndex );
 
-            Log::log( "=========" );
-            Log::log( "Token::checkSmartCardContent - Container <%d>", ucContainerIndex );
+                Log::log( "=========" );
+                Log::log( "Token::checkSmartCardContent - Container <%d>", ucContainerIndex );
 
-            unsigned char flags = cont.getFlags( );
-            if ( flags == MiniDriverContainer::CMAPFILE_FLAG_EMPTY ) {
+                unsigned char flags = cont.getFlags( );
+                if ( flags == MiniDriverContainer::CMAPFILE_FLAG_EMPTY ) {
 
-                // The current container is empty
+                    // The current container is empty
 
-                // Check that none P11 object is associated to this container
-                // If a P11 object using this index then it must be associated to the good container or be deleted
+                    // Check that none P11 object is associated to this container
+                    // If a P11 object using this index then it must be associated to the good container or be deleted
 
-                // Check that none MiniDriver certificate is associated to this container
-                // If a MiniDriver certificate exists then it must be associated to the good contained or be deleted
-                // It could also be a root certificate enrolled by an old P11 version
+                    // Check that none MiniDriver certificate is associated to this container
+                    // If a MiniDriver certificate exists then it must be associated to the good contained or be deleted
+                    // It could also be a root certificate enrolled by an old P11 version
 
-                // Check the container properties is compliant with the CMapFile state
-                // If the CMapFile state shows a type (signature/exchange), a size (1024/2048) or a state (empty/valid/valid & default) different 
-                // from the information given by the container property then the CMapFile must be changed
+                    // Check the container properties is compliant with the CMapFile state
+                    // If the CMapFile state shows a type (signature/exchange), a size (1024/2048) or a state (empty/valid/valid & default) different
+                    // from the information given by the container property then the CMapFile must be changed
 
-                Log::log( "Token::checkSmartCardContent - This container is empty" );
+                    Log::log( "Token::checkSmartCardContent - This container is empty" );
 
-                stCertificateFileName = szUSER_KEYEXCHANGE_CERT_PREFIX;
-                stCertificateFileName += stContainerIndex;
-                Log::log( "Token::checkSmartCardContent - Check if the certificate <%s> is present", stCertificateFileName.c_str( ) );
+                    stCertificateFileName = szUSER_KEYEXCHANGE_CERT_PREFIX;
+                    stCertificateFileName += stContainerIndex;
+                    Log::log( "Token::checkSmartCardContent - Check if the certificate <%s> is present", stCertificateFileName.c_str( ) );
 
-                MiniDriverFiles::FILES_NAME::iterator it = filesMiniDriver.find( stCertificateFileName );
+                    MiniDriverFiles::FILES_NAME::iterator it = filesMiniDriver.find( stCertificateFileName );
 
-                if( it != filesMiniDriver.end( ) ) {
+                    if( it != filesMiniDriver.end( ) ) {
 
-                    // The container is empty but a certificate is associated into the MiniDriver file structure.
-                    // That certificate must be moved from the MiniDriver file structure to the PKCS11 one.
+                        // The container is empty but a certificate is associated into the MiniDriver file structure.
+                        // That certificate must be moved from the MiniDriver file structure to the PKCS11 one.
 
-                    // Create a new root certificate
-                    X509PubKeyCertObject* pNewCertificate = new X509PubKeyCertObject( );
+                        // Create a new root certificate
+                        X509PubKeyCertObject* pNewCertificate = new X509PubKeyCertObject( );
 
-                    pNewCertificate->m_stCertificateName = "";
+                        pNewCertificate->m_stCertificateName = "";
 
-                    pNewCertificate->m_stFileName = "";
+                        pNewCertificate->m_stFileName = "";
 
-                    pNewCertificate->m_ucContainerIndex = MiniDriverContainerMapFile::CONTAINER_INDEX_INVALID;
+                        pNewCertificate->m_ucContainerIndex = MiniDriverContainerMapFile::CONTAINER_INDEX_INVALID;
 
-                    try {
-
-                        // Read the file
-                        m_Device->readCertificate( stCertificateFileName, pNewCertificate->m_pValue );
-
-                    } catch( MiniDriverException& ) {
-
-                        // Unable to read the on card certificate.
-                        // The P11 object creation is skipped.
-                        Log::error( "Token::createCertificateFromMiniDriverFile", "Unable to read the certificate" );
-                        continue;
-                    }
-
-                    if( pNewCertificate->m_pValue.get( ) ) {
-
-                        generatePublicKeyModulus( pNewCertificate->m_pValue, pNewCertificate->m_pModulus, pNewCertificate->_checkValue );
-
-                        generateRootAndSmartCardLogonFlags( pNewCertificate->m_pValue, pNewCertificate->m_bIsRoot, pNewCertificate->_certCategory, pNewCertificate->m_bIsSmartCardLogon );
-                    }
-
-                    // Delete the old certificate from the MiniDriver file structure
-                    m_Device->deleteFile( std::string( szBASE_CSP_DIR ), stCertificateFileName );
-                    Log::log( "Token::checkSmartCardContent - delete <%s> in MSCP dir", stCertificateFileName.c_str( ) );
-                    bReturn = true;
-
-                    // Remove the previous PKCS11 certificate associated to the MiniDriver certificate
-                    std::string stIndex = stCertificateFileName.substr( stCertificateFileName.length( ) - 2, 2 );
-                    std::string stPKCS11CertificateName = stPublicCertificateExchange + stIndex;
-                    m_Device->deleteFile( g_stPathPKCS11, stPKCS11CertificateName );
-                    Log::log( "Token::checkSmartCardContent - delete <%s> in P11 dir", stPKCS11CertificateName.c_str( ) );
-
-                    //// Delete the PKCS#11 object from inner list of managed objects
-                    //unregisterStorageObject( p );
-                    //Log::log( "Token::checkSmartCardContent - delete <%s> in MSCP dir", stCertificateFileName.c_str( ) );
-
-                    // Create the new root certificate intot the MniDriver & PKCS11 file structures
-                    CK_OBJECT_HANDLE h = CK_UNAVAILABLE_INFORMATION;
-                    addObjectCertificate( pNewCertificate, &h );
-                    Log::log( "Token::checkSmartCardContent - add new P11 root certificate <%s>", pNewCertificate->m_stFileName.c_str( ) );
-
-                    pNewCertificate->m_stCertificateName = pNewCertificate->m_stFileName.substr( 3, 5 );
-
-                    // Delete the container from the MiniDriver file structure
-                    m_Device->containerDelete( ucContainerIndex );
-                    Log::log( "Token::checkSmartCardContent - delete container <%d>", ucContainerIndex );
-
-                    // Check if a private or a public key was associated to this container
-                    std::string stPrefix = stPrivateKey;
-
-                    do {
-
-                        stObjectPKCS11 = stPrefix + stIndex;
-
-                        MiniDriverFiles::FILES_NAME::iterator it = filesPKCS11.find( stObjectPKCS11 );
-
-                        if( it != filesPKCS11.end( ) ) {
-
-                            // The PKCS11 private/public key exists.
-                            // Check the public key modulus to find a new container to associate with
+                        try {
 
                             // Read the file
-                            Marshaller::u1Array* f = m_Device->readFile( g_stPathPKCS11, stObjectPKCS11 );
+                            m_Device->readCertificate( stCertificateFileName, pNewCertificate->m_pValue );
 
-                            // Construct the PKCS11 object attributes from the file
-                            std::vector< unsigned char > attributes;
+                        } catch( MiniDriverException& ) {
 
-                            unsigned int l = f->GetLength( );
+                            // Unable to read the on card certificate.
+                            // The P11 object creation is skipped.
+                            Log::error( "Token::createCertificateFromMiniDriverFile", "Unable to read the certificate" );
+                            continue;
+                        }
 
-                            for( unsigned int u = 0 ; u < l ; ++u ) {
+                        if( pNewCertificate->m_pValue.get( ) ) {
 
-                                attributes.push_back( f->GetBuffer( )[ u ] );
-                            }
+                            generatePublicKeyValue( pNewCertificate->m_pValue, pNewCertificate->m_pPublicKeyValue, pNewCertificate->m_bIsRSA, pNewCertificate->m_ucKeySpec, pNewCertificate->_checkValue , pNewCertificate->m_pOID);
 
-                            // Create the PKCS11 object from the file content
-                            boost::shared_ptr< StorageObject > oldObjectOnCard;
+                            generateRootAndSmartCardLogonFlags( pNewCertificate->m_pValue, pNewCertificate->m_bIsRoot, pNewCertificate->_certCategory, pNewCertificate->m_bIsSmartCardLogon );
+                        }
 
-                            CK_ULONG idx = 0;
+                        // Delete the old certificate from the MiniDriver file structure
+                        m_Device->deleteFile( std::string( szBASE_CSP_DIR ), stCertificateFileName );
+                        Log::log( "Token::checkSmartCardContent - delete <%s> in MSCP dir", stCertificateFileName.c_str( ) );
+                        bReturn = true;
 
-                            if( stPrefix.compare( stPublicKey ) == 0 ) {
+                        // Remove the previous PKCS11 certificate associated to the MiniDriver certificate
+                        std::string stIndex = stCertificateFileName.substr( stCertificateFileName.length( ) - 2, 2 );
+                        std::string stPKCS11CertificateName = stPublicCertificateExchange + stIndex;
+                        m_Device->deleteFile( g_stPathPKCS11, stPKCS11CertificateName );
+                        Log::log( "Token::checkSmartCardContent - delete <%s> in P11 dir", stPKCS11CertificateName.c_str( ) );
 
-                                oldObjectOnCard.reset( new Pkcs11ObjectKeyPublicRSA ); 
+                        //// Delete the PKCS#11 object from inner list of managed objects
+                        //unregisterStorageObject( p );
+                        //Log::log( "Token::checkSmartCardContent - delete <%s> in MSCP dir", stCertificateFileName.c_str( ) );
 
-                                ( ( Pkcs11ObjectKeyPublicRSA* ) oldObjectOnCard.get( ) )->deserialize( attributes, &idx );
+                        // Create the new root certificate intot the MniDriver & PKCS11 file structures
+                        CK_OBJECT_HANDLE h = CK_UNAVAILABLE_INFORMATION;
+                        addObjectCertificate( pNewCertificate, &h );
+                        Log::log( "Token::checkSmartCardContent - add new P11 root certificate <%s>", pNewCertificate->m_stFileName.c_str( ) );
 
-                            } else {
+                        pNewCertificate->m_stCertificateName = pNewCertificate->m_stFileName.substr( 3, 5 );
 
-                                oldObjectOnCard.reset( new RSAPrivateKeyObject );
+                        // Delete the container from the MiniDriver file structure
+                        m_Device->containerDelete( ucContainerIndex, 0 );
+                        Log::log( "Token::checkSmartCardContent - delete container <%d>", ucContainerIndex );
 
-                                ( ( RSAPrivateKeyObject* ) oldObjectOnCard.get( ) )->deserialize( attributes, &idx );
-                            }
+                        // Check if a private or a public key was associated to this container
+                        std::string stPrefix = stPrivateKey;
 
-                            // Set the old file name
-                            oldObjectOnCard->m_stFileName = stObjectPKCS11;
+                        do {
 
-                            // Get the container index written into the object
-                            unsigned char ucKeyContainerIndexInObject = ( ( KeyObject* ) oldObjectOnCard.get( ) )->m_ucContainerIndex;
-                            Log::log( "Token::checkSmartCardContent - Container index found into the P11 object <%d>", ucKeyContainerIndexInObject );
+                            stObjectPKCS11 = stPrefix + stIndex;
 
-                            // Get the container index set into the file name
-                            unsigned char ucKeyContainerIndexInFileName = computeIndex( stIndex );
-                            Log::log( "Token::checkSmartCardContent - Container index found into the P11 file name <%d>", ucKeyContainerIndexInFileName );
+                            MiniDriverFiles::FILES_NAME::iterator it = filesPKCS11.find( stObjectPKCS11 );
 
-                            // Get the public key modulus
-                            Marshaller::u1Array* pPublicKeyModulus = NULL;
+                            if( it != filesPKCS11.end( ) ) {
 
-                            if( 0 == stPrefix.compare( stPublicKey ) ) {
+                                // The PKCS11 private/public key exists.
+                                // Check the public key modulus to find a new container to associate with
 
-                                pPublicKeyModulus = ( ( Pkcs11ObjectKeyPublicRSA* ) oldObjectOnCard.get( ) )->m_pModulus.get( );
+                                // Read the file
+                                std::unique_ptr<u1Array> f ( m_Device->readFile( g_stPathPKCS11, stObjectPKCS11 ) );
 
-                            } else {
+                                // Construct the PKCS11 object attributes from the file
+                                std::vector< unsigned char > attributes;
 
-                                pPublicKeyModulus = ( ( RSAPrivateKeyObject* ) oldObjectOnCard.get( ) )->m_pModulus.get( );
-                            }
+                                unsigned int l = f->GetLength( );
 
-                            if( pPublicKeyModulus ) {
+                                for( unsigned int u = 0 ; u < l ; ++u ) {
 
-                                Log::logCK_UTF8CHAR_PTR( "Token::checkSmartCardContent - File Public key modulus", pPublicKeyModulus->GetBuffer( ), pPublicKeyModulus->GetLength( ) );
-
-                                // Search for a container using the same public key container
-                                ucKeyContainerIndexReal = MiniDriverContainerMapFile::CONTAINER_INDEX_INVALID;
-                                ucKeySpec = 0xFF;
-                                stFileName = "";
-                                m_Device->containerGetMatching( ucKeyContainerIndexReal, ucKeySpec, stFileName, pPublicKeyModulus );
-                                Log::log( "Token::checkSmartCardContent - Real container index found comparing the public key modulus of each container with the P11 object one <%d>", ucKeyContainerIndexReal );
-
-                                // Compare the container index defined in the PKCS11 object with the container index using that public key modulus
-                                if( MiniDriverContainerMapFile::CONTAINER_INDEX_INVALID == ucKeyContainerIndexReal ) {
-
-                                    // No container exists into the smart card matching with the public key set into the P11 object
-                                    // This object should be deleted
-                                    Log::log( "Token::checkSmartCardContent - No inner container index for <%s>", stObjectPKCS11.c_str( ) );
-
-                                } else if( ucKeyContainerIndexInFileName != ucKeyContainerIndexReal ) {
-
-                                    // The both index are different !
-
-                                    CK_OBJECT_HANDLE h = CK_UNAVAILABLE_INFORMATION;
-                                    if( stPrefix.compare( stPublicKey ) == 0 ) { 
-
-                                        Pkcs11ObjectKeyPublicRSA* pNewKey = new Pkcs11ObjectKeyPublicRSA( ( const Pkcs11ObjectKeyPublicRSA* ) oldObjectOnCard.get( ) );
-
-                                        // Set the good container index into the PKCS11 object
-                                        pNewKey->m_ucContainerIndex = ucKeyContainerIndexReal;
-
-                                        // Set the good file name in to the PKCS11 object
-                                        pNewKey->m_stFileName = stPrefix;
-                                        Util::toStringHex( ucKeyContainerIndexReal, pNewKey->m_stFileName );
-
-                                        // Create the new root certificate
-                                        addObject( pNewKey, &h );
-
-                                        //m_bSynchronizeObjectsPublic = true;
-
-                                        Log::log( "Token::checkSmartCardContent - add new P11 public key <%s>", pNewKey->m_stFileName.c_str( ) );
-
-                                    } else {
-
-                                        RSAPrivateKeyObject* pNewKey = new RSAPrivateKeyObject( ( const RSAPrivateKeyObject* ) oldObjectOnCard.get( ) );
-
-                                        // Set the good container index into the PKCS11 object
-                                        pNewKey->m_ucContainerIndex = ucKeyContainerIndexReal;
-
-                                        // Set the good file name in to the PKCS11 object
-                                        pNewKey->m_stFileName = stPrefix;
-                                        Util::toStringHex( ucKeyContainerIndexReal, pNewKey->m_stFileName );
-
-                                        // Create the new root certificate
-                                        addObject( pNewKey, &h ); 
-
-                                        //m_bSynchronizeObjectsPrivate = true;
-
-                                        Log::log( "Token::checkSmartCardContent - add new P11 private key <%s>", pNewKey->m_stFileName.c_str( ) );
-                                    }
-
-                                    // Delete the old PKCS#11 object & MiniDriver file/container from card
-                                    m_Device->deleteFile( g_stPathPKCS11, oldObjectOnCard->m_stFileName );
-                                    Log::log( "Token::checkSmartCardContent - delete old P11 key <%s>", oldObjectOnCard->m_stFileName.c_str( ) );
-
-                                    // Delete the old PKCS#11 object from inner list of managed objects
-                                    TOKEN_OBJECTS::iterator i = m_Objects.begin( );
-                                    while( i != m_Objects.end( ) ) {
-
-                                        if( 0 == i->second->m_stFileName.compare( oldObjectOnCard->m_stFileName ) ) {
-
-                                            m_Objects.erase( i );
-
-                                            break;
-                                        }
-
-                                        ++i;
-                                    }	
+                                    attributes.push_back( f->GetBuffer( )[ u ] );
                                 }
 
-                            } else {
+                                // Create the PKCS11 object from the file content
+                                boost::shared_ptr< StorageObject > oldObjectOnCard;
+                                KeyObject helperObj;
+                                bool bIsRSA = false;
 
-                                // The public key modulus is missing. The public/private key is not well formated
-                                Log::log( "Token::checkSmartCardContent - No modulus for <%s>", stObjectPKCS11.c_str( ) );
+                                CK_ULONG idx = 0;
+
+                                helperObj.deserialize( attributes, &idx );
+
+                                bIsRSA = (helperObj._keyType == CKK_RSA);
+
+                                idx = 0;
+
+                                if( stPrefix.compare( stPublicKey ) == 0 ) {
+
+                                    if (bIsRSA)
+                                    {
+                                        oldObjectOnCard.reset( new Pkcs11ObjectKeyPublicRSA );
+                                        ( ( Pkcs11ObjectKeyPublicRSA* ) oldObjectOnCard.get( ) )->deserialize( attributes, &idx );
+                                    }
+                                    else
+                                    {
+                                        oldObjectOnCard.reset( new Pkcs11ObjectKeyPublicECC );
+                                        ( ( Pkcs11ObjectKeyPublicECC* ) oldObjectOnCard.get( ) )->deserialize( attributes, &idx );
+                                    }
+
+                                } else {
+
+                                    if (bIsRSA)
+                                    {
+                                        oldObjectOnCard.reset( new RSAPrivateKeyObject );
+                                        ( ( RSAPrivateKeyObject* ) oldObjectOnCard.get( ) )->deserialize( attributes, &idx );
+                                    }
+                                    else
+                                    {
+                                        oldObjectOnCard.reset( new ECCPrivateKeyObject );
+                                        ( ( ECCPrivateKeyObject* ) oldObjectOnCard.get( ) )->deserialize( attributes, &idx );
+                                    }
+                                }
+
+                                // Set the old file name
+                                oldObjectOnCard->m_stFileName = stObjectPKCS11;
+
+                                // Get the container index written into the object
+                                unsigned char ucKeyContainerIndexInObject = ( ( KeyObject* ) oldObjectOnCard.get( ) )->m_ucContainerIndex;
+                                Log::log( "Token::checkSmartCardContent - Container index found into the P11 object <%d>", ucKeyContainerIndexInObject );
+
+                                // Get the container index set into the file name
+                                unsigned char ucKeyContainerIndexInFileName = computeIndex( stIndex );
+                                Log::log( "Token::checkSmartCardContent - Container index found into the P11 file name <%d>", ucKeyContainerIndexInFileName );
+
+                                // Get the public key modulus
+                                u1Array* pPublicKeyValue = NULL;
+
+                                if( 0 == stPrefix.compare( stPublicKey ) ) {
+
+                                    if (bIsRSA)
+                                        pPublicKeyValue = ( ( Pkcs11ObjectKeyPublicRSA* ) oldObjectOnCard.get( ) )->m_pModulus.get( );
+                                    else
+                                        pPublicKeyValue = ( ( Pkcs11ObjectKeyPublicECC* ) oldObjectOnCard.get( ) )->m_pPublicPoint.get( );
+
+                                } else {
+
+                                    if (bIsRSA)
+                                        pPublicKeyValue = ( ( RSAPrivateKeyObject* ) oldObjectOnCard.get( ) )->m_pModulus.get( );
+                                    else
+                                        pPublicKeyValue = ( ( ECCPrivateKeyObject* ) oldObjectOnCard.get( ) )->m_pPublicPoint.get( );
+                                }
+
+                                if( pPublicKeyValue ) {
+
+                                    if (bIsRSA)
+                                        Log::logCK_UTF8CHAR_PTR( "Token::checkSmartCardContent - File RSA Public key modulus", pPublicKeyValue->GetBuffer( ), pPublicKeyValue->GetLength( ) );
+                                    else
+                                        Log::logCK_UTF8CHAR_PTR( "Token::checkSmartCardContent - File ECC Public key point Q", pPublicKeyValue->GetBuffer( ), pPublicKeyValue->GetLength( ) );
+
+                                    // Search for a container using the same public key container
+                                    ucKeyContainerIndexReal = MiniDriverContainerMapFile::CONTAINER_INDEX_INVALID;
+                                    ucKeySpec = 0xFF;
+                                    stFileName = "";
+                                    m_Device->containerGetMatching( getUserRole(), ucKeyContainerIndexReal, ucKeySpec, stFileName, pPublicKeyValue );
+                                    Log::log( "Token::checkSmartCardContent - Real container index found comparing the public key modulus of each container with the P11 object one <%d>", ucKeyContainerIndexReal );
+
+                                    // Compare the container index defined in the PKCS11 object with the container index using that public key modulus
+                                    if( MiniDriverContainerMapFile::CONTAINER_INDEX_INVALID == ucKeyContainerIndexReal ) {
+
+                                        // No container exists into the smart card matching with the public key set into the P11 object
+                                        // This object should be deleted
+                                        Log::log( "Token::checkSmartCardContent - No inner container index for <%s>", stObjectPKCS11.c_str( ) );
+
+                                    } else if( ucKeyContainerIndexInFileName != ucKeyContainerIndexReal ) {
+
+                                        // The both index are different !
+
+                                        CK_OBJECT_HANDLE h = CK_UNAVAILABLE_INFORMATION;
+                                        if( stPrefix.compare( stPublicKey ) == 0 ) {
+
+                                            Pkcs11ObjectKeyPublic* pNewKey;
+
+                                            if (bIsRSA)
+                                                pNewKey = new Pkcs11ObjectKeyPublicRSA( ( const Pkcs11ObjectKeyPublicRSA* ) oldObjectOnCard.get( ) );
+                                            else
+                                                pNewKey = new Pkcs11ObjectKeyPublicECC( ( const Pkcs11ObjectKeyPublicECC* ) oldObjectOnCard.get( ) );
+
+                                            // Set the good container index into the PKCS11 object
+                                            pNewKey->m_ucContainerIndex = ucKeyContainerIndexReal;
+
+                                            // Set the good file name in to the PKCS11 object
+                                            pNewKey->m_stFileName = stPrefix;
+                                            Util::toStringHex( ucKeyContainerIndexReal, pNewKey->m_stFileName );
+
+                                            // Create the new root certificate
+                                            addObject( pNewKey, &h );
+
+                                            //m_bSynchronizeObjectsPublic = true;
+
+                                            Log::log( "Token::checkSmartCardContent - add new P11 public key <%s>", pNewKey->m_stFileName.c_str( ) );
+
+                                        } else {
+
+                                            PrivateKeyObject* pNewKey;
+
+                                            if (bIsRSA)
+                                                pNewKey = new RSAPrivateKeyObject( ( const RSAPrivateKeyObject* ) oldObjectOnCard.get( ) );
+                                            else
+                                                pNewKey = new ECCPrivateKeyObject( ( const ECCPrivateKeyObject* ) oldObjectOnCard.get( ) );
+
+                                            // Set the good container index into the PKCS11 object
+                                            pNewKey->m_ucContainerIndex = ucKeyContainerIndexReal;
+
+                                            // Set the good file name in to the PKCS11 object
+                                            pNewKey->m_stFileName = stPrefix;
+                                            Util::toStringHex( ucKeyContainerIndexReal, pNewKey->m_stFileName );
+
+                                            // Create the new root certificate
+                                            addObject( pNewKey, &h );
+
+                                            //m_bSynchronizeObjectsPrivate = true;
+
+                                            Log::log( "Token::checkSmartCardContent - add new P11 private key <%s>", pNewKey->m_stFileName.c_str( ) );
+                                        }
+
+                                        // Delete the old PKCS#11 object & MiniDriver file/container from card
+                                        m_Device->deleteFile( g_stPathPKCS11, oldObjectOnCard->m_stFileName );
+                                        Log::log( "Token::checkSmartCardContent - delete old P11 key <%s>", oldObjectOnCard->m_stFileName.c_str( ) );
+
+                                        // Delete the old PKCS#11 object from inner list of managed objects
+                                        TOKEN_OBJECTS::iterator i = m_Objects.begin( );
+                                        while( i != m_Objects.end( ) ) {
+
+                                            if( 0 == i->second->m_stFileName.compare( oldObjectOnCard->m_stFileName ) ) {
+
+                                                m_Objects.erase( i );
+
+                                                break;
+                                            }
+
+                                            ++i;
+                                        }
+                                    }
+
+                                } else {
+
+                                    // The public key modulus is missing. The public/private key is not well formated
+                                    if (bIsRSA)
+                                        Log::log( "Token::checkSmartCardContent - No RSA modulus for <%s>", stObjectPKCS11.c_str( ) );
+                                    else
+                                        Log::log( "Token::checkSmartCardContent - No ECC public point for <%s>", stObjectPKCS11.c_str( ) );
+                                }
                             }
-                        }
 
-                        if( stPrefix.compare( stPrivateKey ) == 0 ) {
+                            if( stPrefix.compare( stPrivateKey ) == 0 ) {
 
-                            stPrefix = stPublicKey;
+                                stPrefix = stPublicKey;
 
-                        } else if( stPrefix.compare( stPublicKey ) == 0 ) {
+                            } else if( stPrefix.compare( stPublicKey ) == 0 ) {
 
-                            stPrefix ="";
-                            break;
-                        }
+                                stPrefix ="";
+                                break;
+                            }
 
-                    } while( 0 != stPrefix.compare( "" ) );
+                        } while( 0 != stPrefix.compare( "" ) );
+                    }
                 }
             }
+        } catch( MiniDriverException& ) {
+
+            Log::error( "Token::checkSmartCardContent", "MiniDriverException" );
         }
-    } catch( MiniDriverException& ) {
-
-        Log::error( "Token::checkSmartCardContent", "MiniDriverException" );
     }
 
-    Log::log(" Token::checkSmartCardContent -$$$$$$$$$$$$$ Obj after P11 clean");
-    BOOST_FOREACH( const TOKEN_OBJECTS::value_type& o, m_Objects ) {
+    if (Log::s_bEnableLog)
+    {
+        Log::log(" Token::checkSmartCardContent -$$$$$$$$$$$$$ Obj after P11 clean");
+        BOOST_FOREACH( const TOKEN_OBJECTS::value_type& o, m_Objects ) {
 
-        printObject( o.second );
+            printObject( o.second );
+        }
+        Log::log(" Token::checkSmartCardContent -$$$$$$$$$$$$$ Obj after P11 clean");
     }
-    Log::log(" Token::checkSmartCardContent -$$$$$$$$$$$$$ Obj after P11 clean");
 
     t.stop( "Token::checkSmartCardContent" );
     Log::end( "Token::checkSmartCardContent" );
@@ -3947,6 +5042,7 @@ void Token::synchronizePublicCertificateAndKeyObjects( void ) {
 
         // Explore each smart card key container
         unsigned char ucContainerCount = m_Device->containerCount( );
+        MiniDriverAuthentication::ROLES userRole = getUserRole();
 
         for( unsigned char ucContainerIndex = 0 ; ucContainerIndex < ucContainerCount ; ++ucContainerIndex ) {
 
@@ -3954,175 +5050,246 @@ void Token::synchronizePublicCertificateAndKeyObjects( void ) {
             Util::toStringHex( ucContainerIndex, stContainerIndex );
 
             // Get the current container
-            MiniDriverContainer c = m_Device->containerGet( ucContainerIndex );
+            MiniDriverContainer& c = m_Device->containerGet( ucContainerIndex );
 
-            // Only deal with valid containers
-            if( MiniDriverContainer::CMAPFILE_FLAG_EMPTY != c.getFlags( ) ) {
+            // Only deal with valid containers that are associated with our role
+            if(     (MiniDriverContainer::CMAPFILE_FLAG_EMPTY != c.getFlags( ) )
+                &&  (   (c.getPinIdentifier() == userRole)
+                    ||  (m_Device->isNoPin(c.getPinIdentifier()) && m_Device->isNoPin(userRole))
+                    )
+                )
+            {
+				Log::log( "Token::synchronizePublicCertificateAndKeyObjects - <%d> valid container", ucContainerIndex );
+				// check both exchange and signature keys
+				for (int i = 0; i < 2; i++)
+				{
+					int retryCounter = 0;
+					boost::shared_ptr< u1Array > pPublicKeyExponent, pPublicKeyModulus, pEccPublicKey;
+                                        boost::shared_ptr< u1Array > pOID;
+retryContainer:
+					// Get the key information
+					if (i == 0)
+					{
+						ucKeySpec = MiniDriverContainer::KEYSPEC_EXCHANGE;
 
-                // Get the key information
-                ucKeySpec = MiniDriverContainer::KEYSPEC_EXCHANGE;
+						uiKeySize = c.getKeyExchangeSizeBits( );
 
-                uiKeySize = c.getKeyExchangeSizeBits( );
+						pPublicKeyExponent = c.getExchangePublicKeyExponent( );
 
-                boost::shared_ptr< Marshaller::u1Array > pPublicKeyExponent = c.getExchangePublicKeyExponent( );
+						pPublicKeyModulus = c.getExchangePublicKeyModulus( );
 
-                boost::shared_ptr< Marshaller::u1Array > pPublicKeyModulus = c.getExchangePublicKeyModulus( );
+						pEccPublicKey = c.getEcdhePointDER();
 
-                stPrefix = szUSER_KEYEXCHANGE_CERT_PREFIX; 
+						if (pEccPublicKey.get())
+							ucKeySpec = c.getEcdheKeySpec();
 
-                if( !uiKeySize ) {
+						stPrefix = szUSER_KEYEXCHANGE_CERT_PREFIX;
+					}
+					else
+					{
+						ucKeySpec = MiniDriverContainer::KEYSPEC_SIGNATURE;
 
-                    ucKeySpec = MiniDriverContainer::KEYSPEC_SIGNATURE;
+						uiKeySize = c.getKeySignatureSizeBits( );
 
-                    uiKeySize = c.getKeySignatureSizeBits( );
+						pPublicKeyExponent = c.getSignaturePublicKeyExponent( );
 
-                    pPublicKeyExponent = c.getSignaturePublicKeyExponent( );
+						pPublicKeyModulus = c.getSignaturePublicKeyModulus( );
 
-                    pPublicKeyModulus = c.getSignaturePublicKeyModulus( );
+						pEccPublicKey = c.getEcdsaPointDER();
 
-                    stPrefix = szUSER_SIGNATURE_CERT_PREFIX;
-                }
+						if (pEccPublicKey.get())
+							ucKeySpec = c.getEcdsaKeySpec();
 
-                Log::log( "Token::synchronizePublicCertificateAndKeyObjects - <%d> valid container", ucContainerIndex );
+						stPrefix = szUSER_SIGNATURE_CERT_PREFIX;
+					}
 
-                // Build the certificate file name associated to this container
-                stCertificateFileName = stPrefix + stContainerIndex;
+	                if( !uiKeySize )
+					{
+						Log::log( "Token::synchronizePublicCertificateAndKeyObjects - no %s key", (i == 0)? "Exchange" : "Signature" );
+						continue;
+					}
 
-                // Locate the associated certificate into the MiniDriver file structure
-                bool bExistsMSCPFile = isFileExists( stCertificateFileName, filesMiniDriver );
+					Log::log( "Token::synchronizePublicCertificateAndKeyObjects - KeySpec=<%d> KeySize=<%d> PubExp=<%p> PubMod=<%p> EccPub=<%p>", ucKeySpec, uiKeySize, pPublicKeyExponent.get(), pPublicKeyModulus.get(), pEccPublicKey.get());
 
-                //??? TO ??? si le fichier n'existe pas il faut supprimer le container
+					if (!pEccPublicKey.get() && (!pPublicKeyExponent.get() || !pPublicKeyModulus.get()))
+					{
+						if (retryCounter == 0)
+						{
+							Log::log( "Token::synchronizePublicCertificateAndKeyObjects - inconsistency discovered. Reading container.");
+							try
+							{
+								// Populate the container info (throws if the container is empty)
+								boost::shared_ptr< u1Array > ci( m_Device->getContainer( ucContainerIndex ) );
 
-                Log::log( "Token::synchronizePublicCertificateAndKeyObjects - check for <%s> - Exists in MSCP <%d>", stCertificateFileName.c_str( ), bExistsMSCPFile );
+								c.setContainerInformation( ci );
+							}
+							catch(MiniDriverException&)
+							{
+								Log::log( "Token::synchronizePublicCertificateAndKeyObjects - error while reading container. Skipping.");
+								//Continue reading the cert  objects do not break;
+							}
 
-                // A public PKCS11 certificate object must exist on cache and on card to represent this MiniDriver certificate
-                stObjectPKCS11 = g_stPrefixPublicObject + stCertificateFileName;
+							retryCounter++;
+							goto retryContainer;
+						}
+						else
+						{
+							Log::log( "Token::synchronizePublicCertificateAndKeyObjects - Container still inconsistent after retry. Skipping.");
+							//Continue reading the cert objects do not break;
+						}
+					}
 
-                // Does this certificate also exist as a PKCS11 object ?
-                bool bExistsPKCS11Object = isFileExists( stObjectPKCS11, filesPKCS11 );
+					// Build the certificate file name associated to this container
+					stCertificateFileName = stPrefix + stContainerIndex;
 
-                Log::log( "Token::synchronizePublicCertificateAndKeyObjects - check for <%s> - Exists in P11 <%d>", stObjectPKCS11.c_str( ), bExistsPKCS11Object );
+					// Locate the associated certificate into the MiniDriver file structure
+					bool bExistsMSCPFile = isFileExists( stCertificateFileName, filesMiniDriver );
 
-                if( bExistsMSCPFile ) { 
+					//??? TO ??? si le fichier n'existe pas il faut supprimer le container
 
-                    // The associated certificate exists into the mscp directory
+					Log::log( "Token::synchronizePublicCertificateAndKeyObjects - check for <%s> - Exists in MSCP <%d>", stCertificateFileName.c_str( ), bExistsMSCPFile );
 
-                    if( bExistsPKCS11Object ) { 
+					// A public PKCS11 certificate object must exist on cache and on card to represent this MiniDriver certificate
+					stObjectPKCS11 = g_stPrefixPublicObject + stCertificateFileName;
 
-                        // The PCKS11 certificate object exists
+					// Does this certificate also exist as a PKCS11 object ?
+					bool bExistsPKCS11Object = isFileExists( stObjectPKCS11, filesPKCS11 );
 
-                        // Load the PKCS11 object from the already existing PKCS11 file
-                        try {
+					Log::log( "Token::synchronizePublicCertificateAndKeyObjects - check for <%s> - Exists in P11 <%d>", stObjectPKCS11.c_str( ), bExistsPKCS11Object );
 
-                            createCertificateFromPKCS11ObjectFile( stObjectPKCS11, stCertificateFileName );
+					if( bExistsMSCPFile ) {
 
-                        } catch( ... ) {
+						// The associated certificate exists into the mscp directory
 
-                            Log::log( "**************************************************** CASE #1 [P11 cert exists but not possible read] - <%s> <%s>", stObjectPKCS11.c_str( ), stCertificateFileName.c_str( ) );
+						if( bExistsPKCS11Object ) {
 
-                            // Create the PKCS11 object from the MSCP file
-                            createCertificateFromMiniDriverFile( stCertificateFileName, ucContainerIndex, ucKeySpec ); 
+							// The PCKS11 certificate object exists
 
-                            //m_ObjectsToDelete.push_back( stObjectPKCS11 );
-                        }
+							// Load the PKCS11 object from the already existing PKCS11 file
+							try {
 
-                    } else { 
+								if (!createCertificateFromPKCS11ObjectFile( stObjectPKCS11, stCertificateFileName ))
+								{
+									Log::log( "**************************************************** [P11 cert exists but not consistent with the one in mscp. Using the minidriver certificate instead] - <%s> <%s>", stObjectPKCS11.c_str( ), stCertificateFileName.c_str( ) );
+									// The PKCS11 object is not consistent with the one in the minidriver file. Create a memory object from the MiniDriver file.
+									createCertificateFromMiniDriverFile( stCertificateFileName, ucContainerIndex, ucKeySpec , pOID);
+								}
 
-                        // The PKCS11 file does not exist
+							} catch( ... ) {
 
-                        // Create the PKCS11 object from the MSCP file
-                        createCertificateFromMiniDriverFile( stCertificateFileName, ucContainerIndex, ucKeySpec );
-                    }
+								Log::log( "**************************************************** CASE #1 [P11 cert exists but not possible read] - <%s> <%s>", stObjectPKCS11.c_str( ), stCertificateFileName.c_str( ) );
 
-                } else { 
+								// Create the PKCS11 object from the MSCP file
+								createCertificateFromMiniDriverFile( stCertificateFileName, ucContainerIndex, ucKeySpec , pOID);
 
-                    // The associated certificate does not exist into the mscp directory
+								//m_ObjectsToDelete.push_back( stObjectPKCS11 );
+							}
 
-                    // If a old corresponding PKCS11 object exists then delete it
-                    if( bExistsPKCS11Object ) {
+						} else {
 
-                        Log::log( "**************************************************** CASE #2 [P11 cert exists but no associated KXC] - <%s> <%s>", stObjectPKCS11.c_str( ), stCertificateFileName.c_str( ) );
+							// The PKCS11 file does not exist
 
-                        // NO DELETE
-                        //m_ObjectsToDelete.push_back( stObjectPKCS11 );
-                    }
-                }
+							// Create the PKCS11 object from the MSCP file
+							createCertificateFromMiniDriverFile( stCertificateFileName, ucContainerIndex, ucKeySpec, pOID );
+						}
 
-                // Locate the associated PUBLIC key
-                // Build the public key file name associated to this container
-                stObjectPKCS11 = g_stPrefixPublicObject + g_stPrefixKeyPublic + stContainerIndex;
+					} else {
 
-                // Does this public key also exist as a PKCS11 object ?
-                bExistsPKCS11Object = isFileExists( stObjectPKCS11, filesPKCS11 );
+						// The associated certificate does not exist into the mscp directory
 
-                if( bExistsPKCS11Object ) { 
+						// If a old corresponding PKCS11 object exists then delete it
+						if( bExistsPKCS11Object ) {
 
-                    // The PCKS11 public key object exists
-                    // Create the PKCS11 object from the already existing PKCS11 file
-                    try {
+							Log::log( "**************************************************** CASE #2 [P11 cert exists but no associated KXC] - <%s> <%s>", stObjectPKCS11.c_str( ), stCertificateFileName.c_str( ) );
 
-                        createPublicKeyFromPKCS11ObjectFile( stObjectPKCS11 );
+							// NO DELETE
+							//m_ObjectsToDelete.push_back( stObjectPKCS11 );
+						}
+					}
 
-                    } catch( ... ) {
+					// Locate the associated PUBLIC key
+					// Build the public key file name associated to this container
+					stObjectPKCS11 = g_stPrefixPublicObject + g_stPrefixKeyPublic + stContainerIndex;
 
-                        Log::log( "**************************************************** CASE #3 [P11 pub key exists but no read possible] - <%s>", stObjectPKCS11.c_str( ) );
+					// Does this public key also exist as a PKCS11 object ?
+					bExistsPKCS11Object = isFileExists( stObjectPKCS11, filesPKCS11 );
 
-                        createPublicKeyFromMiniDriverFile( stObjectPKCS11, ucContainerIndex, ucKeySpec, pPublicKeyExponent.get( ), pPublicKeyModulus.get( ) );
+					if( bExistsPKCS11Object ) {
 
-                        //stObjectPKCS11 = g_stPrefixPublicObject + std::string( szUSER_SIGNATURE_CERT_PREFIX ) + stContainerIndex;
-                        //m_ObjectsToDelete.push_back( stObjectPKCS11 );
-                    }
+						// The PCKS11 public key object exists
+						// Create the PKCS11 object from the already existing PKCS11 file
+						try {
 
-                } else { 
+							createPublicKeyFromPKCS11ObjectFile( stObjectPKCS11 );
 
-                    // The PKCS11 public key object does not exist
-                    // Create the PKCS11 object from the MSCP key container
-                    createPublicKeyFromMiniDriverFile( stObjectPKCS11, ucContainerIndex, ucKeySpec, pPublicKeyExponent.get( ), pPublicKeyModulus.get( ) );
-                }
+						} catch( ... ) {
 
-            } else { 
+							Log::log( "**************************************************** CASE #3 [P11 pub key exists but no read possible] - <%s>", stObjectPKCS11.c_str( ) );
+
+							if (pEccPublicKey.get())
+								createPublicKeyFromMiniDriverFile( stObjectPKCS11, ucContainerIndex, ucKeySpec, NULL, pEccPublicKey.get( ), pOID );
+							else
+								createPublicKeyFromMiniDriverFile( stObjectPKCS11, ucContainerIndex, ucKeySpec, pPublicKeyExponent.get( ), pPublicKeyModulus.get( ), pOID );
+
+							//stObjectPKCS11 = g_stPrefixPublicObject + std::string( szUSER_SIGNATURE_CERT_PREFIX ) + stContainerIndex;
+							//m_ObjectsToDelete.push_back( stObjectPKCS11 );
+						}
+
+					} else {
+
+						// The PKCS11 public key object does not exist
+						// Create the PKCS11 object from the MSCP key container
+						if (pEccPublicKey.get())
+							createPublicKeyFromMiniDriverFile( stObjectPKCS11, ucContainerIndex, ucKeySpec, NULL, pEccPublicKey.get( ), pOID );
+						else
+							createPublicKeyFromMiniDriverFile( stObjectPKCS11, ucContainerIndex, ucKeySpec, pPublicKeyExponent.get( ), pPublicKeyModulus.get( ) , pOID);
+					}
+
+					if (!m_Device->supportsDualKeyContainers ())
+						break;
+				}
+
+            } else {
 
                 // The container is empty
-                // Search for an old corresponding PKCS11 object to delete it
                 Log::log( "Token::synchronizePublicCertificateAndKeyObjects - <%d> empty container", ucContainerIndex );
-
-                //// Build the certificate file name associated to this container
-                //stObjectPKCS11 = g_stPrefixPublicObject + std::string( szUSER_SIGNATURE_CERT_PREFIX ) + stContainerIndex;
-                //bool bExistsPKCS11Object = isFileExists( stObjectPKCS11, filesPKCS11 );
-                //if( bExistsPKCS11Object ) {
-
-                //    // NO DELETE
-                //    //m_ObjectsToDelete.push_back( stObjectPKCS11 );
-                //    Log::log( "**************************************************** CASE #4.1 [P11 obj exists] - <%s>", stObjectPKCS11.c_str( ) );
-                //}
-
-                //stObjectPKCS11 = g_stPrefixPublicObject + std::string( szUSER_KEYEXCHANGE_CERT_PREFIX ) + stContainerIndex;
-                //bExistsPKCS11Object = isFileExists( stObjectPKCS11, filesPKCS11 );
-                //if( bExistsPKCS11Object ) {
-
-                //    // NO DELETE
-                //    //m_ObjectsToDelete.push_back( stObjectPKCS11 );
-                //    Log::log( "**************************************************** CASE #4.2 [P11 obj exists] - <%s>", stObjectPKCS11.c_str( ) );
-                //}
-
-                //stObjectPKCS11 = g_stPrefixPublicObject + g_stPrefixKeyPublic + stContainerIndex;
-                //bExistsPKCS11Object = isFileExists( stObjectPKCS11, filesPKCS11 );
-                //if( bExistsPKCS11Object ) {
-
-                //    // NO DELETE
-                //    //m_ObjectsToDelete.push_back( stObjectPKCS11 );
-                //    Log::log( "**************************************************** CASE #4.3 [P11 obj exists] - <%s>", stObjectPKCS11.c_str( ) );
-                //}
-
-                //stObjectPKCS11 = g_stPrefixPrivateObject + g_stPrefixKeyPrivate + stContainerIndex;
-                //bExistsPKCS11Object = isFileExists( stObjectPKCS11, filesPKCS11 );
-                //if( bExistsPKCS11Object ) {
-
-                //    // NO DELETE
-                //    //m_ObjectsToDelete.push_back( stObjectPKCS11 );
-                //    Log::log( "**************************************************** CASE #4.4 [P11 obj exists] - <%s>", stObjectPKCS11.c_str( ) );
-                //}
             }
+        }
+
+        // update the label of memory-only certificates to match the one from the associated public key
+        BOOST_FOREACH( const TOKEN_OBJECTS::value_type& obj, m_Objects ) {
+        if( CKO_CERTIFICATE == obj->second->getClass( ) ) {
+
+				  X509PubKeyCertObject* objCertificate = (X509PubKeyCertObject*) obj->second;
+				  if (objCertificate->m_bOffCardObject)
+				  {
+					  BOOST_FOREACH( const TOKEN_OBJECTS::value_type& obj2, m_Objects ) {
+						  if( CKO_PUBLIC_KEY == obj2->second->getClass( ) ) {
+
+								Pkcs11ObjectKeyPublic* objPublicKey = (Pkcs11ObjectKeyPublic*) obj2->second;
+								if (objPublicKey->m_ucContainerIndex == objCertificate->m_ucContainerIndex)
+								{
+									// we use only stored P11 public key
+									if (!objPublicKey->m_bOffCardObject)
+									{
+										// Set the same CKA_ID
+										if( objPublicKey->m_pID.get( ) ) {
+
+											 objCertificate->m_pID.reset( new u1Array( *( objPublicKey->m_pID.get( ) ) ) );
+										}
+
+										// Set the same CKA_LABEL
+										if( objPublicKey->m_pLabel.get( ) ) {
+
+											 objCertificate->m_pLabel.reset( new u1Array( *( objPublicKey->m_pLabel.get( ) ) ) );
+										}
+									}
+									break;
+								}
+						  }
+					  }
+				  }
+			  }
         }
 
     } catch( MiniDriverException& x ) {
@@ -4178,11 +5345,12 @@ void Token::synchronizePrivateKeyObjects( void ) {
 
         // Explore each smart card key container
         unsigned char ucContainerCount = m_Device->containerCount( );
+        MiniDriverAuthentication::ROLES userRole = getUserRole();
 
         for( unsigned char ucContainerIndex = 0 ; ucContainerIndex < ucContainerCount ; ++ucContainerIndex ) {
 
             // Get the current container
-            MiniDriverContainer c = m_Device->containerGet( ucContainerIndex );
+            MiniDriverContainer& c = m_Device->containerGet( ucContainerIndex );
 
             // Build the certificate file name associated to this container
             stContainerIndex = "";
@@ -4195,58 +5363,148 @@ void Token::synchronizePrivateKeyObjects( void ) {
             // Does this private key also exist as a PKCS11 object ?
             bExistsPKCS11Object = isFileExists( stKeyFileName, filesPKCS11 );
 
-            // Only deal with valid containers
-            if( MiniDriverContainer::CMAPFILE_FLAG_EMPTY != c.getFlags( ) ) {
+            // Only deal with valid containers that are associated with our role
+            if(     (MiniDriverContainer::CMAPFILE_FLAG_EMPTY != c.getFlags( ) )
+                &&  (   (c.getPinIdentifier() == userRole)
+                    ||  (m_Device->isNoPin(c.getPinIdentifier()) && m_Device->isNoPin(userRole))
+                    )
+                )
+            {
+				Log::log( "Token::synchronizePrivateKeyObjects - <%d> valid container", ucContainerIndex );
+				// check both exchange and signature keys
+				for (int i = 0; i < 2; i++)
+				{
+					int retryCounter = 0;
+					boost::shared_ptr< u1Array > pPublicKeyExponent, pPublicKeyModulus, pEccPublicKey;
+					try
+					{
+retryPrivateKeyContainer:
+						if (i == 0)
+						{
+							// Get the key information
+							ucKeySpec = MiniDriverContainer::KEYSPEC_EXCHANGE;
 
-                // Get the key information
-                ucKeySpec = MiniDriverContainer::KEYSPEC_EXCHANGE;
+							uiKeySize = c.getKeyExchangeSizeBits( );
 
-                uiKeySize = c.getKeyExchangeSizeBits( );
+							pPublicKeyExponent = c.getExchangePublicKeyExponent( );
 
-                boost::shared_ptr< Marshaller::u1Array > pPublicKeyExponent = c.getExchangePublicKeyExponent( );
+							pPublicKeyModulus = c.getExchangePublicKeyModulus( );
 
-                boost::shared_ptr< Marshaller::u1Array > pPublicKeyModulus = c.getExchangePublicKeyModulus( );
+							pEccPublicKey = c.getEcdhePointDER();
 
-                stPrefix = std::string( szUSER_KEYEXCHANGE_CERT_PREFIX ); 
+							if (pEccPublicKey.get())
+								ucKeySpec = c.getEcdheKeySpec();
 
-                if( !uiKeySize ) {
+							stPrefix = std::string( szUSER_KEYEXCHANGE_CERT_PREFIX );
+						}
+						else
+						{
+							ucKeySpec = MiniDriverContainer::KEYSPEC_SIGNATURE;
 
-                    ucKeySpec = MiniDriverContainer::KEYSPEC_SIGNATURE;
+							uiKeySize = c.getKeySignatureSizeBits( );
 
-                    uiKeySize = c.getKeySignatureSizeBits( );
+							pPublicKeyExponent = c.getSignaturePublicKeyExponent( );
 
-                    pPublicKeyExponent = c.getSignaturePublicKeyExponent( );
+							pPublicKeyModulus = c.getSignaturePublicKeyModulus( );
 
-                    pPublicKeyModulus = c.getSignaturePublicKeyModulus( );
+							pEccPublicKey = c.getEcdsaPointDER();
 
-                    stPrefix = std::string( szUSER_SIGNATURE_CERT_PREFIX );
-                } 
+							if (pEccPublicKey.get())
+								ucKeySpec = c.getEcdsaKeySpec();
 
-                if( bExistsPKCS11Object ) { 
+							stPrefix = std::string( szUSER_SIGNATURE_CERT_PREFIX );
+						}
 
-                    // The PCKS11 key object exists
-                    // Create the PKCS11 object from the already existing PKCS11 file
-                    try {
 
-                        createPrivateKeyFromPKCS11ObjectFile( stKeyFileName );
+						if( !uiKeySize )
+						{
+							Log::log( "Token::synchronizePrivateKeyObjects - no %s key", (i == 0)? "Exchange" : "Signature" );
+							continue;
+						}
 
-                    } catch( ... ) {
 
-                        // Create the PKCS11 object from the MSCP key container
-                        createPrivateKeyFromMiniDriverFile( stKeyFileName, ucContainerIndex, ucKeySpec, pPublicKeyExponent.get( ), pPublicKeyModulus.get( ) );
-                    }
+						Log::log( "Token::synchronizePrivateKeyObjects - KeySpec=<%d> KeySize=<%d> PubExp=<%p> PubMod=<%p> EccPub=<%p>", ucKeySpec, uiKeySize, pPublicKeyExponent.get(), pPublicKeyModulus.get(), pEccPublicKey.get());
 
-                } else { 
+						if (!pEccPublicKey.get() && (!pPublicKeyExponent.get() || !pPublicKeyModulus.get()))
+						{
+							if (retryCounter == 0)
+							{
+								Log::log( "Token::synchronizePrivateKeyObjects - inconsistency discovered. Reading container.");
+								try
+								{
+									// Populate the container info (throws exception if the container is empty)
+									boost::shared_ptr< u1Array > ci( m_Device->getContainer( ucContainerIndex ) );
 
-                    // The PKCS11 private key object does not exist
-                    // Create the PKCS11 object from the MSCP key container
-                    createPrivateKeyFromMiniDriverFile( stKeyFileName, ucContainerIndex, ucKeySpec, pPublicKeyExponent.get( ), pPublicKeyModulus.get( ) );
-                }
+									c.setContainerInformation( ci );
+								}
+								catch(MiniDriverException&)
+								{
+									Log::log( "Token::synchronizePrivateKeyObjects - error while reading container. Skipping.");
+									break;
+								}
 
-            } else { 
+								retryCounter++;
+								goto retryPrivateKeyContainer;
+							}
+							else
+							{
+								Log::log( "Token::synchronizePrivateKeyObjects - Container still inconsistent after retry. Skipping.");
+								break;
+							}
+						}
 
-                // The container is empty
-            }
+						if( bExistsPKCS11Object ) {
+							Log::log( "Token::synchronizePrivateKeyObjects - The PKCS11 private key object exists");
+							// The PCKS11 key object exists
+							// Create the PKCS11 object from the already existing PKCS11 file
+							try {
+								Log::log( "Token::synchronizePrivateKeyObjects - Create the PKCS11 object from the already existing PKCS11 file");
+								createPrivateKeyFromPKCS11ObjectFile( stKeyFileName );
+
+							} catch( ... ) {
+								Log::log( "Token::synchronizePrivateKeyObjects - exception occured");
+								// Create the PKCS11 object from the MSCP key container
+								if (pEccPublicKey.get())
+								{
+									Log::log( "Token::synchronizePrivateKeyObjects - creating ECC private key object from the MSCP key container");
+									createPrivateKeyFromMiniDriverFile( stKeyFileName, ucContainerIndex, ucKeySpec, NULL, pEccPublicKey.get( ) );
+								}
+								else
+								{
+									Log::log( "Token::synchronizePrivateKeyObjects - creating RSA private key object from the MSCP key container");
+									createPrivateKeyFromMiniDriverFile( stKeyFileName, ucContainerIndex, ucKeySpec, pPublicKeyExponent.get( ), pPublicKeyModulus.get( ) );
+								}
+							}
+
+						} else {
+							Log::log( "Token::synchronizePrivateKeyObjects - The PKCS11 private key object does not exist");
+							// The PKCS11 private key object does not exist
+							// Create the PKCS11 object from the MSCP key container
+							if (pEccPublicKey.get())
+							{
+								Log::log( "Token::synchronizePrivateKeyObjects - creating ECC private key object from the MSCP key container");
+								createPrivateKeyFromMiniDriverFile( stKeyFileName, ucContainerIndex, ucKeySpec, NULL, pEccPublicKey.get( ) );
+							}
+							else
+							{
+								Log::log( "Token::synchronizePrivateKeyObjects - creating RSA private key object from the MSCP key container");
+								createPrivateKeyFromMiniDriverFile( stKeyFileName, ucContainerIndex, ucKeySpec, pPublicKeyExponent.get( ), pPublicKeyModulus.get( ) );
+							}
+						}
+
+						if (!m_Device->supportsDualKeyContainers ())
+							break;
+					}
+					catch (...)
+					{
+						Log::log( "Token::synchronizePrivateKeyObjects - exception occured while parsing %s part of container %d. Skipping.", (i == 0)? "Exchange" : "Signature" , (int) ucContainerIndex);
+					}
+				}
+			}
+			else {
+
+					// The container is empty
+			}
         }
 
     } catch( MiniDriverException& x ) {
@@ -4259,10 +5517,109 @@ void Token::synchronizePrivateKeyObjects( void ) {
     Log::end( "Token::synchronizePrivateKeyObjects" );
 }
 
+void Token::synchronizeSecretKeyObjects( void ) {
+
+    Log::begin( "Token::synchronizeSecretKeyObjects" );
+    Timer t;
+    t.start( );
+
+    if( !m_Device ) {
+        return;
+    }
+
+    try {
+
+        // Get all PKCS11 object files from the PKCS11 directory into the smart card
+        MiniDriverFiles::FILES_NAME filesPKCS11;
+
+        if( !m_bCreateDirectoryP11 ) {
+
+            try {
+
+                filesPKCS11 = m_Device->enumFiles( g_stPathPKCS11 );
+
+            } catch( ... ) {
+
+            }
+        }
+
+        std::string stContainerIndex = "";
+        std::string stKeyFileName = "";
+        bool bExistsPKCS11Object = false;
+
+        // Explore each smart card key container
+        unsigned char ucContainerCount = m_Device->containerCount( );
+        MiniDriverAuthentication::ROLES userRole = getUserRole();
+
+        for( unsigned char ucContainerIndex = 0 ; ucContainerIndex < ucContainerCount ; ++ucContainerIndex ) {
+
+            // Get the current container
+            MiniDriverContainer& c = m_Device->containerGet( ucContainerIndex );
+
+            // Locate the associated SECRET key
+            // Build the secret key file name associated to this container
+            stContainerIndex = "";
+            Util::toStringHex( ucContainerIndex, stContainerIndex );
+            stKeyFileName = g_stPrefixPrivateObject + g_stPrefixKeySecret + stContainerIndex;
+
+            // Does this secret key exist as a PKCS11 object ?
+            bExistsPKCS11Object = isFileExists( stKeyFileName, filesPKCS11 );
+
+            // Only deal with valid containers that are associated with our role
+            if(     bExistsPKCS11Object
+                /*&&  (MiniDriverContainer::CMAPFILE_FLAG_EMPTY != c.getFlags( ) )
+                &&  (   (c.getPinIdentifier() == userRole)
+                    ||  (m_Device->isNoPin(c.getPinIdentifier()) && m_Device->isNoPin(userRole))
+                    )*/
+                )
+            {
+                Log::log( "Token::synchronizeSecretKeyObjects - <%d> valid container", ucContainerIndex );
+/*
+                try
+                {
+                    // Populate the container info (throws exception if the container is empty)
+                    boost::shared_ptr< u1Array > ci( m_Device->getContainer( ucContainerIndex ) );
+
+                    c.setContainerInformation( ci );
+                }
+                catch(MiniDriverException&)
+                {
+                    Log::log( "Token::synchronizeSecretKeyObjects - error while reading container. Skipping.");
+                    continue;
+                }
+*/
+                Log::log( "Token::synchronizeSecretKeyObjects - The PKCS11 secret key object exists");
+                // The PCKS11 key object exists
+                // Create the PKCS11 object from the already existing PKCS11 file
+                try {
+                    Log::log( "Token::synchronizeSecretKeyObjects - Create the PKCS11 object from the already existing PKCS11 file");
+                    createSecretKeyFromPKCS11ObjectFile( stKeyFileName, ucContainerIndex );
+                }
+                catch (...)
+                {
+                    Log::log( "Token::synchronizeSecretKeyObjects - exception occured while parsing container %d. Skipping.", (int) ucContainerIndex);
+                    continue;
+                }
+            }
+            else {
+
+                    // The container is empty
+            }
+        }
+
+    } catch( MiniDriverException& x ) {
+
+        Log::error( "Token::synchronizeSecretKeyObjects", "MiniDriverException" );
+        throw PKCS11Exception( checkException( x ) );
+    }
+
+    t.stop( "Token::synchronizeSecretKeyObjects" );
+    Log::end( "Token::synchronizeSecretKeyObjects" );
+}
 
 /* Create the PKCS11 certifcate object associated to the MiniDriver certificate file
 */
-void Token::createCertificateFromPKCS11ObjectFile( const std::string& a_CertificateFileP11, const std::string& a_CertificateFileMiniDriver ) {
+bool Token::createCertificateFromPKCS11ObjectFile( const std::string& a_CertificateFileP11, const std::string& a_CertificateFileMiniDriver ) {
 
     Log::begin( "Token::createCertificateFromPKCS11ObjectFile" );
     Timer t;
@@ -4276,7 +5633,7 @@ void Token::createCertificateFromPKCS11ObjectFile( const std::string& a_Certific
     try {
 
         // Read the file
-        Marshaller::u1Array* f = m_Device->readFile( g_stPathPKCS11, a_CertificateFileP11 );
+        std::unique_ptr<u1Array> f ( m_Device->readFile( g_stPathPKCS11, a_CertificateFileP11 ) );
 
         // Construct the PKCS11 object attributes from the file
         std::vector< unsigned char > attributes;
@@ -4295,7 +5652,7 @@ void Token::createCertificateFromPKCS11ObjectFile( const std::string& a_Certific
         CK_ULONG idx = 0;
         o->deserialize( attributes, &idx );
 
-        // Save the fileName in the object 
+        // Save the fileName in the object
         o->m_stFileName = a_CertificateFileP11;
 
         o->m_stCertificateName = a_CertificateFileMiniDriver;
@@ -4305,14 +5662,22 @@ void Token::createCertificateFromPKCS11ObjectFile( const std::string& a_Certific
 
         if( o->m_pValue ) {
 
+           // check if the attributes of the P11 object are compatible with the value of the certificate
+           if ( !Application::g_DisableCertificateValidation && !o->validate() )
+           {
+               // attributes mismatch: abort creating the object from the P11 file because it seems corrupted.
+               delete o;
+               return false;
+           }
+
             generateRootAndSmartCardLogonFlags( o->m_pValue, o->m_bIsRoot, o->_certCategory, o->m_bIsSmartCardLogon );
 
-            generatePublicKeyModulus( o->m_pValue, o->m_pModulus, o->_checkValue );
+            generatePublicKeyValue( o->m_pValue, o->m_pPublicKeyValue, o->m_bIsRSA, o->m_ucKeySpec, o->_checkValue , o->m_pOID);
         }
 
-        if( o->m_pModulus && ( MiniDriverContainerMapFile::CONTAINER_INDEX_INVALID == o->m_ucContainerIndex ) ) {
+        if( o->m_pPublicKeyValue && ( MiniDriverContainerMapFile::CONTAINER_INDEX_INVALID == o->m_ucContainerIndex ) ) {
 
-            searchContainerIndex( o->m_pModulus, o->m_ucContainerIndex, o->m_ucKeySpec );
+            searchContainerIndex( o->m_pPublicKeyValue, o->m_ucContainerIndex, o->m_ucKeySpec );
         }
 
         // As the PKCS11 file exists on card, the PKCS11 object has just to be added to the list of the PKCS11 managed object list.
@@ -4326,12 +5691,14 @@ void Token::createCertificateFromPKCS11ObjectFile( const std::string& a_Certific
 
     t.stop( "Token::createCertificateFromPKCS11ObjectFile" );
     Log::end( "Token::createCertificateFromPKCS11ObjectFile" );
+
+	 return true;
 }
 
 
 /* Create the PKCS11 certifcate object associated to the MiniDriver certificate file
 */
-void Token::createCertificateFromMiniDriverFile( const std::string& a_CertificateFile, const unsigned char& a_ucIndex, const unsigned char& a_ucKeySpec ) {
+void Token::createCertificateFromMiniDriverFile( const std::string& a_CertificateFile, const unsigned char& a_ucIndex, const unsigned char& a_ucKeySpec , boost::shared_ptr<u1Array>& a_pOID) {
 
     Log::begin( "Token::createCertificateFromMiniDriverFile" );
     Timer t;
@@ -4355,10 +5722,10 @@ void Token::createCertificateFromMiniDriverFile( const std::string& a_Certificat
 
     o->m_Private = CK_FALSE;
 
-    o->m_Modifiable = CK_TRUE;
+    o->m_Modifiable = ((a_ucIndex != 0xFF) && m_Device && m_Device->containerReadOnly(a_ucIndex)) ? CK_FALSE: CK_TRUE;
 
     // No PKCS#11 certificate name for an offcard object. There is only a MiniDriver certificate into the smart card
-    o->m_stFileName = ""; 
+    o->m_stFileName = "";
 
     o->m_stCertificateName = a_CertificateFile;
 
@@ -4380,12 +5747,61 @@ void Token::createCertificateFromMiniDriverFile( const std::string& a_Certificat
 
     // Get object attributes from the parsed certificate
     generateDefaultAttributesCertificate( o );
-
+    if (o->m_pOID->GetLength() > 0)
+    {
+    	a_pOID.reset( new u1Array( o->m_pOID->GetLength( ) ) );
+    	a_pOID->SetBuffer( (u1*) o->m_pOID->GetBuffer( ) );
+    }
     // Register this PKCS11 object into the list of the PKCS11 managed objects
     registerStorageObject( o );
 
     t.stop( "Token::createCertificateFromMiniDriverFile" );
     Log::end( "Token::createCertificateFromMiniDriverFile" );
+}
+
+/* Create the PKCS11 root certifcate object from the msroots content
+*/
+void Token::createRootCertificateFromValue( unsigned char* pbCert, unsigned int iCertLen, const unsigned char& a_ucKeySpec ) {
+
+    Log::begin( "Token::createRootCertificateFromValue" );
+    Timer t;
+    t.start( );
+
+    if( !m_Device ) {
+
+        throw PKCS11Exception( CKR_TOKEN_NOT_PRESENT );
+    }
+
+    // Create the PKCS11 object
+    X509PubKeyCertObject* o = new X509PubKeyCertObject( );
+
+    o->m_ucKeySpec = a_ucKeySpec;
+
+    o->m_ucContainerIndex = MiniDriverContainerMapFile::CONTAINER_INDEX_INVALID;
+
+    o->m_bOffCardObject = true;
+
+    o->m_Token = CK_TRUE;
+
+    o->m_Private = CK_FALSE;
+
+    o->m_Modifiable = CK_FALSE;
+
+    // No PKCS#11 certificate name for an offcard object. There is only a MiniDriver certificate into the smart card
+    o->m_stFileName = "";
+
+    o->m_stCertificateName = szROOT_STORE_FILE;
+
+    o->m_pValue.reset(new u1Array(pbCert, iCertLen));
+
+    // Get object attributes from the parsed certificate
+    generateDefaultAttributesCertificate( o );
+
+    // Register this PKCS11 object into the list of the PKCS11 managed objects
+    registerStorageObject( o );
+
+    t.stop( "Token::createRootCertificateFromValue" );
+    Log::end( "Token::createRootCertificateFromValue" );
 }
 
 
@@ -4405,7 +5821,7 @@ void Token::createPublicKeyFromPKCS11ObjectFile( const std::string& a_PKCS11Publ
     try {
 
         // Read the file
-        Marshaller::u1Array* f = m_Device->readFile( g_stPathPKCS11, a_PKCS11PublicKeyFile );
+        std::unique_ptr<u1Array> f ( m_Device->readFile( g_stPathPKCS11, a_PKCS11PublicKeyFile ) );
 
         // Construct the PKCS11 object attributes from the file
         std::vector< unsigned char > attributes;
@@ -4417,19 +5833,32 @@ void Token::createPublicKeyFromPKCS11ObjectFile( const std::string& a_PKCS11Publ
             attributes.push_back( f->GetBuffer( )[ u ] );
         }
 
+        KeyObject helperObj;
+        bool bIsRSA = false;
+        CK_ULONG idx = 0;
+
+        helperObj.deserialize( attributes, &idx );
+        bIsRSA = (helperObj._keyType == CKK_RSA);
+
         // Create the PKCS11 object
-        Pkcs11ObjectKeyPublicRSA* o = new Pkcs11ObjectKeyPublicRSA( );
+        Pkcs11ObjectKeyPublic* o;
+        if (bIsRSA)
+            o = new Pkcs11ObjectKeyPublicRSA( );
+        else
+            o = new Pkcs11ObjectKeyPublicECC( );
 
         // Put the file content into the object
-        CK_ULONG idx = 0;
+        idx = 0;
         o->deserialize( attributes, &idx );
 
-        // Save the fileName in the object 
+        // Save the fileName in the object
         o->m_stFileName = a_PKCS11PublicKeyFile;
+
+        boost::shared_ptr< u1Array> a_pPubKeyValue = (bIsRSA)? ((Pkcs11ObjectKeyPublicRSA*) o)->m_pModulus : ((Pkcs11ObjectKeyPublicECC*)o)->m_pPublicPoint;
 
         if( MiniDriverContainerMapFile::CONTAINER_INDEX_INVALID == o->m_ucContainerIndex ) {
 
-            searchContainerIndex( o->m_pModulus, o->m_ucContainerIndex, o->m_ucKeySpec );
+            searchContainerIndex( a_pPubKeyValue, o->m_ucContainerIndex, o->m_ucKeySpec );
         }
 
         registerStorageObject( o );
@@ -4447,14 +5876,34 @@ void Token::createPublicKeyFromPKCS11ObjectFile( const std::string& a_PKCS11Publ
 
 /* Create the PKCS11 public key object associated to the MiniDriver container
 */
-void Token::createPublicKeyFromMiniDriverFile( const std::string& a_stKeyFileName, const unsigned char& a_ucIndex, const unsigned int& a_ucKeySpec, Marshaller::u1Array* a_pPublicKeyExponent, Marshaller::u1Array* a_pPublicKeyModulus ) {
+void Token::createPublicKeyFromMiniDriverFile( const std::string& /*a_stKeyFileName*/, const unsigned char& a_ucIndex, const unsigned int& a_ucKeySpec, u1Array* a_pPublicKeyExponent, u1Array* a_pPublicKeyModulus, boost::shared_ptr<u1Array> a_pOID ) {
 
-    Log::begin( "Token::createPublicKeyFromMiniDriverFile" );
+	Log::begin( "Token::createPublicKeyFromMiniDriverFile");
+	Log::log ("Token::createPublicKeyFromMiniDriverFile (index=<%d>, KeySpec=<%d>, PubExp=<%p>, PubMod=<%d>)", a_ucIndex, a_ucKeySpec, a_pPublicKeyExponent, a_pPublicKeyModulus );
     Timer t;
     t.start( );
 
     // Create the PKCS11 object
-    Pkcs11ObjectKeyPublicRSA* o = new Pkcs11ObjectKeyPublicRSA( );
+    Pkcs11ObjectKeyPublic* o = NULL;
+    bool bIsRSA = false;
+
+	if (a_pPublicKeyExponent && a_pPublicKeyModulus)
+    {
+        o = new Pkcs11ObjectKeyPublicRSA( );
+        bIsRSA = true;
+    }
+    else if (a_pPublicKeyModulus)
+    {
+        o = new Pkcs11ObjectKeyPublicECC( );
+        bIsRSA = false;
+    }
+	else
+	{
+		Log::error( "Token::createPublicKeyFromMiniDriverFile", "No exponent or modulus passed. Can't create public key. Skipping." );
+		t.stop( "Token::createPublicKeyFromMiniDriverFile" );
+		Log::end( "Token::createPublicKeyFromMiniDriverFile" );
+		return;
+	}
 
     o->m_stFileName = ""; // No PKCS#11 key file into the smart card. This object is build for a off card usage using the information given by the container //a_stKeyFileName;
 
@@ -4462,7 +5911,7 @@ void Token::createPublicKeyFromMiniDriverFile( const std::string& a_stKeyFileNam
 
     o->m_Private = CK_FALSE;
 
-    o->m_Modifiable = CK_TRUE;
+    o->m_Modifiable = ((a_ucIndex != 0xFF) && m_Device && m_Device->containerReadOnly(a_ucIndex)) ? CK_FALSE: CK_TRUE;
 
     o->m_ucContainerIndex = a_ucIndex;
 
@@ -4480,11 +5929,18 @@ void Token::createPublicKeyFromMiniDriverFile( const std::string& a_stKeyFileNam
 
     o->_verifyRecover = CK_FALSE;
 
-    if( MiniDriverContainer::KEYSPEC_EXCHANGE == a_ucKeySpec ) {
+    if(     MiniDriverContainer::KEYSPEC_EXCHANGE == a_ucKeySpec
+        ||  MiniDriverContainer::KEYSPEC_ECDHE_256 == a_ucKeySpec
+        ||  MiniDriverContainer::KEYSPEC_ECDHE_384 == a_ucKeySpec
+        ||  MiniDriverContainer::KEYSPEC_ECDHE_521 == a_ucKeySpec
+      ) {
 
         o->_verify = CK_TRUE;
 
-        o->_encrypt = CK_TRUE;
+        if (MiniDriverContainer::KEYSPEC_EXCHANGE == a_ucKeySpec)
+            o->_encrypt = CK_TRUE;
+        else
+            o->_encrypt = CK_FALSE;
 
         if( m_Device ) {
 
@@ -4506,18 +5962,63 @@ void Token::createPublicKeyFromMiniDriverFile( const std::string& a_stKeyFileNam
 
                 o->_local = CK_TRUE;
             }
-        }    
+        }
     }
 
-    o->m_pPublicExponent.reset( new Marshaller::u1Array( a_pPublicKeyExponent->GetLength( ) ) );
+    if (bIsRSA)
+    {
+        Pkcs11ObjectKeyPublicRSA* oRSA = (Pkcs11ObjectKeyPublicRSA*) o;
 
-    o->m_pPublicExponent->SetBuffer( a_pPublicKeyExponent->GetBuffer( ) );
+        oRSA->m_pPublicExponent.reset( new u1Array( a_pPublicKeyExponent->GetLength( ) ) );
 
-    o->m_pModulus.reset( new Marshaller::u1Array( a_pPublicKeyModulus->GetLength( ) ) );
+        oRSA->m_pPublicExponent->SetBuffer( a_pPublicKeyExponent->GetBuffer( ) );
 
-    o->m_pModulus->SetBuffer( a_pPublicKeyModulus->GetBuffer( ) );
+        oRSA->m_pModulus.reset( new u1Array( a_pPublicKeyModulus->GetLength( ) ) );
 
-    o->m_ulModulusBits = a_pPublicKeyModulus->GetLength( ) * 8;
+        oRSA->m_pModulus->SetBuffer( a_pPublicKeyModulus->GetBuffer( ) );
+
+        oRSA->m_ulModulusBits = a_pPublicKeyModulus->GetLength( ) * 8;
+    }
+    else
+    {
+        Pkcs11ObjectKeyPublicECC* oECC = (Pkcs11ObjectKeyPublicECC*) o;
+
+        oECC->m_pPublicPoint.reset( new u1Array( a_pPublicKeyModulus->GetLength( ) ) );
+
+        oECC->m_pPublicPoint->SetBuffer( a_pPublicKeyModulus->GetBuffer( ) );
+
+        u4 ulOidLen = 0;
+        unsigned char* pOid = NULL;
+
+	if ((a_pOID) && (a_pOID->GetLength() > 0))
+	{
+		ulOidLen = a_pOID->GetLength();
+		pOid = a_pOID->GetBuffer();
+	}
+	else if (    MiniDriverContainer::KEYSPEC_ECDHE_256 == a_ucKeySpec
+            ||  MiniDriverContainer::KEYSPEC_ECDSA_256 == a_ucKeySpec
+           )
+        {
+            pOid = g_pbECC256_OID;
+            ulOidLen = sizeof(g_pbECC256_OID);
+        } else if (    MiniDriverContainer::KEYSPEC_ECDHE_384 == a_ucKeySpec
+            ||  MiniDriverContainer::KEYSPEC_ECDSA_384 == a_ucKeySpec
+           )
+        {
+            pOid = g_pbECC384_OID;
+            ulOidLen = sizeof(g_pbECC384_OID);
+        } else if (    MiniDriverContainer::KEYSPEC_ECDHE_521 == a_ucKeySpec
+            ||  MiniDriverContainer::KEYSPEC_ECDSA_521 == a_ucKeySpec
+           )
+        {
+            pOid = g_pbECC521_OID;
+            ulOidLen = sizeof(g_pbECC521_OID);
+        }
+
+        oECC->m_pParams.reset( new u1Array( ulOidLen ) );
+
+        oECC->m_pParams->SetBuffer( pOid );
+    }
 
     generateDefaultAttributesKeyPublic( o );
 
@@ -4544,7 +6045,7 @@ void Token::createPrivateKeyFromPKCS11ObjectFile( const std::string& a_PKCS11Pri
     try {
 
         // Read the file
-        Marshaller::u1Array* f = m_Device->readFile( g_stPathPKCS11, a_PKCS11PrivateKeyFile );
+        std::unique_ptr<u1Array> f ( m_Device->readFile( g_stPathPKCS11, a_PKCS11PrivateKeyFile ) );
 
         // Construct the PKCS11 object attributes from the file
         std::vector< unsigned char > attributes;
@@ -4556,27 +6057,40 @@ void Token::createPrivateKeyFromPKCS11ObjectFile( const std::string& a_PKCS11Pri
             attributes.push_back( f->GetBuffer( )[ u ] );
         }
 
+        KeyObject helperObj;
+        bool bIsRSA = false;
+        CK_ULONG idx = 0;
+
+        helperObj.deserialize( attributes, &idx );
+        bIsRSA = (helperObj._keyType == CKK_RSA);
+
         // Create the PKCS11 object
-        RSAPrivateKeyObject* o = new RSAPrivateKeyObject( );
+        PrivateKeyObject* o;
+        if (bIsRSA)
+            o = new RSAPrivateKeyObject( );
+        else
+            o = new ECCPrivateKeyObject( );
 
         // Put the file content into the object
-        CK_ULONG idx = 0;
+        idx = 0;
         o->deserialize( attributes, &idx );
 
-        // Save the fileName in the object 
+        // Save the fileName in the object
         o->m_stFileName = a_PKCS11PrivateKeyFile;
+
+        boost::shared_ptr< u1Array> a_pPubKeyValue = (bIsRSA)? ((RSAPrivateKeyObject*) o)->m_pModulus : ((ECCPrivateKeyObject*)o)->m_pPublicPoint;
 
         if( MiniDriverContainerMapFile::CONTAINER_INDEX_INVALID == o->m_ucContainerIndex ) {
 
-            searchContainerIndex( o->m_pModulus, o->m_ucContainerIndex, o->m_ucKeySpec );
+            searchContainerIndex( a_pPubKeyValue, o->m_ucContainerIndex, o->m_ucKeySpec );
         }
 
         // Compatibility with old P11
-        o->_checkValue = Util::MakeCheckValue( o->m_pModulus->GetBuffer( ), o->m_pModulus->GetLength( ) );
+        o->_checkValue = Util::MakeCheckValue( a_pPubKeyValue->GetBuffer( ), a_pPubKeyValue->GetLength( ) );
 
-        setContainerIndexToCertificate( o->m_pModulus, o->m_ucContainerIndex, o->m_ucKeySpec );
+        setContainerIndexToCertificate( a_pPubKeyValue, o->m_ucContainerIndex, o->m_ucKeySpec );
 
-        setContainerIndexToKeyPublic( o->m_pModulus, o->m_ucContainerIndex, o->m_ucKeySpec );
+        setContainerIndexToKeyPublic( a_pPubKeyValue, o->m_ucContainerIndex, o->m_ucKeySpec );
 
         registerStorageObject( o );
 
@@ -4590,17 +6104,95 @@ void Token::createPrivateKeyFromPKCS11ObjectFile( const std::string& a_PKCS11Pri
     Log::end( "Token::createPrivateKeyFromPKCS11ObjectFile" );
 }
 
+void Token::createSecretKeyFromPKCS11ObjectFile( const std::string& a_PKCS11SecretKeyFile, u1 ctrIndex ) {
+
+    Log::begin( "Token::createPrivateKeyFromPKCS11ObjectFile" );
+    Timer t;
+    t.start( );
+
+    if( !m_Device ) {
+
+        throw PKCS11Exception( CKR_TOKEN_NOT_PRESENT );
+    }
+
+    try {
+
+        // Read the file
+        std::unique_ptr<u1Array> f ( m_Device->readFile( g_stPathPKCS11, a_PKCS11SecretKeyFile ) );
+
+        // Construct the PKCS11 object attributes from the file
+        std::vector< unsigned char > attributes;
+
+        unsigned int l = f->GetLength( );
+
+        for( unsigned int u = 0 ; u < l ; ++u ) {
+
+            attributes.push_back( f->GetBuffer( )[ u ] );
+        }
+
+        KeyObject helperObj;
+        bool bIsAES = false;
+        CK_ULONG idx = 0;
+
+        helperObj.deserialize( attributes, &idx );
+        bIsAES = (helperObj._keyType == CKK_AES);
+
+        // Create the PKCS11 object
+        SecretKeyObject* o;
+        if (bIsAES)
+            o = new SecretKeyObjectAES( );
+        else
+            throw MiniDriverException( std::string("the library only supports secret key AES") );
+
+        // Put the file content into the object
+        idx = 0;
+        o->deserialize( attributes, &idx );
+
+        // Save the fileName in the object
+        o->m_stFileName = a_PKCS11SecretKeyFile;
+
+        // Save the container index in the object
+        o->m_ucContainerIndex = ctrIndex;
+
+        registerStorageObject( o );
+
+    } catch( MiniDriverException& x ) {
+
+        Log::error( "Token::createPrivateKeyFromPKCS11ObjectFile", "MiniDriverException" );
+        throw PKCS11Exception( checkException( x ) );
+    }
+
+    t.stop( "Token::createPrivateKeyFromPKCS11ObjectFile" );
+    Log::end( "Token::createPrivateKeyFromPKCS11ObjectFile" );
+}
 
 /* Create the PKCS11 public key object associated to the MiniDriver container
 */
-void Token::createPrivateKeyFromMiniDriverFile( const std::string& a_stKeyFileName, const unsigned char& a_ucIndex, const unsigned int& a_ucKeySpec, Marshaller::u1Array* a_pPublicKeyExponent, Marshaller::u1Array* a_pPublicKeyModulus ) {
+void Token::createPrivateKeyFromMiniDriverFile( const std::string& /*a_stKeyFileName*/, const unsigned char& a_ucIndex, const unsigned int& a_ucKeySpec, u1Array* a_pPublicKeyExponent, u1Array* a_pPublicKeyValue ) {
 
     Log::begin( "Token::createPrivateKeyFromMiniDriverFile" );
     Timer t;
     t.start( );
 
     // Create the PKCS11 object
-    RSAPrivateKeyObject* o = new RSAPrivateKeyObject( );
+    bool bIsRSA = (a_ucKeySpec == MiniDriverContainer::KEYSPEC_SIGNATURE || a_ucKeySpec == MiniDriverContainer::KEYSPEC_EXCHANGE);
+    PrivateKeyObject* o = NULL;
+
+	 if (bIsRSA && a_pPublicKeyExponent && a_pPublicKeyValue)
+    {
+        o = new RSAPrivateKeyObject( );
+    }
+    else if (!bIsRSA && a_pPublicKeyValue)
+    {
+        o = new ECCPrivateKeyObject( );
+    }
+	else
+	{
+		Log::error( "Token::createPrivateKeyFromMiniDriverFile", "Inconsistency in parameters. Skipping." );
+		t.stop( "Token::createPrivateKeyFromMiniDriverFile" );
+		Log::end( "Token::createPrivateKeyFromMiniDriverFile" );
+		return;
+	}
 
     o->m_stFileName = ""; // No PKCS#11 key file into the smart card. This object is build for a off card usage using the information given by the container
 
@@ -4608,7 +6200,7 @@ void Token::createPrivateKeyFromMiniDriverFile( const std::string& a_stKeyFileNa
 
     o->m_Private = CK_TRUE;
 
-    o->m_Modifiable = CK_TRUE;
+    o->m_Modifiable = ((a_ucIndex != 0xFF) && m_Device && m_Device->containerReadOnly(a_ucIndex)) ? CK_FALSE: CK_TRUE;
 
     o->m_bOffCardObject = true;
 
@@ -4616,44 +6208,83 @@ void Token::createPrivateKeyFromMiniDriverFile( const std::string& a_stKeyFileNa
 
     o->_sensitive = CK_TRUE;
 
-    o->_signRecover = false;
+    o->_signRecover = CK_FALSE;
 
     o->_unwrap = CK_FALSE;
 
-    o->_extractable = false;
+    o->_extractable = CK_FALSE;
 
     o->_alwaysSensitive = CK_TRUE;
 
     o->_neverExtractable = CK_TRUE;
 
-    o->_wrapWithTrusted = false;
+    o->_wrapWithTrusted = CK_FALSE;
 
-    o->_alwaysAuthenticate = false;
+    o->_alwaysAuthenticate = CK_FALSE;
 
-    o->_derive = false;
+    o->_derive = CK_FALSE;
 
     o->_local = CK_FALSE;
 
-    if( MiniDriverContainer::KEYSPEC_EXCHANGE == a_ucKeySpec ) {
+    if(     MiniDriverContainer::KEYSPEC_EXCHANGE == a_ucKeySpec
+        ||  MiniDriverContainer::KEYSPEC_ECDHE_256 == a_ucKeySpec
+        ||  MiniDriverContainer::KEYSPEC_ECDHE_384 == a_ucKeySpec
+        ||  MiniDriverContainer::KEYSPEC_ECDHE_521 == a_ucKeySpec
+      ) {
 
-        o->_decrypt = true;
+        o->_sign = CK_TRUE;
 
-        o->_sign = true;
+        if (MiniDriverContainer::KEYSPEC_EXCHANGE == a_ucKeySpec)
+            o->_decrypt = CK_TRUE;
+        else
+        {
+            o->_decrypt = CK_FALSE;
+            o->_derive = CK_TRUE;
+        }
 
     } else {
 
-        o->_decrypt = false;
+        o->_sign = CK_TRUE;
 
-        o->_sign = true;
+        o->_decrypt = CK_FALSE;
+
     }
 
     o->m_ucContainerIndex = a_ucIndex;
 
-    o->m_pPublicExponent.reset( new Marshaller::u1Array( a_pPublicKeyExponent->GetLength( ) ) );
-    o->m_pPublicExponent->SetBuffer( a_pPublicKeyExponent->GetBuffer( ) );
+    if (bIsRSA)
+    {
+		 Log::log( "Token::createPrivateKeyFromMiniDriverFile - Building RSAPrivateKeyObject from modulus and exponent");
+        RSAPrivateKeyObject* rsa = (RSAPrivateKeyObject*) o;
+        rsa->m_pPublicExponent.reset( new u1Array( a_pPublicKeyExponent->GetLength( ) ) );
+        rsa->m_pPublicExponent->SetBuffer( a_pPublicKeyExponent->GetBuffer( ) );
 
-    o->m_pModulus.reset( new Marshaller::u1Array( a_pPublicKeyModulus->GetLength( ) ) );
-    o->m_pModulus->SetBuffer( a_pPublicKeyModulus->GetBuffer( ) );
+        rsa->m_pModulus.reset( new u1Array( a_pPublicKeyValue->GetLength( ) ) );
+        rsa->m_pModulus->SetBuffer( a_pPublicKeyValue->GetBuffer( ) );
+    }
+    else
+    {
+		 Log::log( "Token::createPrivateKeyFromMiniDriverFile - Building ECCPrivateKeyObject from public point and curve parameters");
+        ECCPrivateKeyObject* ecc = (ECCPrivateKeyObject*) o;
+        ecc->m_pPublicPoint.reset(new u1Array( a_pPublicKeyValue->GetLength( ) ) );
+        ecc->m_pPublicPoint->SetBuffer( a_pPublicKeyValue->GetBuffer( ) );
+
+        if (a_ucKeySpec == MiniDriverContainer::KEYSPEC_ECDHE_256 || a_ucKeySpec == MiniDriverContainer::KEYSPEC_ECDSA_256)
+        {
+            ecc->m_pParams.reset(new u1Array( sizeof(g_pbECC256_OID) ));
+            ecc->m_pParams->SetBuffer( g_pbECC256_OID );
+        }
+        if (a_ucKeySpec == MiniDriverContainer::KEYSPEC_ECDHE_384 || a_ucKeySpec == MiniDriverContainer::KEYSPEC_ECDSA_384)
+        {
+            ecc->m_pParams.reset(new u1Array( sizeof(g_pbECC384_OID) ));
+            ecc->m_pParams->SetBuffer( g_pbECC384_OID );
+        }
+        if (a_ucKeySpec == MiniDriverContainer::KEYSPEC_ECDHE_521 || a_ucKeySpec == MiniDriverContainer::KEYSPEC_ECDSA_521)
+        {
+            ecc->m_pParams.reset(new u1Array( sizeof(g_pbECC521_OID) ));
+            ecc->m_pParams->SetBuffer( g_pbECC521_OID );
+        }
+    }
 
     //setDefaultAttributes( o, true );
     generateDefaultAttributesKeyPrivate( o );
@@ -4704,6 +6335,7 @@ CK_RV Token::checkException( MiniDriverException& x ) {
         break;
 
     case SCARD_E_NO_SMARTCARD:
+    case SCARD_W_REMOVED_CARD:
         rv = CKR_DEVICE_REMOVED;
         break;
 
@@ -4732,26 +6364,10 @@ CK_RV Token::checkException( MiniDriverException& x ) {
 
 /*
 */
-Marshaller::u1Array* Token::computeSHA1( const unsigned char* a_pData, const size_t& a_uiLength ) {
-
-    CSHA1 sha1;
-
-    Marshaller::u1Array* pHash = new Marshaller::u1Array( SHA1_HASH_LENGTH );
-
-    sha1.hashCore( (unsigned char*)a_pData, 0, a_uiLength );
-
-    sha1.hashFinal( pHash->GetBuffer( ) );
-
-    return pHash;
-}
-
-
-/*
-*/
 unsigned char Token::computeIndex( const std::string& a_stFileName ) {
 
     if( a_stFileName.length( ) < 2 ) {
-     
+
         return 0xFF;
     }
 
@@ -4794,17 +6410,17 @@ void Token::generateDefaultAttributesCertificate( X509PubKeyCertObject* a_pObjec
         generateIssuer( a_pObject->m_pValue, a_pObject->m_pIssuer );
 
         // Get the certificate public key modulus
-        generatePublicKeyModulus( a_pObject->m_pValue, a_pObject->m_pModulus, a_pObject->_checkValue );
+        generatePublicKeyValue( a_pObject->m_pValue, a_pObject->m_pPublicKeyValue, a_pObject->m_bIsRSA, a_pObject->m_ucKeySpec, a_pObject->_checkValue , a_pObject->m_pOID);
 
         // Generate the certicate label
-        generateLabel( a_pObject->m_pModulus, a_pObject->m_pLabel );
+        generateLabel( a_pObject->m_pPublicKeyValue, a_pObject->m_pLabel );
 
         // Generate the ID
-        generateID( a_pObject->m_pModulus, a_pObject->m_pID );
+        generateID( a_pObject->m_pPublicKeyValue, a_pObject->m_pID );
 
         // Generate the subject
         generateSubject( a_pObject->m_pValue, a_pObject->m_pSubject );
-    
+
     } catch( ... ) {
 
         // If a parsing error occurs then these attributes can't be set.
@@ -4814,20 +6430,43 @@ void Token::generateDefaultAttributesCertificate( X509PubKeyCertObject* a_pObjec
 
 /*
 */
-void Token::generateDefaultAttributesKeyPublic( Pkcs11ObjectKeyPublicRSA* a_pObject ) {
+void Token::generateDefaultAttributesKeyPublic( Pkcs11ObjectKeyPublic* a_pObject ) {
 
     Log::begin( "Token::generateDefaultAttributesKeyPublic" );
     Timer t;
     t.start( );
 
-    if( !a_pObject && !a_pObject->m_pModulus ) {
+    if( !a_pObject) {
 
         return;
     }
 
-    int l = a_pObject->m_pModulus->GetLength( );
+    bool bisRSA = (a_pObject->_keyType == CKK_RSA);
+    unsigned int l = 0;
+    unsigned char* p = NULL;
+    boost::shared_ptr< u1Array> pPublicKeyValue;
 
-    unsigned char* p = a_pObject->m_pModulus->GetBuffer( );
+    if (bisRSA)
+    {
+        if (!((Pkcs11ObjectKeyPublicRSA*)a_pObject)->m_pModulus)
+        {
+            return;
+        }
+        l = ((Pkcs11ObjectKeyPublicRSA*)a_pObject)->m_pModulus->GetLength( );
+        p = ((Pkcs11ObjectKeyPublicRSA*)a_pObject)->m_pModulus->GetBuffer( );
+        pPublicKeyValue = ((Pkcs11ObjectKeyPublicRSA*)a_pObject)->m_pModulus;
+    }
+    else
+    {
+        if( !((Pkcs11ObjectKeyPublicECC*) a_pObject)->m_pPublicPoint ) {
+
+            return;
+        }
+        l = ((Pkcs11ObjectKeyPublicECC*) a_pObject)->m_pPublicPoint->GetLength( );
+        p = ((Pkcs11ObjectKeyPublicECC*) a_pObject)->m_pPublicPoint->GetBuffer( );
+        pPublicKeyValue = ((Pkcs11ObjectKeyPublicECC*) a_pObject)->m_pPublicPoint;
+    }
+
 
     // Search for a private key using the same public key exponent to set the same container index
     if( MiniDriverContainerMapFile::CONTAINER_INDEX_INVALID == a_pObject->m_ucContainerIndex ) {
@@ -4836,33 +6475,55 @@ void Token::generateDefaultAttributesKeyPublic( Pkcs11ObjectKeyPublicRSA* a_pObj
 
             if( CKO_PRIVATE_KEY == obj->second->getClass( ) ) {
 
-                RSAPrivateKeyObject* objPrivateKey = (RSAPrivateKeyObject*) obj->second;
+                PrivateKeyObject* objPrivateKey = (PrivateKeyObject*) obj->second;
 
-                if( 0 == memcmp( objPrivateKey->m_pModulus->GetBuffer( ), p, l ) ) {
+                if (bisRSA == (objPrivateKey->_keyType == CKK_RSA))
+                {
+                    boost::shared_ptr< u1Array> keyPubVal;
+                    if (bisRSA)
+                        keyPubVal = ((RSAPrivateKeyObject*) objPrivateKey)->m_pModulus;
+                    else
+                        keyPubVal = ((ECCPrivateKeyObject*) objPrivateKey)->m_pPublicPoint;
 
-                    // Set the same CKA_ID
-                    if( objPrivateKey->m_pID.get( ) ) {
+                    if(     keyPubVal.get()
+                        &&  (keyPubVal->GetLength() == l)
+                        &&  (0 == memcmp( keyPubVal->GetBuffer( ), p, l ) )
+                      )
+                    {
+                        if (!bisRSA)
+                        {
+                            if (!Util::compareU1Arrays(((ECCPrivateKeyObject*) objPrivateKey)->m_pParams.get(),
+                                ((Pkcs11ObjectKeyPublicECC*) a_pObject)->m_pParams->GetBuffer(),
+                                ((Pkcs11ObjectKeyPublicECC*) a_pObject)->m_pParams->GetLength()))
+                            {
+                                continue;
+                            }
+                        }
 
-                        a_pObject->m_pID.reset( new Marshaller::u1Array( *( objPrivateKey->m_pID.get( ) ) ) );
+                        // Set the same CKA_ID
+                        if( objPrivateKey->m_pID.get( ) ) {
+
+                            a_pObject->m_pID.reset( new u1Array( *( objPrivateKey->m_pID.get( ) ) ) );
+                        }
+
+                        // Set the same CKA_LABEL
+                        if( objPrivateKey->m_pLabel.get( ) ) {
+
+                            a_pObject->m_pLabel.reset( new u1Array( *( objPrivateKey->m_pLabel.get( ) ) ) );
+                        }
+
+                        // Set the same CKA_SUBJECT
+                        if( objPrivateKey->m_pSubject.get( ) ) {
+
+                            a_pObject->m_pSubject.reset( new u1Array( *( objPrivateKey->m_pSubject.get( ) ) ) );
+                        }
+
+                        a_pObject->m_ucContainerIndex = objPrivateKey->m_ucContainerIndex;
+
+                        a_pObject->m_ucKeySpec = objPrivateKey->m_ucKeySpec;
+
+                        break;
                     }
-
-                    // Set the same CKA_LABEL
-                    if( objPrivateKey->m_pLabel.get( ) ) {
-
-                        a_pObject->m_pLabel.reset( new Marshaller::u1Array( *( objPrivateKey->m_pLabel.get( ) ) ) );
-                    }
-
-                    // Set the same CKA_SUBJECT
-                    if( objPrivateKey->m_pSubject.get( ) ) {
-
-                        a_pObject->m_pSubject.reset( new Marshaller::u1Array( *( objPrivateKey->m_pSubject.get( ) ) ) );
-                    }
-
-                    a_pObject->m_ucContainerIndex = objPrivateKey->m_ucContainerIndex;
-
-                    a_pObject->m_ucKeySpec = objPrivateKey->m_ucKeySpec;
-
-                    break;
                 }
             }
         }
@@ -4884,60 +6545,75 @@ void Token::generateDefaultAttributesKeyPublic( Pkcs11ObjectKeyPublicRSA* a_pObj
                     continue;
                 }
 
-                X509Cert x509cert( objCertificate->m_pValue->GetBuffer( ), objCertificate->m_pValue->GetLength( ) );
+                try
+                {
+                    X509Cert x509cert( objCertificate->m_pValue->GetBuffer( ), objCertificate->m_pValue->GetLength( ) );
 
-                // Get the certificate public key modulus
-                BEROctet::Blob modulus = x509cert.Modulus( );
+                    if (bisRSA == x509cert.IsRsaPublicKey())
+                    {
+                        // Get the certificate public key modulus
+                        BEROctet::Blob pubValue;
+                        if (bisRSA)
+                            pubValue = x509cert.Modulus( );
+                        else
+                            pubValue = x509cert.EcPublicPoint();
 
-                Marshaller::u1Array m( modulus.size( ) );
+                        // Check if the both certificate and public key share the same modulus
+                        if( (pubValue.size() == l) && (0 == memcmp( pubValue.data(), p, l ))) {
 
-                m.SetBuffer( modulus.data( ) );
+                            if (!bisRSA)
+                            {
+                                // check the curve
+                                BEROctet::Blob oid = x509cert.EcCurveOid();
+                                if (!Util::compareU1Arrays(((Pkcs11ObjectKeyPublicECC*) a_pObject)->m_pParams.get(), oid.data(), oid.size()))
+                                    continue;
+                            }
 
-                // Check if the both certificate and public key share the same modulus
-                if( 0 == memcmp( m.GetBuffer( ), p, l ) ) {
+                            if( objCertificate->m_pSubject.get( ) ) {
 
-                    if( objCertificate->m_pSubject.get( ) ) {
+                                // Copyt the certificate subject
+                                a_pObject->m_pSubject.reset( new u1Array( *( objCertificate->m_pSubject.get( ) ) ) );
 
-                        // Copyt the certificate subject
-                        a_pObject->m_pSubject.reset( new Marshaller::u1Array( *( objCertificate->m_pSubject.get( ) ) ) );
+                            } else {
 
-                    } else {
+                                // Generate the subject
+                                BEROctet::Blob sb( x509cert.Subject( ) );
 
-                        // Generate the subject
-                        BEROctet::Blob sb( x509cert.Subject( ) );
+                                a_pObject->m_pSubject.reset( new u1Array( static_cast< s4 >( sb.size( ) ) ) );
 
-                        a_pObject->m_pSubject.reset( new Marshaller::u1Array( static_cast< s4 >( sb.size( ) ) ) );
+                                a_pObject->m_pSubject->SetBuffer( const_cast< unsigned char* >( sb.data( ) ) );
+                            }
 
-                        a_pObject->m_pSubject->SetBuffer( const_cast< unsigned char* >( sb.data( ) ) );
+                            // By the way copy the certificate ID
+                            if( objCertificate->m_pID.get( ) && !a_pObject->m_pID.get( ) ) {
+
+                                a_pObject->m_pID.reset( new u1Array( *( objCertificate->m_pID.get( ) ) ) );
+                            }
+
+                            if( objCertificate->m_pLabel.get( ) && !a_pObject->m_pLabel.get( ) ) {
+
+                                a_pObject->m_pLabel.reset( new u1Array( *( objCertificate->m_pLabel.get( ) ) ) );
+                            }
+
+                            break;
+                        }
                     }
-
-                    // By the way copy the certificate ID
-                    if( objCertificate->m_pID.get( ) && !a_pObject->m_pID.get( ) ) {
-
-                        a_pObject->m_pID.reset( new Marshaller::u1Array( *( objCertificate->m_pID.get( ) ) ) );
-                    }
-
-                    if( objCertificate->m_pLabel.get( ) && !a_pObject->m_pLabel.get( ) ) {
-
-                        a_pObject->m_pLabel.reset( new Marshaller::u1Array( *( objCertificate->m_pLabel.get( ) ) ) );
-                    }
-
-                    break;
                 }
+                catch (...) {}
             }
         }
     }
 
-    // Generate the id 
+    // Generate the id
     if( !a_pObject->m_pID.get( ) ) {
 
-        generateID( a_pObject->m_pModulus, a_pObject->m_pID );
+        generateID( pPublicKeyValue, a_pObject->m_pID );
     }
 
     // Generate the label from the public key modulus
     if( !a_pObject->m_pLabel.get( ) ) {
 
-        generateLabel( a_pObject->m_pModulus, a_pObject->m_pLabel );
+        generateLabel( pPublicKeyValue, a_pObject->m_pLabel );
     }
 
     t.stop( "Token::generateDefaultAttributesKeyPublic" );
@@ -4947,76 +6623,200 @@ void Token::generateDefaultAttributesKeyPublic( Pkcs11ObjectKeyPublicRSA* a_pObj
 
 /*
 */
-void Token::generateDefaultAttributesKeyPrivate( RSAPrivateKeyObject* a_pObject ) {
+void Token::generateDefaultAttributesKeyPrivate( PrivateKeyObject* a_pObject ) {
 
-    Log::begin( "Token::generateDefaultAttributesKeyPublic" );
+    Log::begin( "Token::generateDefaultAttributesKeyPrivate" );
     Timer t;
     t.start( );
 
-    if( !a_pObject && !a_pObject->m_pModulus ) {
+    if( !a_pObject ) {
 
         return;
     }
 
-    unsigned int l = a_pObject->m_pModulus->GetLength( );
+    bool bisRSA = (a_pObject->_keyType == CKK_RSA);
+    unsigned int l = 0;
+    unsigned char* p = NULL;
+    boost::shared_ptr< u1Array> pPublicKeyValue;
 
-    unsigned char* p = a_pObject->m_pModulus->GetBuffer( );
+    if (bisRSA)
+    {
+        if( !((RSAPrivateKeyObject*) a_pObject)->m_pModulus ) {
+
+            return;
+        }
+        l = ((RSAPrivateKeyObject*) a_pObject)->m_pModulus->GetLength( );
+        p = ((RSAPrivateKeyObject*) a_pObject)->m_pModulus->GetBuffer( );
+        pPublicKeyValue = ((RSAPrivateKeyObject*) a_pObject)->m_pModulus;
+    }
+    else
+    {
+        if( !((ECCPrivateKeyObject*) a_pObject)->m_pPublicPoint ) {
+
+            return;
+        }
+        l = ((ECCPrivateKeyObject*) a_pObject)->m_pPublicPoint->GetLength( );
+        p = ((ECCPrivateKeyObject*) a_pObject)->m_pPublicPoint->GetBuffer( );
+        pPublicKeyValue = ((ECCPrivateKeyObject*) a_pObject)->m_pPublicPoint;
+    }
 
     // Compatibility with old P11
     a_pObject->_checkValue = Util::MakeCheckValue( p, l );
 
-    // Generate a default id from the public key modulus if not found in previous certificate or public key search
-    generateID( a_pObject->m_pModulus, a_pObject->m_pID );
-
-    // Generate a default label from the public key modulus if not found in previous certificate or public key search
-    generateLabel( a_pObject->m_pModulus, a_pObject->m_pLabel );
-
     // Give the same container index of the private key to the associated certificate
+	bool bCertFound = false;
+
     BOOST_FOREACH( const TOKEN_OBJECTS::value_type& obj, m_Objects ) {
 
         if( CKO_CERTIFICATE == obj->second->getClass( ) ) {
 
             X509PubKeyCertObject* objCertificate = (X509PubKeyCertObject*) obj->second;
 
-            if( objCertificate->m_pValue.get( ) ) {
+			if( objCertificate->m_pValue.get( ) && (objCertificate->m_pValue->GetLength() > 0)) {
 
-                X509Cert x509cert( objCertificate->m_pValue->GetBuffer( ), objCertificate->m_pValue->GetLength( ) );
+				try
+				{
+					X509Cert x509cert( objCertificate->m_pValue->GetBuffer( ), objCertificate->m_pValue->GetLength( ) );
 
-                // Get the certificate public key modulus
-                BEROctet::Blob modulus = x509cert.Modulus( );
+					if (bisRSA == x509cert.IsRsaPublicKey())
+					{
+						// Get the certificate public key modulus
+						BEROctet::Blob pubValue;
+						if (bisRSA)
+							pubValue = x509cert.Modulus( );
+						else
+							pubValue = x509cert.EcPublicPoint();
 
-                Marshaller::u1Array m( modulus.size( ) );
+						if((pubValue.size() == l) && (0 == memcmp( pubValue.data(), p, l )))
+						{
+							if (!bisRSA)
+							{
+								// check the curve
+								BEROctet::Blob oid = x509cert.EcCurveOid();
+								if (!Util::compareU1Arrays(((ECCPrivateKeyObject*) a_pObject)->m_pParams.get(), oid.data(), oid.size()))
+									continue;
+							}
+							// Give the same container index of the private key to the certificate
+							objCertificate->m_ucContainerIndex = a_pObject->m_ucContainerIndex;
 
-                m.SetBuffer( modulus.data( ) );
+							objCertificate->m_ucKeySpec = a_pObject->m_ucKeySpec;
 
-                if( 0 == memcmp( m.GetBuffer( ), p, l ) ) {
+							if( objCertificate->m_pSubject.get( ) ) {
 
-                    // Give the same container index of the private key to the certificate
-                    objCertificate->m_ucContainerIndex = a_pObject->m_ucContainerIndex;
+								a_pObject->m_pSubject.reset( new u1Array( objCertificate->m_pSubject->GetLength( ) ) );
 
-                    objCertificate->m_ucKeySpec = a_pObject->m_ucKeySpec;
+								a_pObject->m_pSubject->SetBuffer( objCertificate->m_pSubject->GetBuffer( ) );
 
-                    if( objCertificate->m_pSubject.get( ) ) {
+							} else {
 
-                        a_pObject->m_pSubject.reset( new Marshaller::u1Array( objCertificate->m_pSubject->GetLength( ) ) );
+								// Get the certificate subject
+								BEROctet::Blob sb( x509cert.Subject( ) );
 
-                        a_pObject->m_pSubject->SetBuffer( objCertificate->m_pSubject->GetBuffer( ) );
+								a_pObject->m_pSubject.reset( new u1Array( static_cast< s4 >( sb.size( ) ) ) );
 
-                    } else {
+								a_pObject->m_pSubject->SetBuffer( const_cast< unsigned char* >( sb.data( ) ) );
+							}
 
-                        // Get the certificate subject
-                        BEROctet::Blob sb( x509cert.Subject( ) );
+							if (objCertificate->m_pID.get() ) {
 
-                        a_pObject->m_pSubject.reset( new Marshaller::u1Array( static_cast< s4 >( sb.size( ) ) ) );
+								a_pObject->m_pID.reset( new u1Array( objCertificate->m_pID->GetLength( ) ) );
 
-                        a_pObject->m_pSubject->SetBuffer( const_cast< unsigned char* >( sb.data( ) ) );
-                    }
+								a_pObject->m_pID->SetBuffer( objCertificate->m_pID->GetBuffer( ) );
+							}
 
-                    break;
-                }
+							if (objCertificate->m_pLabel.get() ) {
+
+								a_pObject->m_pLabel.reset( new u1Array( objCertificate->m_pLabel->GetLength( ) ) );
+
+								a_pObject->m_pLabel->SetBuffer( objCertificate->m_pLabel->GetBuffer( ) );
+							}
+
+							bCertFound = true;
+
+							break;
+						}
+					}
+				}
+				catch(...)
+				{
+					Log::log( "Token::generateDefaultAttributesKeyPrivate - exception while parsing certificate at index %d. Skipping.", (int) objCertificate->m_ucContainerIndex );
+				}
             }
         }
     }
+
+	if (!bCertFound)
+	{
+		// Look for an associated public key
+		BOOST_FOREACH( const TOKEN_OBJECTS::value_type& obj, m_Objects ) {
+
+			if( CKO_PUBLIC_KEY == obj->second->getClass( ) ) {
+
+				Pkcs11ObjectKeyPublic* objPublicKey = (Pkcs11ObjectKeyPublic*) obj->second;
+
+				if( a_pObject->_keyType == objPublicKey->_keyType) {
+
+					unsigned int pubKeyLen;
+					unsigned char* pubKeyBuffer;
+					if (bisRSA)
+					{
+						if( !((Pkcs11ObjectKeyPublicRSA*) objPublicKey)->m_pModulus ) {
+
+							continue;
+						}
+						pubKeyLen = ((Pkcs11ObjectKeyPublicRSA*) objPublicKey)->m_pModulus->GetLength( );
+						pubKeyBuffer = ((Pkcs11ObjectKeyPublicRSA*) objPublicKey)->m_pModulus->GetBuffer( );
+					}
+					else
+					{
+						if( !((Pkcs11ObjectKeyPublicECC*) objPublicKey)->m_pPublicPoint ) {
+
+							continue;
+						}
+						pubKeyLen = ((Pkcs11ObjectKeyPublicECC*) objPublicKey)->m_pPublicPoint->GetLength( );
+						pubKeyBuffer = ((Pkcs11ObjectKeyPublicECC*) objPublicKey)->m_pPublicPoint->GetBuffer( );
+					}
+
+					if((pubKeyLen == l) && (0 == memcmp( pubKeyBuffer, p, l )))
+					{
+						if (!bisRSA)
+						{
+							// check the curve
+							if (	(((Pkcs11ObjectKeyPublicECC*) objPublicKey)->m_pParams->GetLength() != ((ECCPrivateKeyObject*) a_pObject)->m_pParams->GetLength())
+								||
+									!Util::compareU1Arrays(((ECCPrivateKeyObject*) a_pObject)->m_pParams.get(), ((Pkcs11ObjectKeyPublicECC*) objPublicKey)->m_pParams->GetBuffer(), ((Pkcs11ObjectKeyPublicECC*) objPublicKey)->m_pParams->GetLength())
+								)
+								continue;
+						}
+
+						if (objPublicKey->m_pID.get() ) {
+
+							a_pObject->m_pID.reset( new u1Array( objPublicKey->m_pID->GetLength( ) ) );
+
+							a_pObject->m_pID->SetBuffer( objPublicKey->m_pID->GetBuffer( ) );
+						}
+
+						if (objPublicKey->m_pLabel.get() ) {
+
+							a_pObject->m_pLabel.reset( new u1Array( objPublicKey->m_pLabel->GetLength( ) ) );
+
+							a_pObject->m_pLabel->SetBuffer( objPublicKey->m_pLabel->GetBuffer( ) );
+						}
+
+						break;
+					}
+				}
+			}
+		}
+	}
+
+    // Generate a default id from the public key modulus if not found in previous certificate or public key search
+	if (!a_pObject->m_pID)
+		generateID( pPublicKeyValue, a_pObject->m_pID );
+
+    // Generate a default label from the public key modulus if not found in previous certificate or public key search
+	if (!a_pObject->m_pLabel)
+		generateLabel( pPublicKeyValue, a_pObject->m_pLabel );
 
     //// Give the same container index of the private key to the associated public key
     //BOOST_FOREACH( const TOKEN_OBJECTS::value_type& obj, m_Objects ) {
@@ -5036,21 +6836,21 @@ void Token::generateDefaultAttributesKeyPrivate( RSAPrivateKeyObject* a_pObject 
     //            // try to get the same CKA_ID, CKA_LABEL and CKA_SUBJECT as the associated public key
     //            //if( /*o->m_bOffCardObject &&*/ objPublicKey->m_pSubject.get( ) && !o->m_pSubject.get( ) ) {
 
-    //            //    o->m_pSubject.reset( new Marshaller::u1Array( objPublicKey->m_pSubject->GetLength( ) ) );
+    //            //    o->m_pSubject.reset( new u1Array( objPublicKey->m_pSubject->GetLength( ) ) );
 
     //            //    o->m_pSubject->SetBuffer( objPublicKey->m_pSubject->GetBuffer( ) );
     //            //}
 
     //            if( /*o->m_bOffCardObject &&*/ objPublicKey->m_pID.get( ) && !o->m_pID.get( ) ) {
 
-    //                o->m_pID.reset( new Marshaller::u1Array( objPublicKey->m_pID->GetLength( ) ) );
+    //                o->m_pID.reset( new u1Array( objPublicKey->m_pID->GetLength( ) ) );
 
     //                o->m_pID->SetBuffer( objPublicKey->m_pID->GetBuffer( ) );
     //            }
 
     //            if( /*o->m_bOffCardObject &&*/ objPublicKey->m_pLabel.get( ) && !o->m_pLabel.get( ) ) {
 
-    //                o->m_pLabel.reset( new Marshaller::u1Array( objPublicKey->m_pLabel->GetLength( ) ) );
+    //                o->m_pLabel.reset( new u1Array( objPublicKey->m_pLabel->GetLength( ) ) );
 
     //                o->m_pLabel->SetBuffer( objPublicKey->m_pLabel->GetBuffer( ) );
     //            }
@@ -5060,14 +6860,14 @@ void Token::generateDefaultAttributesKeyPrivate( RSAPrivateKeyObject* a_pObject 
     //    }
     //}
 
-    t.stop( "Token::generateDefaultAttributesKeyPublic" );
-    Log::end( "Token::generateDefaultAttributesKeyPublic" );
+    t.stop( "Token::generateDefaultAttributesKeyPrivate" );
+    Log::end( "Token::generateDefaultAttributesKeyPrivate" );
 }
 
 
 /* Generate a default label from the public key modulus
 */
-void Token::generateLabel( boost::shared_ptr< Marshaller::u1Array>& a_pModulus, boost::shared_ptr< Marshaller::u1Array>& a_pLabel ) {
+void Token::generateLabel( boost::shared_ptr< u1Array>& a_pModulus, boost::shared_ptr< u1Array>& a_pLabel ) {
 
     if( !a_pModulus ) {
 
@@ -5076,9 +6876,9 @@ void Token::generateLabel( boost::shared_ptr< Marshaller::u1Array>& a_pModulus, 
 
     std::string stLabel = CAttributedCertificate::DerivedUniqueName( a_pModulus->GetBuffer( ), a_pModulus->GetLength( ) );
 
-    a_pLabel.reset( new Marshaller::u1Array( stLabel.size( ) ) );
+    a_pLabel.reset( new u1Array( stLabel.size( ) ) );
 
-    a_pLabel->SetBuffer( reinterpret_cast< const unsigned char* >( stLabel.c_str( ) ) );
+    a_pLabel->SetBuffer( (u1*)( stLabel.c_str( ) ) );
 
     // Generate the certificate label from the certificate value
     //std::string stLabel;
@@ -5089,127 +6889,238 @@ void Token::generateLabel( boost::shared_ptr< Marshaller::u1Array>& a_pModulus, 
     //    }
     //    stLabel += s;
     //}
-    //a_pObject->m_pLabel.reset( new Marshaller::u1Array( stLabel.size( ) ) );
+    //a_pObject->m_pLabel.reset( new u1Array( stLabel.size( ) ) );
     //a_pObject->m_pLabel->SetBuffer( reinterpret_cast< const unsigned char* >( stLabel.c_str( ) ) );
 }
 
 
 /* Generate a default id from the public key modulus
 */
-void Token::generateID( boost::shared_ptr< Marshaller::u1Array>& a_pModulus, boost::shared_ptr< Marshaller::u1Array>& a_pID ) {
+void Token::generateID( boost::shared_ptr< u1Array>& a_pModulus, boost::shared_ptr< u1Array>& a_pID ) {
 
     if( !a_pModulus ) {
 
         return;
     }
 
-    a_pID.reset( computeSHA1( a_pModulus->GetBuffer( ), a_pModulus->GetLength( ) ) );
+    a_pID.reset( Session::computeSHA1( a_pModulus->GetBuffer( ), a_pModulus->GetLength( ) ) );
 }
 
 
 /* Get the certificate serial number
 */
-void Token::generateSerialNumber( boost::shared_ptr< Marshaller::u1Array>& a_pCertificateValue, boost::shared_ptr< Marshaller::u1Array>& a_pSerialNumber ) {
+void Token::generateSerialNumber( boost::shared_ptr< u1Array>& a_pCertificateValue, boost::shared_ptr< u1Array>& a_pSerialNumber ) {
 
-    X509Cert x509cert( a_pCertificateValue->GetBuffer( ), a_pCertificateValue->GetLength( ) );
+    try
+    {
+        X509Cert x509cert( a_pCertificateValue->GetBuffer( ), a_pCertificateValue->GetLength( ) );
 
-    BEROctet::Blob b( x509cert.SerialNumber( ) );
+        BEROctet::Blob b( x509cert.SerialNumber( ) );
 
-    a_pSerialNumber.reset( new Marshaller::u1Array( static_cast< s4 >( b.size( ) ) ) );
+        a_pSerialNumber.reset( new u1Array( static_cast< s4 >( b.size( ) ) ) );
 
-    a_pSerialNumber->SetBuffer( const_cast< unsigned char* >( b.data( ) ) );
+        a_pSerialNumber->SetBuffer( const_cast< unsigned char* >( b.data( ) ) );
+    }
+    catch (...)
+    {
+        a_pSerialNumber.reset( new u1Array( 0 ) );
+    }
 }
 
 
 /* Get the certificate issuer from the certifcate value
 */
-void Token::generateIssuer( boost::shared_ptr< Marshaller::u1Array>& a_pCertificateValue, boost::shared_ptr< Marshaller::u1Array>& a_pIssuer ) {
+void Token::generateIssuer( boost::shared_ptr< u1Array>& a_pCertificateValue, boost::shared_ptr< u1Array>& a_pIssuer ) {
 
-    X509Cert x509cert( a_pCertificateValue->GetBuffer( ), a_pCertificateValue->GetLength( ) );
+    try
+    {
+        X509Cert x509cert( a_pCertificateValue->GetBuffer( ), a_pCertificateValue->GetLength( ) );
 
-    BEROctet::Blob b( x509cert.Issuer( ) );
+        BEROctet::Blob b( x509cert.Issuer( ) );
 
-    a_pIssuer.reset( new Marshaller::u1Array( static_cast< s4 >( b.size( ) ) ) );
+        a_pIssuer.reset( new u1Array( static_cast< s4 >( b.size( ) ) ) );
 
-    a_pIssuer->SetBuffer( const_cast< unsigned char* >( b.data( ) ) );
+        a_pIssuer->SetBuffer( const_cast< unsigned char* >( b.data( ) ) );
+    }
+    catch (...)
+    {
+        a_pIssuer.reset( new u1Array(0 ) );
+    }
 }
 
 
 /* Get the certificate subject from the certifcate value
 */
-void Token::generateSubject( boost::shared_ptr< Marshaller::u1Array>& a_pCertificateValue, boost::shared_ptr< Marshaller::u1Array>& a_pSubject ) {
+void Token::generateSubject( boost::shared_ptr< u1Array>& a_pCertificateValue, boost::shared_ptr< u1Array>& a_pSubject ) {
 
-    X509Cert x509cert( a_pCertificateValue->GetBuffer( ), a_pCertificateValue->GetLength( ) );
+    try
+    {
+        X509Cert x509cert( a_pCertificateValue->GetBuffer( ), a_pCertificateValue->GetLength( ) );
 
-    BEROctet::Blob b( x509cert.Subject( ) );
+        BEROctet::Blob b( x509cert.Subject( ) );
 
-    a_pSubject.reset( new Marshaller::u1Array( static_cast< s4 >( b.size( ) ) ) );
+        a_pSubject.reset( new u1Array( static_cast< s4 >( b.size( ) ) ) );
 
-    a_pSubject->SetBuffer( const_cast< unsigned char* >( b.data( ) ) );
+        a_pSubject->SetBuffer( const_cast< unsigned char* >( b.data( ) ) );
+    }
+    catch (...)
+    {
+        a_pSubject.reset( new u1Array(0) );
+    }
 }
 
 
 /* Get the public key modulus
 */
-void Token::generatePublicKeyModulus( boost::shared_ptr< Marshaller::u1Array>& a_pCertificateValue, boost::shared_ptr< Marshaller::u1Array>& a_pModulus, u8& a_u8CheckValue ) {
+void Token::generatePublicKeyValue( boost::shared_ptr< u1Array>& a_pCertificateValue, boost::shared_ptr< u1Array>& a_pPublicKeyValue, bool& bIsRSA, unsigned char &ucKeySpec, u8& a_u8CheckValue , boost::shared_ptr< u1Array>& a_pOID) {
 
-    X509Cert x509cert( a_pCertificateValue->GetBuffer( ), a_pCertificateValue->GetLength( ) );
+    Log::begin( "Token::generatePublicKeyValue" );
+    BEROctet::Blob pubKeyVal;
+    try
+    {
+        X509Cert x509cert( a_pCertificateValue->GetBuffer( ), a_pCertificateValue->GetLength( ) );
+        bIsRSA = x509cert.IsRsaPublicKey();
+        if (bIsRSA)
+        {
+            pubKeyVal = x509cert.Modulus( );
+        }
+        else
+        {
+            BEROctet::Blob oid = x509cert.EcCurveOid();
+    	    a_pOID.reset( new u1Array( oid.size( ) ) );
+            a_pOID->SetBuffer( (u1*) oid.data( ) );
 
-    BEROctet::Blob modulus = x509cert.Modulus( );
+            if (MiniDriverContainer::KEYSPEC_EXCHANGE == ucKeySpec)
+            {
+                if (    (oid.size() == sizeof(g_pbECC256_OID))
+                    &&  (0 == memcmp(oid.data(), g_pbECC256_OID, sizeof(g_pbECC256_OID)))
+                   )
+                {
+                    ucKeySpec = MiniDriverContainer::KEYSPEC_ECDHE_256;
+                }
+                if (    (oid.size() == sizeof(g_pbECC384_OID))
+                    &&  (0 == memcmp(oid.data(), g_pbECC384_OID, sizeof(g_pbECC384_OID)))
+                   )
+                {
+                    ucKeySpec = MiniDriverContainer::KEYSPEC_ECDHE_384;
+                }
+                if (    (oid.size() == sizeof(g_pbECC521_OID))
+                    &&  (0 == memcmp(oid.data(), g_pbECC521_OID, sizeof(g_pbECC521_OID)))
+                   )
+                {
+                    ucKeySpec = MiniDriverContainer::KEYSPEC_ECDHE_521;
+                }
+            }
+            else if (MiniDriverContainer::KEYSPEC_SIGNATURE == ucKeySpec)
+            {
+                if (    (oid.size() == sizeof(g_pbECC256_OID))
+                    &&  (0 == memcmp(oid.data(), g_pbECC256_OID, sizeof(g_pbECC256_OID)))
+                   )
+                {
+                    ucKeySpec = MiniDriverContainer::KEYSPEC_ECDSA_256;
+                }
+                if (    (oid.size() == sizeof(g_pbECC384_OID))
+                    &&  (0 == memcmp(oid.data(), g_pbECC384_OID, sizeof(g_pbECC384_OID)))
+                   )
+                {
+                    ucKeySpec = MiniDriverContainer::KEYSPEC_ECDSA_384;
+                }
+                if (    (oid.size() == sizeof(g_pbECC521_OID))
+                    &&  (0 == memcmp(oid.data(), g_pbECC521_OID, sizeof(g_pbECC521_OID)))
+                   )
+                {
+                    ucKeySpec = MiniDriverContainer::KEYSPEC_ECDSA_521;
+                }
+            }
+            pubKeyVal = x509cert.EcPublicPoint();
+        }
+    }
+    catch (...)
+    {
+        bIsRSA = false;
+    }
 
-    a_pModulus.reset( new Marshaller::u1Array( modulus.size( ) ) );
+    a_pPublicKeyValue.reset( new u1Array( pubKeyVal.size( ) ) );
 
-    a_pModulus->SetBuffer( modulus.data( ) );
+    a_pPublicKeyValue->SetBuffer( (u1*) pubKeyVal.data( ) );
 
     // Compatibility with old P11
-    a_u8CheckValue = Util::MakeCheckValue( modulus.data( ), static_cast< unsigned int >( modulus.size( ) ) );
+    a_u8CheckValue = Util::MakeCheckValue( pubKeyVal.data( ), static_cast< unsigned int >( pubKeyVal.size( ) ) );
+    Log::end( "Token::generatePublicKeyValue" );
 }
 
 
 /* Get the public key modulus
 */
-void Token::generateRootAndSmartCardLogonFlags( boost::shared_ptr< Marshaller::u1Array>& a_pCertificateValue, bool& a_bIsRoot, unsigned long& a_ulCertificateCategory, bool& a_bIsSmartCardLogon ) {
+void Token::generateRootAndSmartCardLogonFlags( boost::shared_ptr< u1Array>& a_pCertificateValue, bool& a_bIsRoot, unsigned long& a_ulCertificateCategory, bool& a_bIsSmartCardLogon ) {
 
-    X509Cert x509cert( a_pCertificateValue->GetBuffer( ), a_pCertificateValue->GetLength( ) );
+    try
+    {
+        X509Cert x509cert( a_pCertificateValue->GetBuffer( ), a_pCertificateValue->GetLength( ) );
 
-    a_bIsRoot = ( x509cert.IsCACert( ) || x509cert.IsRootCert( ) );
+        a_bIsRoot = ( x509cert.IsCACert( ) || x509cert.IsRootCert( ) );
 
-    // CKA_CERTIFICATE_CATEGORY attribute set to "authority" (2) is the certificate is a root or CA one
-    a_ulCertificateCategory = a_bIsRoot ? 2 : 1; 
+        // CKA_CERTIFICATE_CATEGORY attribute set to "authority" (2) is the certificate is a root or CA one
+        a_ulCertificateCategory = a_bIsRoot ? 2 : 1;
 
-    // Look for the Windows Smart Card Logon OID
-    a_bIsSmartCardLogon = x509cert.isSmartCardLogon( );
-    //Log::log( "SmartCardLogon <%d>", a_pObject->m_bIsSmartCardLogon );
+        // Look for the Windows Smart Card Logon OID
+        a_bIsSmartCardLogon = x509cert.isSmartCardLogon( );
+        //Log::log( "SmartCardLogon <%d>", a_pObject->m_bIsSmartCardLogon );
+    }
+    catch (...)
+    {
+        a_bIsRoot = false;
+        a_ulCertificateCategory = 1;
+        a_bIsSmartCardLogon = false;
+    }
 }
 
 
 /* Search for a private key using the same public key exponent to set the same container index
 */
-void Token::searchContainerIndex( boost::shared_ptr< Marshaller::u1Array>& a_pModulus, unsigned char& a_ucContainerIndex, unsigned char& a_ucKeySpec ) {
+void Token::searchContainerIndex( boost::shared_ptr< u1Array>& a_pPubKeyValue, unsigned char& a_ucContainerIndex, unsigned char& a_ucKeySpec ) {
 
-    if( !a_pModulus ) {
+    if( !a_pPubKeyValue ) {
 
         return;
     }
 
-    int l = a_pModulus->GetLength( );
+    int l = a_pPubKeyValue->GetLength( );
 
-    unsigned char* p = a_pModulus->GetBuffer( );
+    unsigned char* p = a_pPubKeyValue->GetBuffer( );
 
     BOOST_FOREACH( const TOKEN_OBJECTS::value_type& obj, m_Objects ) {
 
         if( CKO_PRIVATE_KEY == obj->second->getClass( ) ) {
 
-            RSAPrivateKeyObject* objPrivateKey = (RSAPrivateKeyObject*) obj->second;
+            PrivateKeyObject* prvKey =  (PrivateKeyObject*) obj->second;
+            if (prvKey->_keyType == CKK_RSA)
+            {
+                RSAPrivateKeyObject* objPrivateKey = (RSAPrivateKeyObject*) prvKey;
 
-            if( 0 == memcmp( objPrivateKey->m_pModulus->GetBuffer( ), p, l ) ) {
+                if( 0 == memcmp( objPrivateKey->m_pModulus->GetBuffer( ), p, l ) ) {
 
-                a_ucContainerIndex = objPrivateKey->m_ucContainerIndex;
+                    a_ucContainerIndex = objPrivateKey->m_ucContainerIndex;
 
-                a_ucKeySpec = objPrivateKey->m_ucKeySpec;
+                    a_ucKeySpec = objPrivateKey->m_ucKeySpec;
+
+                    break;
+                }
             }
 
-            break;
+            if (prvKey->_keyType == CKK_EC)
+            {
+                ECCPrivateKeyObject* objPrivateKey = (ECCPrivateKeyObject*) prvKey;
+
+                if( (objPrivateKey->m_pPublicPoint->GetLength() == (u4)l) && (0 == memcmp( objPrivateKey->m_pPublicPoint->GetBuffer( ), p, l ) )) {
+
+                    a_ucContainerIndex = objPrivateKey->m_ucContainerIndex;
+
+                    a_ucKeySpec = objPrivateKey->m_ucKeySpec;
+
+                    break;
+                }
+            }
         }
     }
 }
@@ -5238,23 +7149,23 @@ void Token::setDefaultAttributesCertificate( X509PubKeyCertObject* a_pObject ) {
 
         generateRootAndSmartCardLogonFlags( a_pObject->m_pValue, a_pObject->m_bIsRoot, a_pObject->_certCategory, a_pObject->m_bIsSmartCardLogon );
 
-        generatePublicKeyModulus( a_pObject->m_pValue, a_pObject->m_pModulus, a_pObject->_checkValue );
+        generatePublicKeyValue( a_pObject->m_pValue, a_pObject->m_pPublicKeyValue,  a_pObject->m_bIsRSA, a_pObject->m_ucKeySpec, a_pObject->_checkValue, a_pObject->m_pOID );
 
-        if( a_pObject->m_pModulus ) {
+        if( a_pObject->m_pPublicKeyValue ) {
 
             if( MiniDriverContainerMapFile::CONTAINER_INDEX_INVALID == a_pObject->m_ucContainerIndex ) {
 
-                searchContainerIndex( a_pObject->m_pModulus, a_pObject->m_ucContainerIndex, a_pObject->m_ucKeySpec );
+                searchContainerIndex( a_pObject->m_pPublicKeyValue, a_pObject->m_ucContainerIndex, a_pObject->m_ucKeySpec );
             }
 
             if( !a_pObject->m_pLabel ) {
 
-                generateLabel( a_pObject->m_pModulus, a_pObject->m_pLabel );
+                generateLabel( a_pObject->m_pPublicKeyValue, a_pObject->m_pLabel );
             }
 
             if( !a_pObject->m_pID ) {
 
-                generateID( a_pObject->m_pModulus, a_pObject->m_pID );
+                generateID( a_pObject->m_pPublicKeyValue, a_pObject->m_pID );
             }
 
             if( !a_pObject->m_pSubject ) {
@@ -5284,7 +7195,7 @@ void Token::setDefaultAttributesCertificate( X509PubKeyCertObject* a_pObject ) {
 
 /*
 */
-void Token::setDefaultAttributesKeyPublic( Pkcs11ObjectKeyPublicRSA* a_pObject ) {
+void Token::setDefaultAttributesKeyPublic( Pkcs11ObjectKeyPublic* a_pObject ) {
 
     Log::begin( "Token::setDefaultAttributesKeyPublic" );
     Timer t;
@@ -5295,30 +7206,65 @@ void Token::setDefaultAttributesKeyPublic( Pkcs11ObjectKeyPublicRSA* a_pObject )
         return;
     }
 
-    if( !a_pObject->m_pModulus ) {
+    if (a_pObject->_keyType == CKK_RSA)
+    {
+        Pkcs11ObjectKeyPublicRSA* a_pRsaKey = (Pkcs11ObjectKeyPublicRSA*) a_pObject;
 
-        return;
+        if( !a_pRsaKey->m_pModulus ) {
+
+            return;
+        }
+
+        try {
+
+            if( MiniDriverContainerMapFile::CONTAINER_INDEX_INVALID == a_pRsaKey->m_ucContainerIndex ) {
+
+                searchContainerIndex( a_pRsaKey->m_pModulus, a_pRsaKey->m_ucContainerIndex, a_pRsaKey->m_ucKeySpec );
+            }
+
+            if( !a_pRsaKey->m_pLabel ) {
+
+                generateLabel( a_pRsaKey->m_pModulus, a_pRsaKey->m_pLabel );
+            }
+
+            if( !a_pRsaKey->m_pID ) {
+
+                generateID( a_pRsaKey->m_pModulus, a_pRsaKey->m_pID );
+            }
+
+        } catch( ... ) {
+
+        }
     }
+    else
+    {
+        Pkcs11ObjectKeyPublicECC* a_pEccKey = (Pkcs11ObjectKeyPublicECC*) a_pObject;
 
-    try {
+        if( !a_pEccKey->m_pPublicPoint ) {
 
-        if( MiniDriverContainerMapFile::CONTAINER_INDEX_INVALID == a_pObject->m_ucContainerIndex ) {
-
-            searchContainerIndex( a_pObject->m_pModulus, a_pObject->m_ucContainerIndex, a_pObject->m_ucKeySpec );
+            return;
         }
 
-        if( !a_pObject->m_pLabel ) {
+        try {
 
-            generateLabel( a_pObject->m_pModulus, a_pObject->m_pLabel );
+            if( MiniDriverContainerMapFile::CONTAINER_INDEX_INVALID == a_pEccKey->m_ucContainerIndex ) {
+
+                searchContainerIndex( a_pEccKey->m_pPublicPoint, a_pEccKey->m_ucContainerIndex, a_pEccKey->m_ucKeySpec );
+            }
+
+            if( !a_pEccKey->m_pLabel ) {
+
+                generateLabel( a_pEccKey->m_pPublicPoint, a_pEccKey->m_pLabel );
+            }
+
+            if( !a_pEccKey->m_pID ) {
+
+                generateID( a_pEccKey->m_pPublicPoint, a_pEccKey->m_pID );
+            }
+
+        } catch( ... ) {
+
         }
-
-        if( !a_pObject->m_pID ) {
-
-            generateID( a_pObject->m_pModulus, a_pObject->m_pID );
-        }
-
-    } catch( ... ) {
-
     }
 
     t.stop( "Token::setDefaultAttributesKeyPublic" );
@@ -5328,7 +7274,7 @@ void Token::setDefaultAttributesKeyPublic( Pkcs11ObjectKeyPublicRSA* a_pObject )
 
 /*
 */
-void Token::setDefaultAttributesKeyPrivate( RSAPrivateKeyObject* a_pObject ) {
+void Token::setDefaultAttributesKeyPrivate( PrivateKeyObject* a_pObject ) {
 
     Log::begin( "Token::setDefaultAttributesKeyPrivate" );
     Timer t;
@@ -5339,40 +7285,85 @@ void Token::setDefaultAttributesKeyPrivate( RSAPrivateKeyObject* a_pObject ) {
         return;
     }
 
-    if( !a_pObject->m_pModulus ) {
+    if (a_pObject->_keyType == CKK_RSA)
+    {
+        RSAPrivateKeyObject* a_pRsaKey = (RSAPrivateKeyObject*) a_pObject;
 
-        return;
+        if( !a_pRsaKey->m_pModulus ) {
+
+            return;
+        }
+
+        try {
+
+            if( MiniDriverContainerMapFile::CONTAINER_INDEX_INVALID == a_pRsaKey->m_ucContainerIndex ) {
+
+                searchContainerIndex( a_pRsaKey->m_pModulus, a_pRsaKey->m_ucContainerIndex, a_pRsaKey->m_ucKeySpec );
+            }
+
+            // Compatibility with old P11
+            unsigned char* p = a_pRsaKey->m_pModulus->GetBuffer( );
+            unsigned int l = a_pRsaKey->m_pModulus->GetLength( );
+
+            a_pObject->_checkValue = Util::MakeCheckValue( p, l );
+
+            setContainerIndexToCertificate( a_pRsaKey->m_pModulus, a_pRsaKey->m_ucContainerIndex, a_pRsaKey->m_ucKeySpec );
+
+            setContainerIndexToKeyPublic( a_pRsaKey->m_pModulus, a_pRsaKey->m_ucContainerIndex, a_pRsaKey->m_ucKeySpec );
+
+            if( !a_pRsaKey->m_pLabel ) {
+
+                generateLabel( a_pRsaKey->m_pModulus, a_pRsaKey->m_pLabel );
+            }
+
+            if( !a_pRsaKey->m_pID ) {
+
+                generateID( a_pRsaKey->m_pModulus, a_pRsaKey->m_pID );
+            }
+
+        } catch( ... ) {
+
+        }
     }
+    else
+    {
+        ECCPrivateKeyObject* a_pEccKey = (ECCPrivateKeyObject*) a_pObject;
 
-    try {
+        if( !a_pEccKey->m_pPublicPoint ) {
 
-        if( MiniDriverContainerMapFile::CONTAINER_INDEX_INVALID == a_pObject->m_ucContainerIndex ) {
-
-            searchContainerIndex( a_pObject->m_pModulus, a_pObject->m_ucContainerIndex, a_pObject->m_ucKeySpec );
+            return;
         }
 
-        // Compatibility with old P11
-        unsigned char* p = a_pObject->m_pModulus->GetBuffer( );
-        unsigned int l = a_pObject->m_pModulus->GetLength( );
+        try {
 
-        a_pObject->_checkValue = Util::MakeCheckValue( p, l );
+            if( MiniDriverContainerMapFile::CONTAINER_INDEX_INVALID == a_pEccKey->m_ucContainerIndex ) {
 
-        setContainerIndexToCertificate( a_pObject->m_pModulus, a_pObject->m_ucContainerIndex, a_pObject->m_ucKeySpec );
+                searchContainerIndex( a_pEccKey->m_pPublicPoint, a_pEccKey->m_ucContainerIndex, a_pEccKey->m_ucKeySpec );
+            }
 
-        setContainerIndexToKeyPublic( a_pObject->m_pModulus, a_pObject->m_ucContainerIndex, a_pObject->m_ucKeySpec );
+            // Compatibility with old P11
+            unsigned char* p = a_pEccKey->m_pPublicPoint->GetBuffer( );
+            unsigned int l = a_pEccKey->m_pPublicPoint->GetLength( );
 
-        if( !a_pObject->m_pLabel ) {
+            a_pObject->_checkValue = Util::MakeCheckValue( p, l );
 
-            generateLabel( a_pObject->m_pModulus, a_pObject->m_pLabel );
+            setContainerIndexToCertificate( a_pEccKey->m_pPublicPoint, a_pEccKey->m_ucContainerIndex, a_pEccKey->m_ucKeySpec );
+
+            setContainerIndexToKeyPublic( a_pEccKey->m_pPublicPoint, a_pEccKey->m_ucContainerIndex, a_pEccKey->m_ucKeySpec );
+
+            if( !a_pEccKey->m_pLabel ) {
+
+                generateLabel( a_pEccKey->m_pPublicPoint, a_pEccKey->m_pLabel );
+            }
+
+            if( !a_pEccKey->m_pID ) {
+
+                generateID( a_pEccKey->m_pPublicPoint, a_pEccKey->m_pID );
+            }
+
+        } catch( ... ) {
+
         }
-
-        if( !a_pObject->m_pID ) {
-
-            generateID( a_pObject->m_pModulus, a_pObject->m_pID );
-        }
-
-    } catch( ... ) {
-
     }
 
     t.stop( "Token::setDefaultAttributesKeyPrivate" );
@@ -5382,20 +7373,20 @@ void Token::setDefaultAttributesKeyPrivate( RSAPrivateKeyObject* a_pObject ) {
 
 /*
 */
-void Token::setContainerIndexToCertificate( boost::shared_ptr< Marshaller::u1Array>& a_pModulus, const unsigned char& a_ucContainerIndex, const unsigned char& a_ucKeySpec ) {
+void Token::setContainerIndexToCertificate( boost::shared_ptr< u1Array>& a_pPublicKeyValue, const unsigned char& a_ucContainerIndex, const unsigned char& a_ucKeySpec ) {
 
     Log::begin( "Token::setContainerIndexToCertificate" );
     Timer t;
     t.start( );
 
-    if( !a_pModulus ) {
+    if( !a_pPublicKeyValue ) {
 
         return;
     }
 
-    unsigned char* p = a_pModulus->GetBuffer( );
+    unsigned char* p = a_pPublicKeyValue->GetBuffer( );
 
-    unsigned int l = a_pModulus->GetLength( );
+    unsigned int l = a_pPublicKeyValue->GetLength( );
 
     // Give the same container index of the private key to the associated certificate
     BOOST_FOREACH( const TOKEN_OBJECTS::value_type& obj, m_Objects ) {
@@ -5406,24 +7397,28 @@ void Token::setContainerIndexToCertificate( boost::shared_ptr< Marshaller::u1Arr
 
             if( objCertificate->m_pValue.get( ) ) {
 
-                X509Cert x509cert( objCertificate->m_pValue->GetBuffer( ), objCertificate->m_pValue->GetLength( ) );
+                try
+                {
+                    X509Cert x509cert( objCertificate->m_pValue->GetBuffer( ), objCertificate->m_pValue->GetLength( ) );
 
-                // Get the certificate public key modulus
-                BEROctet::Blob modulus = x509cert.Modulus( );
+                    // Get the certificate public key modulus
+                    BEROctet::Blob pubVal;
+                    if (x509cert.IsRsaPublicKey())
+                        pubVal = x509cert.Modulus( );
+                    else
+                        pubVal = x509cert.EcPublicPoint( );
 
-                Marshaller::u1Array m( modulus.size( ) );
+                    if( (l == pubVal.size()) && (0 == memcmp( pubVal.data(), p, l )) ) {
 
-                m.SetBuffer( modulus.data( ) );
+                        // Give the same container index of the private key to the certificate
+                        objCertificate->m_ucContainerIndex = a_ucContainerIndex;
 
-                if( 0 == memcmp( m.GetBuffer( ), p, l ) ) {
+                        objCertificate->m_ucKeySpec = a_ucKeySpec;
 
-                    // Give the same container index of the private key to the certificate
-                    objCertificate->m_ucContainerIndex = a_ucContainerIndex;
-
-                    objCertificate->m_ucKeySpec = a_ucKeySpec;
-
-                    break;
+                        break;
+                    }
                 }
+                catch (...) {}
             }
         }
     }
@@ -5435,20 +7430,20 @@ void Token::setContainerIndexToCertificate( boost::shared_ptr< Marshaller::u1Arr
 
 /* Search for an associated public key created before the private key to rename it properly using the index of the created container
 */
-void Token::setContainerIndexToKeyPublic( boost::shared_ptr< Marshaller::u1Array>& a_pModulus, const unsigned char& a_ucContainerIndex, const unsigned char& a_ucKeySpec ) {
+void Token::setContainerIndexToKeyPublic( boost::shared_ptr< u1Array>& a_pPublicKeyValue, const unsigned char& a_ucContainerIndex, const unsigned char& /*a_ucKeySpec*/ ) {
 
     Log::begin( "Token::setContainerIndexToKeyPublic" );
     Timer t;
     t.start( );
 
-    if( !a_pModulus ) {
+    if( !a_pPublicKeyValue ) {
 
         return;
     }
 
-    unsigned char* p = a_pModulus->GetBuffer( );
+    unsigned char* p = a_pPublicKeyValue->GetBuffer( );
 
-    unsigned int l = a_pModulus->GetLength( );
+    unsigned int l = a_pPublicKeyValue->GetLength( );
 
     // Give the same container index of the private key to the associated public key
     BOOST_FOREACH( const TOKEN_OBJECTS::value_type& obj, m_Objects ) {
@@ -5456,13 +7451,15 @@ void Token::setContainerIndexToKeyPublic( boost::shared_ptr< Marshaller::u1Array
         // Search for a PKCS11 public key object
         if( CKO_PUBLIC_KEY == obj->second->getClass( ) ) {
 
-            Pkcs11ObjectKeyPublicRSA* objPublicKey = (Pkcs11ObjectKeyPublicRSA*) obj->second;
+            Pkcs11ObjectKeyPublic* objPublicKey = (Pkcs11ObjectKeyPublic*) obj->second;
+            bool bIsRSA = (objPublicKey->_keyType == CKK_RSA);
 
            // When the public key is created first the index is not set
             if( MiniDriverContainerMapFile::CONTAINER_INDEX_INVALID == objPublicKey->m_ucContainerIndex ) {
 
+                boost::shared_ptr< u1Array> pubVal = (bIsRSA)? ((Pkcs11ObjectKeyPublicRSA*) objPublicKey)->m_pModulus : ((Pkcs11ObjectKeyPublicECC*) objPublicKey)->m_pPublicPoint;
                 // Search for the same modulus as the private key
-                if( 0 == memcmp( objPublicKey->m_pModulus->GetBuffer( ), p, l ) ) {
+                if( (pubVal->GetLength() == l) && (0 == memcmp( pubVal->GetBuffer( ), p, l )) ) {
 
                     // Delete the old object
                     deleteObjectFromCard( objPublicKey );
@@ -5470,7 +7467,7 @@ void Token::setContainerIndexToKeyPublic( boost::shared_ptr< Marshaller::u1Array
                     // Compute a new name regardiong the new index for the public key
                     std::string stNewName = objPublicKey->m_stFileName.substr( 0, objPublicKey->m_stFileName.length( ) - 2 );
                     Util::toStringHex( a_ucContainerIndex, stNewName );
-                    
+
                     // Update the inner object's properties
                     objPublicKey->m_stFileName = stNewName;
 
@@ -5487,4 +7484,21 @@ void Token::setContainerIndexToKeyPublic( boost::shared_ptr< Marshaller::u1Array
 
     t.stop( "Token::setContainerIndexToKeyPublic" );
     Log::end( "Token::setContainerIndexToKeyPublic" );
+}
+
+bool Token::isRoleUsingProtectedAuthenticationPath(MiniDriverAuthentication::ROLES role)
+{
+	if ( !m_Device->isNoPin( role ) )
+	{
+		if(  (  (m_Device->isExternalPin(role))
+				&&(m_Device->isVerifyPinSecured())
+				)
+			||(m_Device->isModeNotPinOnly(role))
+			)
+		{
+			return true;
+		}
+	}
+
+	return false;
 }

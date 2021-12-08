@@ -1,6 +1,7 @@
 /*
-*  PKCS#11 library for .Net smart cards
+*  PKCS#11 library for IoT Safe
 *  Copyright (C) 2007-2009 Gemalto <support@gemalto.com>
+*  Copyright (C) 2009-2021 Thales
 *
 *  This library is free software; you can redistribute it and/or
 *  modify it under the terms of the GNU Lesser General Public
@@ -17,56 +18,44 @@
 *  Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301  USA
 *
 */
-
-
 #define CRYPTOKIVERSION_INTERFACE_MAJOR  0x02
 #define CRYPTOKIVERSION_INTERFACE_MINOR  0x14
 
 
 #include <string>
 #include <boost/thread/mutex.hpp>
-#include <boost/thread/condition_variable.hpp>
 #include <boost/foreach.hpp>
-#include <boost/array.hpp>
 #include "cryptoki.h"
 #include "Application.hpp"
 #include "Log.hpp"
 #include "PKCS11Exception.hpp"
 #include "version.hpp"
 
+#include <openssl/err.h>
+#include <openssl/evp.h>
+#include <openssl/engine.h>
+#include <openssl/rand.h>
 
-boost::condition_variable g_WaitForSlotEventCondition;
-
-boost::mutex g_WaitForSlotEventMutex;
-
-bool g_bWaitForSlotEvent = false;
+#ifndef WIN32
+#define UNREFERENCED_PARAMETER(P) {(P)=(P);}
+#endif
 
 // Must be a 32 max length string
 const CK_UTF8CHAR g_stManufacturedId[ ] = "Gemalto";
 
 // Must be a 32 max length string
-const CK_UTF8CHAR g_stLibraryDescription[ ] = "Gemalto .NET PKCS11";
+const CK_UTF8CHAR g_stLibraryDescription[ ] = "Gemalto PKCS11";
 
 boost::mutex io_mutex;
-
-Application* g_Application = NULL;
+/*
+ * Definition of the allocators associated with the 
+ * instances of the CSecureString template
+ */
+CSecureAllocator CSecureString::g_Allocator;
 
 CK_BBOOL g_isInitialized = FALSE;
 
-void pkcs11Initialization(void)
-{
-    g_Application = new Application;
-}
-
-void pkcs11Finalization(void)
-{
-    if (g_Application)
-    {
-        delete g_Application;
-        g_Application = NULL;
-    }
-}
-
+bool g_bDllUnloading = false;
 
 static const CK_FUNCTION_LIST FunctionList = {
 
@@ -83,6 +72,7 @@ static const CK_FUNCTION_LIST FunctionList = {
 #undef CK_NEED_ARG_LIST
 };
 
+Application g_Application;
 
 extern "C"
 {
@@ -91,23 +81,35 @@ extern "C"
     */
     CK_DEFINE_FUNCTION( CK_RV, C_GetCardProperty )( CK_SLOT_ID ulSlotID, CK_BYTE a_ucProperty, CK_BYTE a_ucFlags, CK_BYTE_PTR a_pValue, CK_ULONG_PTR a_pValueLen ) {
 
+		if (g_bDllUnloading)
+		{
+#ifndef _WIN32
+			Log::log( "C_GetCardProperty -   return CKR_CRYPTOKI_NOT_INITIALIZED (Library unloading)" );
+#endif
+			return CKR_CRYPTOKI_NOT_INITIALIZED;
+		}
+		
         boost::mutex::scoped_lock lock( io_mutex );
 
         CK_RV rv = CKR_OK;
 
-        Log::begin( "C_GetCardProperty" );
-        Log::in( "C_GetCardProperty" );
-        Log::log( "C_GetCardProperty - slotID <%#02x>", ulSlotID );
-        Log::log( "C_GetCardProperty - property <%#02x>", a_ucProperty );
-        Log::log( "C_GetCardProperty - flags <%#02x>", a_ucFlags );
-        if( *a_pValueLen ) {
+		if (Log::s_bEnableLog)
+		{
+			Log::begin( "C_GetCardProperty" );
+			Log::in( "C_GetCardProperty" );
+			Log::log( "C_GetCardProperty - slotID <%#02x>", ulSlotID );
+			Log::log( "C_GetCardProperty - property <%#02x>", a_ucProperty );
+			Log::log( "C_GetCardProperty - flags <%#02x>", a_ucFlags );
+			if( *a_pValueLen ) {
 
-            Log::logCK_UTF8CHAR_PTR( "C_GetCardProperty - value", a_pValue, *a_pValueLen );
-            Log::log( "C_GetCardProperty - value len <%#02x>", *a_pValueLen );
-        }
-        Log::start( );
+				Log::logCK_UTF8CHAR_PTR( "C_GetCardProperty - value", a_pValue, *a_pValueLen );
+				Log::log( "C_GetCardProperty - value len <%#02x>", *a_pValueLen );
+			}
+			Log::start( );
+		}
 
         boost::shared_ptr< Slot > s;
+		bool bTransTaken = false;
 
         try {
 
@@ -121,15 +123,18 @@ extern "C"
                 */
             } else {
 
-                s = g_Application->getSlot( ulSlotID );
+                s = g_Application.getSlot( ulSlotID );
 
                 if( s.get( ) && s->m_Device.get( ) ) {
 
-                    s->m_Device->beginTransaction( );
-
+                    bTransTaken = s->m_Device->beginTransaction( );
                     s->getCardProperty( a_ucProperty, a_ucFlags, a_pValue, a_pValueLen );
                 }
             }
+
+        } catch( MiniDriverException& x) {        
+
+            rv = Token::checkException( x );
 
         } catch( PKCS11Exception& x ) {
 
@@ -140,20 +145,23 @@ extern "C"
             rv = CKR_GENERAL_ERROR;
         }
 
-        if( s.get( ) && s->m_Device.get( ) ) {
+        if( s.get( ) && s->m_Device.get( ) && bTransTaken) {
 
             s->m_Device->endTransaction( );
         }
 
-        Log::stop( "C_GetCardProperty" );
-        Log::logCK_RV( "C_GetCardProperty", rv );
-        Log::out( "C_GetCardProperty" );
-        if( *a_pValueLen ) {
+		if (Log::s_bEnableLog)
+		{
+			Log::stop( "C_GetCardProperty" );
+			Log::logCK_RV( "C_GetCardProperty", rv );
+			Log::out( "C_GetCardProperty" );
+			if( *a_pValueLen ) {
 
-            Log::logCK_UTF8CHAR_PTR( "C_GetCardProperty - value", a_pValue, *a_pValueLen );
-            Log::log( "C_GetCardProperty - value len <%#02x>", *a_pValueLen );
-        }
-        Log::end( "C_GetCardProperty" );
+				Log::logCK_UTF8CHAR_PTR( "C_GetCardProperty - value", a_pValue, *a_pValueLen );
+				Log::log( "C_GetCardProperty - value len <%#02x>", *a_pValueLen );
+			}
+			Log::end( "C_GetCardProperty" );
+		}
 
         return rv;
     }
@@ -164,20 +172,32 @@ extern "C"
     */
     CK_DEFINE_FUNCTION( CK_RV, C_SetCardProperty )( CK_SLOT_ID ulSlotID, CK_BYTE a_ucProperty, CK_BYTE a_ucFlags, CK_BYTE_PTR a_pValue, CK_ULONG a_ulValueLen ) {
 
+		if (g_bDllUnloading)
+		{
+#ifndef _WIN32
+			Log::log( "C_SetCardProperty -   return CKR_CRYPTOKI_NOT_INITIALIZED (Library unloading)" );
+#endif
+			return CKR_CRYPTOKI_NOT_INITIALIZED;
+		}
+		
         boost::mutex::scoped_lock lock( io_mutex );
 
         CK_RV rv = CKR_OK;
 
-        Log::begin( "C_SetCardProperty" );
-        Log::in( "C_SetCardProperty" );
-        Log::log( "C_SetCardProperty - slotID <%#02x>", ulSlotID );
-        Log::log( "C_SetCardProperty - property <%#02x>", a_ucProperty );
-        Log::log( "C_SetCardProperty - flags <%#02x>", a_ucFlags );
-        Log::logCK_UTF8CHAR_PTR( "C_SetCardProperty - value", a_pValue, a_ulValueLen );
-        Log::log( "C_SetCardProperty - value len <%#02x>", a_ulValueLen );
-        Log::start( );
+		if (Log::s_bEnableLog)
+		{
+			Log::begin( "C_SetCardProperty" );
+			Log::in( "C_SetCardProperty" );
+			Log::log( "C_SetCardProperty - slotID <%#02x>", ulSlotID );
+			Log::log( "C_SetCardProperty - property <%#02x>", a_ucProperty );
+			Log::log( "C_SetCardProperty - flags <%#02x>", a_ucFlags );
+			Log::logCK_UTF8CHAR_PTR( "C_SetCardProperty - value", a_pValue, a_ulValueLen );
+			Log::log( "C_SetCardProperty - value len <%#02x>", a_ulValueLen );
+			Log::start( );
+		}
 
         boost::shared_ptr< Slot > s;
+		bool bTransTaken = false;
 
         try {
 
@@ -191,15 +211,18 @@ extern "C"
 
             } else {
 
-                s = g_Application->getSlot( ulSlotID );
+                s = g_Application.getSlot( ulSlotID );
 
                 if( s.get( ) && s->m_Device.get( ) ) {
 
-                    s->m_Device->beginTransaction( );
-
+                    bTransTaken = s->m_Device->beginTransaction( );
                     s->setCardProperty( a_ucProperty, a_ucFlags, a_pValue, a_ulValueLen );
                 }
             }
+
+        } catch( MiniDriverException& x) {        
+
+            rv = Token::checkException( x );
 
         } catch( PKCS11Exception& x ) {
 
@@ -210,14 +233,17 @@ extern "C"
             rv = CKR_GENERAL_ERROR;
         }
 
-        if( s.get( ) && s->m_Device.get( ) ) {
+		if( s.get( ) && s->m_Device.get( ) && bTransTaken) {
 
             s->m_Device->endTransaction( );
         }
 
-        Log::stop( "C_SetCardProperty" );
-        Log::logCK_RV( "C_SetCardProperty", rv );
-        Log::end( "C_SetCardProperty" );
+		if (Log::s_bEnableLog)
+		{
+			Log::stop( "C_SetCardProperty" );
+			Log::logCK_RV( "C_SetCardProperty", rv );
+			Log::end( "C_SetCardProperty" );
+		}
 
         return rv;
     }
@@ -230,14 +256,25 @@ extern "C"
     */
     CK_DEFINE_FUNCTION( CK_RV, C_Initialize )( CK_VOID_PTR a_pInitArgs ) {
 
+		if (g_bDllUnloading)
+		{
+#ifndef _WIN32
+			Log::log( "C_Initialize -   return CKR_CRYPTOKI_NOT_INITIALIZED (Library unloading)" );
+#endif
+			return CKR_CRYPTOKI_NOT_INITIALIZED;
+		}
+		
         boost::mutex::scoped_lock lock( io_mutex );
 
         CK_RV rv = CKR_OK;
 
-        Log::begin( "C_Initialize" );
-        Log::in( "C_Initialize" );
-        Log::log( "C_Initialize - pInitArgs <%#02x>", a_pInitArgs );
-        Log::start( );
+		if (Log::s_bEnableLog)
+		{
+			Log::begin( "C_Initialize" );
+			Log::in( "C_Initialize" );
+			Log::log( "C_Initialize - pInitArgs <%#02x>", a_pInitArgs );
+			Log::start( );
+		}
 
         try {
 
@@ -268,7 +305,7 @@ extern "C"
                     if( initArgs._CreateMutex || initArgs.DestroyMutex || initArgs.LockMutex || initArgs.UnlockMutex ) {
 
                         Log::error( "C_Initialize", "CKR_CANT_LOCK" );
-                        rv = CKR_CANT_LOCK;
+                        //rv = CKR_CANT_LOCK;
                     }
 
                 } else if( initArgs._CreateMutex || initArgs.DestroyMutex || initArgs.LockMutex || initArgs.UnlockMutex ) {
@@ -288,24 +325,23 @@ extern "C"
 
             if ( CKR_OK == rv ) {
 
-                pkcs11Initialization();
-
-                g_Application->initialize( );
+                g_Application.initialize( );
 
                 g_isInitialized = TRUE;
             }
 
             Log::log( "C_Initialize - isInitialized <%#02x>", g_isInitialized );
 
-        } catch( ... ) {
-
-            pkcs11Finalization();
+        } catch( ... ) {            
             rv = CKR_GENERAL_ERROR;
         }
 
-        Log::stop( "C_Initialize" );
-        Log::logCK_RV( "C_Initialize", rv );
-        Log::end( "C_Initialize" );
+		if (Log::s_bEnableLog)
+		{
+			Log::stop( "C_Initialize" );
+			Log::logCK_RV( "C_Initialize", rv );
+			Log::end( "C_Initialize" );
+		}
         return rv;
     }
 
@@ -318,14 +354,25 @@ extern "C"
     */
     CK_DEFINE_FUNCTION( CK_RV, C_Finalize )( CK_VOID_PTR a_pReserved ) {
 
+		if (g_bDllUnloading)
+		{
+#ifndef _WIN32
+			Log::log( "C_Finalize -   return CKR_CRYPTOKI_NOT_INITIALIZED (Library unloading)" );
+#endif
+			return CKR_CRYPTOKI_NOT_INITIALIZED;
+		}
+		
         boost::mutex::scoped_lock lock( io_mutex );
 
         CK_RV rv = CKR_OK;
 
-        Log::begin( "C_Finalize" );
-        Log::in( "C_Finalize" );
-        Log::log( "C_Finalize - pReserved <%#02x>", a_pReserved );
-        Log::start( );
+		if (Log::s_bEnableLog)
+		{
+			Log::begin( "C_Finalize" );
+			Log::in( "C_Finalize" );
+			Log::log( "C_Finalize - pReserved <%#02x>", a_pReserved );
+			Log::start( );
+		}
 
         try {
 
@@ -344,10 +391,7 @@ extern "C"
 
             } else {
 
-                g_WaitForSlotEventCondition.notify_all( );
-
-                g_Application->finalize( );
-                pkcs11Finalization();
+				g_Application.finalize( );
 
                 g_isInitialized = FALSE;
             }
@@ -357,10 +401,12 @@ extern "C"
             rv = CKR_GENERAL_ERROR;
         }
 
-        Log::stop( "C_Finalize" );
-        Log::logCK_RV( "C_Finalize", rv );
-        Log::end( "C_Finalize" );
-
+		if (Log::s_bEnableLog)
+		{
+			Log::stop( "C_Finalize" );
+			Log::logCK_RV( "C_Finalize", rv );
+			Log::end( "C_Finalize" );
+		}
         return rv;
     }
 
@@ -372,13 +418,24 @@ extern "C"
     */
     CK_DEFINE_FUNCTION( CK_RV, C_GetInfo )( CK_INFO_PTR pInfo ) {
 
+		if (g_bDllUnloading)
+		{
+#ifndef _WIN32
+			Log::log( "C_GetInfo -   return CKR_CRYPTOKI_NOT_INITIALIZED (Library unloading)" );
+#endif
+			return CKR_CRYPTOKI_NOT_INITIALIZED;
+		}
+		
         boost::mutex::scoped_lock lock( io_mutex );
 
         CK_RV rv = CKR_OK;
-        Log::begin( "C_GetInfo" );
-        Log::in( "C_GetInfo" );
-        Log::logCK_INFO( "C_GetInfo", pInfo );
-        Log::start( );
+		if (Log::s_bEnableLog)
+		{
+			Log::begin( "C_GetInfo" );
+			Log::in( "C_GetInfo" );
+			Log::logCK_INFO( "C_GetInfo", pInfo );
+			Log::start( );
+		}
 
         if( !g_isInitialized ) {
 
@@ -401,11 +458,14 @@ extern "C"
             pInfo->libraryVersion.minor  = CRYPTOKIVERSION_LIBRARY_MINOR;
         }
 
-        Log::stop( "C_GetInfo" );
-        Log::logCK_RV( "C_GetInfo", rv );
-        Log::out( "C_GetInfo" );
-        Log::logCK_INFO( "C_GetInfo", pInfo );
-        Log::end( "C_GetInfo" );
+		if (Log::s_bEnableLog)
+		{
+			Log::stop( "C_GetInfo" );
+			Log::logCK_RV( "C_GetInfo", rv );
+			Log::out( "C_GetInfo" );
+			Log::logCK_INFO( "C_GetInfo", pInfo );
+			Log::end( "C_GetInfo" );
+		}
         return rv;
     }
 
@@ -417,13 +477,24 @@ extern "C"
     */
     CK_DEFINE_FUNCTION( CK_RV,C_GetFunctionList )( CK_FUNCTION_LIST_PTR_PTR ppFunctionList ) {
 
+		if (g_bDllUnloading)
+		{
+#ifndef _WIN32
+			Log::log( "C_GetFunctionList -   return CKR_CRYPTOKI_NOT_INITIALIZED (Library unloading)" );
+#endif
+			return CKR_CRYPTOKI_NOT_INITIALIZED;
+		}
+		
         boost::mutex::scoped_lock lock( io_mutex );
 
         CK_RV rv = CKR_OK;
-        Log::begin( "C_GetFunctionList" );
-        Log::in( "C_GetFunctionList" );
-        Log::log( "C_GetFunctionList - CK_FUNCTION_LIST_PTR_PTR <%#02x>", ppFunctionList );
-        Log::start( );
+		if (Log::s_bEnableLog)
+		{
+			Log::begin( "C_GetFunctionList" );
+			Log::in( "C_GetFunctionList" );
+			Log::log( "C_GetFunctionList - CK_FUNCTION_LIST_PTR_PTR <%#02x>", ppFunctionList );
+			Log::start( );
+		}
 
         if( !ppFunctionList ) {
 
@@ -435,11 +506,14 @@ extern "C"
             *ppFunctionList = (CK_FUNCTION_LIST_PTR)&FunctionList;
         }
 
-        Log::stop( "C_GetFunctionList" );
-        Log::logCK_RV( "C_GetFunctionList", rv );
-        Log::out( "C_GetFunctionList" );
-        Log::log( "C_GetFunctionList - CK_FUNCTION_LIST_PTR_PTR <%#02x>", ppFunctionList );
-        Log::end( "C_GetFunctionList" );
+		if (Log::s_bEnableLog)
+		{
+			Log::stop( "C_GetFunctionList" );
+			Log::logCK_RV( "C_GetFunctionList", rv );
+			Log::out( "C_GetFunctionList" );
+			Log::log( "C_GetFunctionList - CK_FUNCTION_LIST_PTR_PTR <%#02x>", ppFunctionList );
+			Log::end( "C_GetFunctionList" );
+		}
         return rv;
     }
 
@@ -453,15 +527,26 @@ extern "C"
     */
     CK_DEFINE_FUNCTION( CK_RV, C_GetSlotList )( CK_BBOOL tokenPresent, CK_SLOT_ID_PTR pSlotList, CK_ULONG_PTR pulCount ) {
 
+		if (g_bDllUnloading)
+		{
+#ifndef _WIN32
+			Log::log( "C_GetSlotList -   return CKR_CRYPTOKI_NOT_INITIALIZED (Library unloading)" );
+#endif
+			return CKR_CRYPTOKI_NOT_INITIALIZED;
+		}
+		
         boost::mutex::scoped_lock lock( io_mutex );
 
         CK_RV rv = CKR_OK;
 
-        Log::begin( "C_GetSlotList" );
-        Log::in( "C_GetSlotList" );
-        Log::log( "C_GetSlotList - tokenPresent <%d>", tokenPresent );
-        Log::logCK_SLOT_ID_PTR( "C_GetSlotList", pSlotList, pulCount );
-        Log::start( );
+		if (Log::s_bEnableLog)
+		{
+			Log::begin( "C_GetSlotList" );
+			Log::in( "C_GetSlotList" );
+			Log::log( "C_GetSlotList - tokenPresent <%d>", tokenPresent );
+			Log::logCK_SLOT_ID_PTR( "C_GetSlotList", pSlotList, pulCount );
+			Log::start( );
+		}
 
         try {
 
@@ -471,7 +556,7 @@ extern "C"
 
             } else if( pulCount ) {
 
-                g_Application->getSlotList( tokenPresent, pSlotList, pulCount );
+                g_Application.getSlotList( tokenPresent, pSlotList, pulCount );
 
             } else {
 
@@ -483,11 +568,14 @@ extern "C"
             rv = x.getError( );
         }
 
-        Log::stop( "C_GetSlotList" );
-        Log::logCK_RV( "C_GetSlotList", rv );
-        Log::out( "C_GetSlotList" );
-        Log::logCK_SLOT_ID_PTR( "C_GetSlotList", pSlotList, pulCount );
-        Log::end( "C_GetSlotList" );
+		if (Log::s_bEnableLog)
+		{
+			Log::stop( "C_GetSlotList" );
+			Log::logCK_RV( "C_GetSlotList", rv );
+			Log::out( "C_GetSlotList" );
+			Log::logCK_SLOT_ID_PTR( "C_GetSlotList", pSlotList, pulCount );
+			Log::end( "C_GetSlotList" );
+		}
 
         return rv;
     }
@@ -502,17 +590,29 @@ extern "C"
     */
     CK_DEFINE_FUNCTION( CK_RV, C_GetSlotInfo )( CK_SLOT_ID slotID, CK_SLOT_INFO_PTR pInfo )
     {
+		if (g_bDllUnloading)
+		{
+#ifndef _WIN32
+			Log::log( "C_GetSlotInfo -   return CKR_CRYPTOKI_NOT_INITIALIZED (Library unloading)" );
+#endif
+			return CKR_CRYPTOKI_NOT_INITIALIZED;
+		}
+		
         boost::mutex::scoped_lock lock( io_mutex );
 
         CK_RV rv = CKR_OK;
 
-        Log::begin( "C_GetSlotInfo" );
-        Log::in( "C_GetSlotInfo" );
-        Log::log( "C_GetSlotInfo - slotID <%ld>", slotID );
-        Log::logCK_SLOT_INFO_PTR( "C_GetSlotInfo", pInfo );
-        Log::start( );
+		if (Log::s_bEnableLog)
+		{
+			Log::begin( "C_GetSlotInfo" );
+			Log::in( "C_GetSlotInfo" );
+			Log::log( "C_GetSlotInfo - slotID <%ld>", slotID );
+			Log::logCK_SLOT_INFO_PTR( "C_GetSlotInfo", pInfo );
+			Log::start( );
+		}
 
         boost::shared_ptr< Slot > s;
+		bool bTransTaken = false;
 
         try {
 
@@ -526,15 +626,29 @@ extern "C"
 
             } else {
 
-                s = g_Application->getSlot( slotID );
+                s = g_Application.getSlot( slotID );
 
                 if( s.get( ) && s->m_Device.get( ) ) {
-
-                    s->m_Device->beginTransaction( );
-               
-                    s->getInfo( pInfo );
+                    if (s->isVirtual() && (!s->isCardPresent() || s->isTokenRemoved()))
+                    {
+                        // virtual slot but no card => remove it and report slot id as invalid
+                        s.reset();
+                        rv = CKR_SLOT_ID_INVALID;
+                    }
+                    else if (s->getReaderName() == EMPTY_READER_NAME)
+                    {
+                        rv = CKR_SLOT_ID_INVALID;
+                    }
+                    else
+                    {
+                        bTransTaken = s->m_Device->beginTransaction( );
+                        s->getInfo( pInfo );
+                    }
                 }
             }
+        } catch( MiniDriverException& x) {        
+
+            rv = Token::checkException( x );
 
         } catch( PKCS11Exception& x ) {
 
@@ -542,16 +656,19 @@ extern "C"
             rv = x.getError( );
         }
 
-        if( s.get( ) && s->m_Device.get( ) ) {
+        if( s.get( ) && s->m_Device.get( ) && bTransTaken) {
 
             s->m_Device->endTransaction( );
         }
 
-        Log::stop( "C_GetSlotInfo" );
-        Log::logCK_RV( "C_GetSlotInfo", rv );
-        Log::out( "C_GetSlotInfo" );
-        Log::logCK_SLOT_INFO_PTR( "C_GetSlotInfo", pInfo );
-        Log::end( "C_GetSlotInfo" );
+		if (Log::s_bEnableLog)
+		{
+			Log::stop( "C_GetSlotInfo" );
+			Log::logCK_RV( "C_GetSlotInfo", rv );
+			Log::out( "C_GetSlotInfo" );
+			Log::logCK_SLOT_INFO_PTR( "C_GetSlotInfo", pInfo );
+			Log::end( "C_GetSlotInfo" );
+		}
 
         return rv;
     }
@@ -566,17 +683,29 @@ extern "C"
     */
     CK_DEFINE_FUNCTION( CK_RV, C_GetTokenInfo )( CK_SLOT_ID slotID, CK_TOKEN_INFO_PTR pInfo ) {
 
+		if (g_bDllUnloading)
+		{
+#ifndef _WIN32
+			Log::log( "C_GetTokenInfo -   return CKR_CRYPTOKI_NOT_INITIALIZED (Library unloading)" );
+#endif
+			return CKR_CRYPTOKI_NOT_INITIALIZED;
+		}
+		
         boost::mutex::scoped_lock lock( io_mutex );
 
         CK_RV rv = CKR_OK;
 
-        Log::begin( "C_GetTokenInfo" );
-        Log::in( "C_GetTokenInfo" );
-        Log::log( "C_GetTokenInfo - slotID <%ld>", slotID );
-        Log::logCK_TOKEN_INFO_PTR( "C_GetTokenInfo", pInfo );
-        Log::start( );
+		if (Log::s_bEnableLog)
+		{
+			Log::begin( "C_GetTokenInfo" );
+			Log::in( "C_GetTokenInfo" );
+			Log::log( "C_GetTokenInfo - slotID <%ld>", slotID );
+			Log::logCK_TOKEN_INFO_PTR( "C_GetTokenInfo", pInfo );
+			Log::start( );
+		}
 
         boost::shared_ptr< Slot > s;
+		bool bTransTaken = false;
 
         try {
 
@@ -590,23 +719,33 @@ extern "C"
 
             } else {
 
-                s = g_Application->getSlot( slotID );
+                s = g_Application.getSlot( slotID );
 
                 if( s.get( ) && s->m_Device.get( ) ) {
 
                     //if( ! s->getToken( ).get( ) ) {
                     if( !s->getToken( ).get( ) && !s->isTokenInserted( ) ) {
-                    
-                        rv = CKR_TOKEN_NOT_PRESENT;
+                        // in case of virtual slot, remove it
+                        if (s->isVirtual())
+                        {
+                            s.reset();
+                            rv = CKR_SLOT_ID_INVALID;
+                        }
+                        else
+                            rv = CKR_TOKEN_NOT_PRESENT;
                     
                     } else {
 
-                        s->m_Device->beginTransaction( );
-                
+                        bTransTaken = s->m_Device->beginTransaction( );
+
                         s->getTokenInfo( pInfo );
                     }
                 }
             }
+
+        } catch( MiniDriverException& x) {        
+
+            rv = Token::checkException( x );
 
         } catch( PKCS11Exception& x ) {
 
@@ -617,16 +756,19 @@ extern "C"
             rv = CKR_GENERAL_ERROR;
         }
 
-        if( s.get( ) && s->m_Device.get( ) ) {
+        if( s.get( ) && s->m_Device.get( ) && bTransTaken) {
 
             s->m_Device->endTransaction( );
         }
 
-        Log::stop( "C_GetTokenInfo" );
-        Log::logCK_RV( "C_GetTokenInfo", rv );
-        Log::out( "C_GetTokenInfo" );
-        Log::logCK_TOKEN_INFO_PTR( "C_GetTokenInfo", pInfo );
-        Log::end( "C_GetTokenInfo" );
+		if (Log::s_bEnableLog)
+		{
+			Log::stop( "C_GetTokenInfo" );
+			Log::logCK_RV( "C_GetTokenInfo", rv );
+			Log::out( "C_GetTokenInfo" );
+			Log::logCK_TOKEN_INFO_PTR( "C_GetTokenInfo", pInfo );
+			Log::end( "C_GetTokenInfo" );
+		}
 
         return rv;
     }
@@ -642,17 +784,29 @@ extern "C"
     */
     CK_DEFINE_FUNCTION( CK_RV, C_GetMechanismList )( CK_SLOT_ID slotID, CK_MECHANISM_TYPE_PTR pMechanismList, CK_ULONG_PTR pulCount ) {
 
+		if (g_bDllUnloading)
+		{
+#ifndef _WIN32
+			Log::log( "C_GetMechanismList -   return CKR_CRYPTOKI_NOT_INITIALIZED (Library unloading)" );
+#endif
+			return CKR_CRYPTOKI_NOT_INITIALIZED;
+		}
+		
         boost::mutex::scoped_lock lock( io_mutex );
 
         CK_RV rv = CKR_OK;
 
-        Log::begin( "C_GetMechanismList" );
-        Log::in( "C_GetMechanismList" );
-        Log::log( "C_GetMechanismList - slotID <%#02x>", slotID );
-        Log::logCK_MECHANISM_TYPE( "C_GetMechanismList", pMechanismList, pulCount );
-        Log::start( );
+		if (Log::s_bEnableLog)
+		{
+			Log::begin( "C_GetMechanismList" );
+			Log::in( "C_GetMechanismList" );
+			Log::log( "C_GetMechanismList - slotID <%#02x>", slotID );
+			Log::logCK_MECHANISM_TYPE( "C_GetMechanismList", pMechanismList, pulCount );
+			Log::start( );
+		}
 
         boost::shared_ptr< Slot > s; 
+		bool bTransTaken = false;
 
         try {
 
@@ -666,22 +820,32 @@ extern "C"
 
             } else {
 
-                s = g_Application->getSlot( slotID );
+                s = g_Application.getSlot( slotID );
 
                 if( s.get( ) && s->m_Device.get( ) ) {
 
                      if( !s->getToken( ).get( ) && !s->isTokenInserted( ) ) { //->getToken( ).get( ) ) {
                     
-                        rv = CKR_TOKEN_NOT_PRESENT;
+                        if (s->isVirtual())
+                        {
+                            s.reset();
+                            rv = CKR_SLOT_ID_INVALID;
+                        }
+                        else
+                            rv = CKR_TOKEN_NOT_PRESENT;
                     
                     } else {
                         
-                        s->m_Device->beginTransaction( );
-               
+                        bTransTaken = s->m_Device->beginTransaction( );
+
                         s->getMechanismList( pMechanismList, pulCount );
                     }
                 }
             }
+
+        } catch( MiniDriverException& x) {        
+
+            rv = Token::checkException( x );
 
         } catch( PKCS11Exception& x ) {
 
@@ -692,16 +856,19 @@ extern "C"
             rv = CKR_GENERAL_ERROR;
         }
 
-        if( s.get( ) && s->m_Device.get( ) ) {
+        if( s.get( ) && s->m_Device.get( ) && bTransTaken) {
 
             s->m_Device->endTransaction( );
         }
 
-        Log::stop( "C_GetMechanismList" );
-        Log::logCK_RV( "C_GetMechanismList", rv );
-        Log::out( "C_GetMechanismList" );
-        Log::logCK_MECHANISM_TYPE( "C_GetMechanismList", pMechanismList, pulCount );
-        Log::end( "C_GetMechanismList" );
+		if (Log::s_bEnableLog)
+		{
+			Log::stop( "C_GetMechanismList" );
+			Log::logCK_RV( "C_GetMechanismList", rv );
+			Log::out( "C_GetMechanismList" );
+			Log::logCK_MECHANISM_TYPE( "C_GetMechanismList", pMechanismList, pulCount );
+			Log::end( "C_GetMechanismList" );
+		}
 
         return rv;
     }
@@ -717,18 +884,30 @@ extern "C"
     */
     CK_DEFINE_FUNCTION( CK_RV, C_GetMechanismInfo )( CK_SLOT_ID slotID, CK_MECHANISM_TYPE type, CK_MECHANISM_INFO_PTR pInfo ) {
 
+		if (g_bDllUnloading)
+		{
+#ifndef _WIN32
+			Log::log( "C_GetMechanismInfo -   return CKR_CRYPTOKI_NOT_INITIALIZED (Library unloading)" );
+#endif
+			return CKR_CRYPTOKI_NOT_INITIALIZED;
+		}
+		
         boost::mutex::scoped_lock lock( io_mutex );
 
         CK_RV rv = CKR_OK;
 
-        Log::begin( "C_GetMechanismInfo" );
-        Log::in( "C_GetMechanismInfo" );
-        Log::log( "C_GetMechanismInfo - slotID <%#02x>", slotID );
-        Log::logCK_MECHANISM_TYPE( "C_GetMechanismInfo", type );
-        Log::logCK_MECHANISM_INFO_PTR( "C_GetMechanismInfo", pInfo );
-        Log::start( );
+		if (Log::s_bEnableLog)
+		{
+			Log::begin( "C_GetMechanismInfo" );
+			Log::in( "C_GetMechanismInfo" );
+			Log::log( "C_GetMechanismInfo - slotID <%#02x>", slotID );
+			Log::logCK_MECHANISM_TYPE( "C_GetMechanismInfo", type );
+			Log::logCK_MECHANISM_INFO_PTR( "C_GetMechanismInfo", pInfo );
+			Log::start( );
+		}
 
         boost::shared_ptr< Slot > s;
+		bool bTransTaken = false;
 
         try {
 
@@ -742,22 +921,32 @@ extern "C"
 
             } else {
 
-                s = g_Application->getSlot( slotID );
+                s = g_Application.getSlot( slotID );
 
                 if( s.get( ) && s->m_Device.get( ) ) {
 
                      if( !s->getToken( ).get( ) && !s->isTokenInserted( ) ) { //->getToken( ).get( ) ) {
                     
-                        rv = CKR_TOKEN_NOT_PRESENT;
+                        if (s->isVirtual())
+                        {
+                            s.reset();
+                            rv = CKR_SLOT_ID_INVALID;
+                        }
+                        else
+                            rv = CKR_TOKEN_NOT_PRESENT;
                     
                     } else {
                         
-                        s->m_Device->beginTransaction( );
-                
+                        bTransTaken = s->m_Device->beginTransaction( );
+
                         s->getMechanismInfo( type, pInfo );
                     }
                 }
             }
+
+        } catch( MiniDriverException& x) {        
+
+            rv = Token::checkException( x );
 
         } catch( PKCS11Exception& x ) {
 
@@ -768,16 +957,19 @@ extern "C"
             rv = CKR_GENERAL_ERROR;
         }
 
-        if( s.get( ) && s->m_Device.get( ) ) {
+        if( s.get( ) && s->m_Device.get( ) && bTransTaken) {
 
             s->m_Device->endTransaction( );
         }
 
-        Log::stop( "C_GetMechanismInfo" );
-        Log::logCK_RV( "C_GetMechanismInfo", rv );
-        Log::out( "C_GetMechanismInfo" );
-        Log::logCK_MECHANISM_INFO_PTR( "C_GetMechanismInfo", pInfo );
-        Log::end( "C_GetMechanismInfo" );
+		if (Log::s_bEnableLog)
+		{
+			Log::stop( "C_GetMechanismInfo" );
+			Log::logCK_RV( "C_GetMechanismInfo", rv );
+			Log::out( "C_GetMechanismInfo" );
+			Log::logCK_MECHANISM_INFO_PTR( "C_GetMechanismInfo", pInfo );
+			Log::end( "C_GetMechanismInfo" );
+		}
 
         return rv;
     }
@@ -793,18 +985,31 @@ extern "C"
     */
     CK_DEFINE_FUNCTION( CK_RV, C_InitToken )( CK_SLOT_ID slotID, CK_UTF8CHAR_PTR pPin, CK_ULONG ulPinLen, CK_UTF8CHAR_PTR pLabel ) {
 
+		if (g_bDllUnloading)
+		{
+#ifndef _WIN32
+			Log::log( "C_InitToken -   return CKR_CRYPTOKI_NOT_INITIALIZED (Library unloading)" );
+#endif
+			return CKR_CRYPTOKI_NOT_INITIALIZED;
+		}
+		
         boost::mutex::scoped_lock lock( io_mutex );
 
         CK_RV rv = CKR_OK;
 
-        Log::begin( "C_InitToken" );
-        Log::in( "C_InitToken" );
-        Log::log( "C_InitToken - slotID <%#02x>", slotID );
-        Log::logCK_UTF8CHAR_PTR( "C_InitToken - pPin", pPin, ulPinLen );
-        Log::logCK_UTF8CHAR_PTR( "C_InitToken - pLabel", pLabel, 32 );
-        Log::start( );
+		if (Log::s_bEnableLog)
+		{
+			Log::begin( "C_InitToken" );
+			Log::in( "C_InitToken" );
+			Log::log( "C_InitToken - slotID <%#02x>", slotID );
+			Log::log( "C_InitToken - pPin <%s>", pPin? "Sensitive" : "NULL");
+			Log::log( "C_InitToken - ulPinLen <%s>", ulPinLen? "Sensitive" : "0");
+			Log::logCK_UTF8CHAR_PTR( "C_InitToken - pLabel", pLabel, 32 );
+			Log::start( );
+		}
 
         boost::shared_ptr< Slot > s;
+		bool bTransTaken = false;
 
         try {
 
@@ -818,22 +1023,32 @@ extern "C"
 
             } else {
 
-                s = g_Application->getSlot( slotID );
+                s = g_Application.getSlot( slotID );
 
                 if( s.get( ) && s->m_Device.get( ) ) {
 
                      if( !s->getToken( ).get( ) && !s->isTokenInserted( ) ) { //->getToken( ).get( ) ) {
                     
-                        rv = CKR_TOKEN_NOT_PRESENT;
+                        if (s->isVirtual())
+                        {
+                            s.reset();
+                            rv = CKR_SLOT_ID_INVALID;
+                        }
+                        else
+                            rv = CKR_TOKEN_NOT_PRESENT;
                     
                     } else {
                         
-                        s->m_Device->beginTransaction( );
-                
+                        bTransTaken = s->m_Device->beginTransaction( );
+
                         s->initToken( pPin, ulPinLen, pLabel );
                     }
                 }
             }
+
+        } catch( MiniDriverException& x) {        
+
+            rv = Token::checkException( x );
 
         } catch( PKCS11Exception& x ) {
 
@@ -844,14 +1059,17 @@ extern "C"
             rv = CKR_GENERAL_ERROR;
         }
 
-        if( s.get( ) && s->m_Device.get( ) ) {
+        if( s.get( ) && s->m_Device.get( ) && bTransTaken) {
 
             s->m_Device->endTransaction( );
         }
 
-        Log::stop( "C_InitToken" );
-        Log::logCK_RV( "C_InitToken", rv );
-        Log::end( "C_InitToken" );
+		if (Log::s_bEnableLog)
+		{
+			Log::stop( "C_InitToken" );
+			Log::logCK_RV( "C_InitToken", rv );
+			Log::end( "C_InitToken" );
+		}
 
         return rv;
     }
@@ -866,17 +1084,30 @@ extern "C"
     */
     CK_DEFINE_FUNCTION( CK_RV,C_InitPIN )( CK_SESSION_HANDLE hSession, CK_UTF8CHAR_PTR pPin, CK_ULONG ulPinLen ) {
 
+		if (g_bDllUnloading)
+		{
+#ifndef _WIN32
+			Log::log( "C_InitPIN -   return CKR_CRYPTOKI_NOT_INITIALIZED (Library unloading)" );
+#endif
+			return CKR_CRYPTOKI_NOT_INITIALIZED;
+		}
+		
         boost::mutex::scoped_lock lock( io_mutex );
 
         CK_RV rv = CKR_OK;
 
-        Log::begin( "C_InitPIN" );
-        Log::in( "C_InitPIN" );
-        Log::log( "C_InitPIN - hSession <%#02x>", hSession );
-        Log::logCK_UTF8CHAR_PTR( "C_InitPIN - pPin", pPin, ulPinLen );
-        Log::start( );
+		if (Log::s_bEnableLog)
+		{
+			Log::begin( "C_InitPIN" );
+			Log::in( "C_InitPIN" );
+			Log::log( "C_InitPIN - hSession <%#02x>", hSession );
+			Log::log( "C_InitPIN - pPin <%s>", pPin? "Sensitive" : "NULL");
+			Log::log( "C_InitPIN - ulPinLen <%s>", ulPinLen? "Sensitive" : "0");
+			Log::start( );
+		}
 
         boost::shared_ptr< Slot > s;
+		bool bTransTaken = false;
 
         try {
 
@@ -884,13 +1115,13 @@ extern "C"
 
                 rv = CKR_CRYPTOKI_NOT_INITIALIZED;
 
-            } else if( !pPin ||  !ulPinLen ) {
+            } else if( !pPin && ulPinLen ) {
 
                 rv = CKR_ARGUMENTS_BAD;
 
             } else {
 
-                s = g_Application->getSlotFromSession( hSession );
+                s = g_Application.getSlotFromSession( hSession );
 
                 if( s.get( ) && s->m_Device.get( ) ) {
 
@@ -900,12 +1131,16 @@ extern "C"
                     
                     } else {
 
-                        s->m_Device->beginTransaction( );
-                
+                        bTransTaken = s->m_Device->beginTransaction( );
+
                         s->initPIN( hSession, pPin, ulPinLen );
                     }
                 }
             }
+
+        } catch( MiniDriverException& x) {        
+
+            rv = Token::checkException( x );
 
         } catch( PKCS11Exception& x ) {
 
@@ -916,14 +1151,17 @@ extern "C"
             rv = CKR_GENERAL_ERROR;
         }
 
-        if( s.get( ) && s->m_Device.get( ) ) {
+        if( s.get( ) && s->m_Device.get( ) && bTransTaken) {
 
             s->m_Device->endTransaction( );
         }
 
-        Log::stop( "C_InitPIN" );
-        Log::logCK_RV( "C_InitPIN", rv );
-        Log::end( "C_InitPIN" );
+		if (Log::s_bEnableLog)
+		{
+			Log::stop( "C_InitPIN" );
+			Log::logCK_RV( "C_InitPIN", rv );
+			Log::end( "C_InitPIN" );
+		}
 
         return rv;
     }
@@ -940,18 +1178,32 @@ extern "C"
     */
     CK_DEFINE_FUNCTION( CK_RV, C_SetPIN )( CK_SESSION_HANDLE hSession, CK_UTF8CHAR_PTR pOldPin, CK_ULONG ulOldLen, CK_UTF8CHAR_PTR pNewPin, CK_ULONG ulNewLen ) {
 
+		if (g_bDllUnloading)
+		{
+#ifndef _WIN32
+			Log::log( "C_SetPIN -   return CKR_CRYPTOKI_NOT_INITIALIZED (Library unloading)" );
+#endif
+			return CKR_CRYPTOKI_NOT_INITIALIZED;
+		}
+		
         boost::mutex::scoped_lock lock( io_mutex );
 
         CK_RV rv = CKR_OK;
 
-        Log::begin( "C_SetPIN" );
-        Log::in( "C_SetPIN" );
-        Log::log( "C_SetPIN - hSession <%#02x>", hSession );
-        Log::logCK_UTF8CHAR_PTR( "C_SetPIN - pOldPin", pOldPin, ulOldLen );
-        Log::logCK_UTF8CHAR_PTR( "C_SetPIN - pNewPin", pNewPin, ulNewLen );
-        Log::start( );
+		if (Log::s_bEnableLog)
+		{
+			Log::begin( "C_SetPIN" );
+			Log::in( "C_SetPIN" );
+			Log::log( "C_SetPIN - hSession <%#02x>", hSession );
+			Log::log( "C_SetPIN - pOldPin <%s>", pOldPin? "Sensitive" : "NULL");
+			Log::log( "C_SetPIN - ulOldLen <%s>", ulOldLen? "Sensitive" : "0");
+			Log::log( "C_SetPIN - pNewPin <%s>", pNewPin? "Sensitive" : "NULL");
+			Log::log( "C_SetPIN - ulNewLen <%s>", ulNewLen? "Sensitive" : "0");
+			Log::start( );
+		}
 
         boost::shared_ptr< Slot > s;
+		bool bTransTaken = false;
 
         try {
 
@@ -959,13 +1211,13 @@ extern "C"
 
                 rv = CKR_CRYPTOKI_NOT_INITIALIZED;
 
-            } else if( !pOldPin || !ulOldLen || !pNewPin || !ulNewLen ) {
+            } else if( (!pOldPin && ulOldLen) || (!pNewPin && ulNewLen) ) {
 
                 rv = CKR_ARGUMENTS_BAD;
 
             } else {
 
-                s = g_Application->getSlotFromSession( hSession );
+                s = g_Application.getSlotFromSession( hSession );
                
                 if( s.get( ) && s->m_Device.get( ) ) {
 
@@ -975,12 +1227,16 @@ extern "C"
                     
                     } else {
                         
-                        s->m_Device->beginTransaction( );
-               
+                        bTransTaken = s->m_Device->beginTransaction( );
+
                         s->setPIN( hSession, pOldPin, ulOldLen, pNewPin, ulNewLen );
                     }
                 }
             }
+
+        } catch( MiniDriverException& x) {        
+
+            rv = Token::checkException( x );
 
         } catch( PKCS11Exception& x ) {
 
@@ -991,14 +1247,17 @@ extern "C"
             rv = CKR_GENERAL_ERROR;
         }
 
-        if( s.get( ) && s->m_Device.get( ) ) {
+        if( s.get( ) && s->m_Device.get( ) && bTransTaken) {
 
             s->m_Device->endTransaction( );
         }
 
-        Log::stop( "C_SetPIN" );
-        Log::logCK_RV( "C_SetPIN", rv );
-        Log::end( "C_SetPIN" );
+		if (Log::s_bEnableLog)
+		{
+			Log::stop( "C_SetPIN" );
+			Log::logCK_RV( "C_SetPIN", rv );
+			Log::end( "C_SetPIN" );
+		}
 
         return rv;
     }
@@ -1016,20 +1275,32 @@ extern "C"
     */
     CK_DEFINE_FUNCTION( CK_RV, C_OpenSession )( CK_SLOT_ID slotID, CK_FLAGS flags, CK_VOID_PTR pApplication, CK_NOTIFY Notify, CK_SESSION_HANDLE_PTR phSession ) {
 
+		if (g_bDllUnloading)
+		{
+#ifndef _WIN32
+			Log::log( "C_OpenSession -   return CKR_CRYPTOKI_NOT_INITIALIZED (Library unloading)" );
+#endif
+			return CKR_CRYPTOKI_NOT_INITIALIZED;
+		}
+		
         boost::mutex::scoped_lock lock( io_mutex );
 
         CK_RV rv = CKR_OK;
 
-        Log::begin( "C_OpenSession" );
-        Log::in( "C_OpenSession" );
-        Log::log( "C_OpenSession - slotID <%#02x>", slotID );
-        Log::logSessionFlags( "C_OpenSession", flags );
-        Log::log( "C_OpenSession - pApplication <%#02x>", pApplication );
-        Log::log( "C_OpenSession - Notify <%#02x>", Notify );
-        Log::log( "C_OpenSession - phSession <%#02x> (%#02x)", phSession, ( ( NULL_PTR != phSession ) ? *phSession : 0 ) );
-        Log::start( );
+		if (Log::s_bEnableLog)
+		{
+			Log::begin( "C_OpenSession" );
+			Log::in( "C_OpenSession" );
+			Log::log( "C_OpenSession - slotID <%#02x>", slotID );
+			Log::logSessionFlags( "C_OpenSession", flags );
+			Log::log( "C_OpenSession - pApplication <%#02x>", pApplication );
+			Log::log( "C_OpenSession - Notify <%#02x>", Notify );
+			Log::log( "C_OpenSession - phSession <%#02x> (%#02x)", phSession, ( ( NULL_PTR != phSession ) ? *phSession : 0 ) );
+			Log::start( );
+		}
 
         boost::shared_ptr< Slot > s;
+		bool bTransTaken = false;
 
         try {
 
@@ -1049,22 +1320,32 @@ extern "C"
 
             if( CKR_OK == rv ) {
 
-                s = g_Application->getSlot( slotID );
+                s = g_Application.getSlot( slotID );
 
                 if( s.get( ) && s->m_Device.get( ) ) {
 
                     if( !s->getToken( ).get( ) && !s->isTokenInserted( ) ) {
                     
-                        rv = CKR_TOKEN_NOT_PRESENT;
+                        if (s->isVirtual())
+                        {
+                            s.reset();
+                            rv = CKR_SLOT_ID_INVALID;
+                        }
+                        else
+                            rv = CKR_TOKEN_NOT_PRESENT;
                     
                     } else {
                         
-                        s->m_Device->beginTransaction( );
-              
+                        bTransTaken = s->m_Device->beginTransaction( );
+
                         s->openSession( flags, pApplication, Notify, phSession );
                     }
                 }
             }
+
+        } catch( MiniDriverException& x) {        
+
+            rv = Token::checkException( x );
 
         } catch( PKCS11Exception& x ) {
 
@@ -1075,16 +1356,19 @@ extern "C"
             rv = CKR_GENERAL_ERROR;
         }
 
-        if( s.get( ) && s->m_Device.get( ) ) {
+        if( s.get( ) && s->m_Device.get( ) && bTransTaken) {
 
             s->m_Device->endTransaction( );
         }
 
-        Log::stop( "C_OpenSession" );
-        Log::logCK_RV( "C_OpenSession", rv );
-        Log::out( "C_OpenSession" );
-        Log::log( "C_OpenSession - phSession <%#02x> (%ld)", phSession, ( ( NULL_PTR != phSession ) ? *phSession : 0 ) );
-        Log::end( "C_OpenSession" );
+		if (Log::s_bEnableLog)
+		{
+			Log::stop( "C_OpenSession" );
+			Log::logCK_RV( "C_OpenSession", rv );
+			Log::out( "C_OpenSession" );
+			Log::log( "C_OpenSession - phSession <%#02x> (%ld)", phSession, ( ( NULL_PTR != phSession ) ? *phSession : 0 ) );
+			Log::end( "C_OpenSession" );
+		}
 
         return rv;
     }
@@ -1098,16 +1382,28 @@ extern "C"
     */
     CK_DEFINE_FUNCTION( CK_RV, C_CloseSession )( CK_SESSION_HANDLE hSession ) {
 
+		if (g_bDllUnloading)
+		{
+#ifndef _WIN32
+			Log::log( "C_CloseSession -   return CKR_CRYPTOKI_NOT_INITIALIZED (Library unloading)" );
+#endif
+			return CKR_CRYPTOKI_NOT_INITIALIZED;
+		}
+		
         boost::mutex::scoped_lock lock( io_mutex );
 
         CK_RV rv = CKR_OK;
 
-        Log::begin( "C_CloseSession" );
-        Log::in( "C_CloseSession" );
-        Log::log( "C_CloseSession - hSession <%#02x>", hSession );
-        Log::start( );
+		if (Log::s_bEnableLog)
+		{
+			Log::begin( "C_CloseSession" );
+			Log::in( "C_CloseSession" );
+			Log::log( "C_CloseSession - hSession <%#02x>", hSession );
+			Log::start( );
+		}
 
         boost::shared_ptr< Slot > s;
+		bool bTransTaken = false;
 
         try {
 
@@ -1121,22 +1417,31 @@ extern "C"
 
             } else {
 
-                s = g_Application->getSlotFromSession( hSession );
+                s = g_Application.getSlotFromSession( hSession );
 
                 if( s.get( ) && s->m_Device.get( ) ) {
 
                      if( !s->getToken( ).get( ) && !s->isTokenInserted( ) ) { //->getToken( ).get( ) ) {
                     
+                        if (s->isVirtual())
+                        {
+                            s.reset();
+                        }
+
                         rv = CKR_TOKEN_NOT_PRESENT;
                     
                     } else {
                         
-                        s->m_Device->beginTransaction( );
-                
+                        bTransTaken = s->m_Device->beginTransaction( );
+
                         s->closeSession( hSession );
                     }
                 }
             }
+
+        } catch( MiniDriverException& x) {        
+
+            rv = Token::checkException( x );
 
         } catch( PKCS11Exception& x ) {
 
@@ -1147,14 +1452,17 @@ extern "C"
             rv = CKR_GENERAL_ERROR;
         }
 
-        if( s.get( ) && s->m_Device.get( ) ) {
+        if( s.get( ) && s->m_Device.get( ) && bTransTaken) {
 
             s->m_Device->endTransaction( );
         }
 
-        Log::stop( "C_CloseSession" );
-        Log::logCK_RV( "C_CloseSession", rv );
-        Log::end( "C_CloseSession" );
+		if (Log::s_bEnableLog)
+		{
+			Log::stop( "C_CloseSession" );
+			Log::logCK_RV( "C_CloseSession", rv );
+			Log::end( "C_CloseSession" );
+		}
 
         return rv;
     }
@@ -1167,16 +1475,28 @@ extern "C"
     */
     CK_DEFINE_FUNCTION( CK_RV, C_CloseAllSessions )( CK_SLOT_ID slotID ) {
 
+		if (g_bDllUnloading)
+		{
+#ifndef _WIN32
+			Log::log( "C_CloseAllSessions -   return CKR_CRYPTOKI_NOT_INITIALIZED (Library unloading)" );
+#endif
+			return CKR_CRYPTOKI_NOT_INITIALIZED;
+		}
+		
         boost::mutex::scoped_lock lock( io_mutex );
 
         CK_RV rv = CKR_OK;
 
-        Log::begin( "C_CloseAllSessions" );
-        Log::in( "C_CloseAllSessions" );
-        Log::log( "C_CloseAllSessions - slotID <%#02x>", slotID );
-        Log::start( );
+		if (Log::s_bEnableLog)
+		{
+			Log::begin( "C_CloseAllSessions" );
+			Log::in( "C_CloseAllSessions" );
+			Log::log( "C_CloseAllSessions - slotID <%#02x>", slotID );
+			Log::start( );
+		}
 
         boost::shared_ptr< Slot > s;
+		bool bTransTaken = false;
 
         try {
 
@@ -1186,7 +1506,7 @@ extern "C"
 
             } else {
 
-                s = g_Application->getSlot( slotID );
+                s = g_Application.getSlot( slotID );
 
                 if( s.get( ) && s->m_Device.get( ) ) {
 
@@ -1197,12 +1517,22 @@ extern "C"
                     //
                     //} else {
                         
-                        s->m_Device->beginTransaction( );
-                
+                        bTransTaken = s->m_Device->beginTransaction( );
+
                         s->closeAllSessions( );
+
+                        if (s->isVirtual() && (!s->isCardPresent() || s->isTokenRemoved()))
+                        {
+                            s.reset();
+                        }
+
                     //}
                 }
             }
+
+        } catch( MiniDriverException& x) {        
+
+            rv = Token::checkException( x );
 
         } catch( PKCS11Exception& x ) {
 
@@ -1213,14 +1543,17 @@ extern "C"
             rv = CKR_GENERAL_ERROR;
         }
 
-        if( s.get( ) && s->m_Device.get( ) ) {
+        if( s.get( ) && s->m_Device.get( ) && bTransTaken) {
 
             s->m_Device->endTransaction( );
         }
 
-        Log::stop( "C_CloseAllSessions" );
-        Log::logCK_RV( "C_CloseAllSessions", rv );
-        Log::end( "C_CloseAllSessions" );
+		if (Log::s_bEnableLog)
+		{
+			Log::stop( "C_CloseAllSessions" );
+			Log::logCK_RV( "C_CloseAllSessions", rv );
+			Log::end( "C_CloseAllSessions" );
+		}
 
         return rv;
     }
@@ -1234,17 +1567,29 @@ extern "C"
     */
     CK_DEFINE_FUNCTION( CK_RV, C_GetSessionInfo )( CK_SESSION_HANDLE hSession, CK_SESSION_INFO_PTR pInfo ) {
 
+		if (g_bDllUnloading)
+		{
+#ifndef _WIN32
+			Log::log( "C_GetSessionInfo -   return CKR_CRYPTOKI_NOT_INITIALIZED (Library unloading)" );
+#endif
+			return CKR_CRYPTOKI_NOT_INITIALIZED;
+		}
+		
         boost::mutex::scoped_lock lock( io_mutex );
 
         CK_RV rv = CKR_OK;
 
-        Log::begin( "C_GetSessionInfo" );
-        Log::in( "C_GetSessionInfo" );
-        Log::log( "C_GetSessionInfo - hSession <%#02x>", hSession );
-        Log::logCK_SESSION_INFO_PTR( "C_GetSessionInfo", pInfo );
-        Log::start( );
+		if (Log::s_bEnableLog)
+		{
+			Log::begin( "C_GetSessionInfo" );
+			Log::in( "C_GetSessionInfo" );
+			Log::log( "C_GetSessionInfo - hSession <%#02x>", hSession );
+			Log::logCK_SESSION_INFO_PTR( "C_GetSessionInfo", pInfo );
+			Log::start( );
+		}
 
         boost::shared_ptr< Slot > s;
+		bool bTransTaken = false;
 
         try {
 
@@ -1258,22 +1603,31 @@ extern "C"
 
             } else {
 
-                s = g_Application->getSlotFromSession( hSession );
+                s = g_Application.getSlotFromSession( hSession );
 
                 if( s.get( ) && s->m_Device.get( ) ) {
 
-                     if( !s->getToken( ).get( ) && !s->isTokenInserted( ) ) { //->getToken( ).get( ) ) {
+                    if( !s->getToken( ).get( ) && !s->isTokenInserted( ) ) { //->getToken( ).get( ) ) {
                     
-                        rv = CKR_TOKEN_NOT_PRESENT;
+                        s->closeAllSessions();
+                        if (s->isVirtual())
+                        {
+                            s.reset();
+                        }
+                        rv = CKR_SESSION_HANDLE_INVALID;
                     
                     } else {
                         
-                        s->m_Device->beginTransaction( );
+                        bTransTaken = s->m_Device->beginTransaction( );
 
                         s->getSessionInfo( hSession, pInfo );
                     }
                 }
             }
+
+        } catch( MiniDriverException& x) {        
+
+            rv = Token::checkException( x );
 
         } catch( PKCS11Exception& x ) {
 
@@ -1284,16 +1638,19 @@ extern "C"
             rv = CKR_GENERAL_ERROR;
         }
 
-        if( s.get( ) && s->m_Device.get( ) ) {
+        if( s.get( ) && s->m_Device.get( ) && bTransTaken) {
 
             s->m_Device->endTransaction( );
         }
 
-        Log::stop( "C_GetSessionInfo" );
-        Log::logCK_RV( "C_GetSessionInfo", rv );
-        Log::out( "C_GetSessionInfo" );
-        Log::logCK_SESSION_INFO_PTR( "C_GetSessionInfo", pInfo );
-        Log::end( "C_GetSessionInfo" );
+		if (Log::s_bEnableLog)
+		{
+			Log::stop( "C_GetSessionInfo" );
+			Log::logCK_RV( "C_GetSessionInfo", rv );
+			Log::out( "C_GetSessionInfo" );
+			Log::logCK_SESSION_INFO_PTR( "C_GetSessionInfo", pInfo );
+			Log::end( "C_GetSessionInfo" );
+		}
 
         return rv;
     }
@@ -1309,19 +1666,31 @@ extern "C"
     */
     CK_DEFINE_FUNCTION( CK_RV, C_Login )( CK_SESSION_HANDLE hSession, CK_USER_TYPE userType, CK_UTF8CHAR_PTR pPin, CK_ULONG ulPinLen ) {
 
+		if (g_bDllUnloading)
+		{
+#ifndef _WIN32
+			Log::log( "C_Login -   return CKR_CRYPTOKI_NOT_INITIALIZED (Library unloading)" );
+#endif
+			return CKR_CRYPTOKI_NOT_INITIALIZED;
+		}
+		
         boost::mutex::scoped_lock lock( io_mutex );
 
         CK_RV rv = CKR_OK;
 
-        Log::begin( "C_Login" );
-        Log::in( "C_Login" );
-        Log::log( "C_Login - hSession <%#02x>", hSession );
-        Log::logCK_USER_TYPE( "C_Login", userType );
-        Log::logCK_UTF8CHAR_PTR( "C_Login - pPin", pPin, ulPinLen );
-        Log::log( "C_Login - ulPinLen <%ld>", ulPinLen );
-        Log::start( );
+		if( Log::s_bEnableLog )
+		{
+			Log::begin( "C_Login" );
+			Log::in( "C_Login" );
+			Log::log( "C_Login - hSession <%#02x>", hSession );
+			Log::logCK_USER_TYPE( "C_Login", userType );
+			Log::log( "C_Login - pPin <%s>", pPin? "Sensitive" : "NULL");
+			Log::log( "C_Login - ulPinLen <%s>", ulPinLen? "Sensitive" : "0" );
+			Log::start( );
+		}
 
         boost::shared_ptr< Slot > s;
+		bool bTransTaken = false;
 
         try {
 
@@ -1335,7 +1704,7 @@ extern "C"
 
             } else {
 
-                s = g_Application->getSlotFromSession( hSession );
+                s = g_Application.getSlotFromSession( hSession );
 
                 if( s.get( ) && s->m_Device.get( ) ) {
 
@@ -1345,12 +1714,16 @@ extern "C"
                     
                     } else {
                         
-                        s->m_Device->beginTransaction( );
-               
+                        bTransTaken = s->m_Device->beginTransaction( );
+
                         s->login( hSession, userType, pPin, ulPinLen );
                     }
                 }
             }
+
+        } catch( MiniDriverException& x) {        
+
+            rv = Token::checkException( x );
 
         } catch( PKCS11Exception& x ) {
 
@@ -1361,14 +1734,17 @@ extern "C"
             rv = CKR_GENERAL_ERROR;
         }
 
-        if( s.get( ) && s->m_Device.get( ) ) {
+        if( s.get( ) && s->m_Device.get( ) && bTransTaken) {
 
             s->m_Device->endTransaction( );
         }
 
-        Log::stop( "C_Login" );
-        Log::logCK_RV( "C_Login", rv );
-        Log::end( "C_Login" );
+		if( Log::s_bEnableLog )
+		{
+			Log::stop( "C_Login" );
+			Log::logCK_RV( "C_Login", rv );
+			Log::end( "C_Login" );
+		}
 
         return rv;
     }
@@ -1381,16 +1757,28 @@ extern "C"
     */
     CK_DEFINE_FUNCTION( CK_RV, C_Logout )( CK_SESSION_HANDLE hSession ) {
 
+		if (g_bDllUnloading)
+		{
+#ifndef _WIN32
+			Log::log( "C_Logout -   return CKR_CRYPTOKI_NOT_INITIALIZED (Library unloading)" );
+#endif
+			return CKR_CRYPTOKI_NOT_INITIALIZED;
+		}
+		
         boost::mutex::scoped_lock lock( io_mutex );
 
         CK_RV rv = CKR_OK;
 
-        Log::begin( "C_Logout" );
-        Log::in( "C_Logout" );
-        Log::log( "C_Logout - hSession <%#02x>", hSession );
-        Log::start( );
+		if (Log::s_bEnableLog)
+		{
+			Log::begin( "C_Logout" );
+			Log::in( "C_Logout" );
+			Log::log( "C_Logout - hSession <%#02x>", hSession );
+			Log::start( );
+		}
 
         boost::shared_ptr< Slot > s;
+		bool bTransTaken = false;
 
         try {
 
@@ -1400,7 +1788,7 @@ extern "C"
 
             } else {
 
-                s = g_Application->getSlotFromSession( hSession );
+                s = g_Application.getSlotFromSession( hSession );
 
 
                 if( s.get( ) && s->m_Device.get( ) ) {
@@ -1411,12 +1799,16 @@ extern "C"
                     
                     } else {
                         
-                        s->m_Device->beginTransaction( );
-              
+                        bTransTaken = s->m_Device->beginTransaction( );
+
                         s->logout( hSession );
                     }
                 }
             }
+
+        } catch( MiniDriverException& x) {        
+
+            rv = Token::checkException( x );
 
         } catch( PKCS11Exception& x ) {
 
@@ -1427,14 +1819,17 @@ extern "C"
             rv = CKR_GENERAL_ERROR;
         }
 
-        if( s.get( ) && s->m_Device.get( ) ) {
+        if( s.get( ) && s->m_Device.get( ) && bTransTaken) {
 
             s->m_Device->endTransaction( );
         }
 
-        Log::stop( "C_Logout" );
-        Log::logCK_RV( "C_Logout", rv );
-        Log::end( "C_Logout" );
+		if (Log::s_bEnableLog)
+		{
+			Log::stop( "C_Logout" );
+			Log::logCK_RV( "C_Logout", rv );
+			Log::end( "C_Logout" );
+		}
 
         return rv;
     }
@@ -1450,18 +1845,30 @@ extern "C"
     */
     CK_DEFINE_FUNCTION( CK_RV, C_CreateObject )( CK_SESSION_HANDLE hSession, CK_ATTRIBUTE_PTR pTemplate, CK_ULONG ulCount, CK_OBJECT_HANDLE_PTR phObject ) {
 
+		if (g_bDllUnloading)
+		{
+#ifndef _WIN32
+			Log::log( "C_CreateObject -   return CKR_CRYPTOKI_NOT_INITIALIZED (Library unloading)" );
+#endif
+			return CKR_CRYPTOKI_NOT_INITIALIZED;
+		}
+		
         boost::mutex::scoped_lock lock( io_mutex );
 
         CK_RV rv = CKR_OK;
 
-        Log::begin( "C_CreateObject" );
-        Log::in( "C_CreateObject" );
-        Log::log( "C_CreateObject - hSession <%#02x>", hSession );
-        Log::logCK_ATTRIBUTE_PTR( "C_CreateObject", pTemplate, ulCount );
-        Log::log( "C_CreateObject - phObject <%#02x>", phObject );
-        Log::start( );
+		if (Log::s_bEnableLog)
+		{
+			Log::begin( "C_CreateObject" );
+			Log::in( "C_CreateObject" );
+			Log::log( "C_CreateObject - hSession <%#02x>", hSession );
+			Log::logCK_ATTRIBUTE_PTR( "C_CreateObject", pTemplate, ulCount );
+			Log::log( "C_CreateObject - phObject <%#02x>", phObject );
+			Log::start( );
+		}
 
         boost::shared_ptr< Slot > s;
+		bool bTransTaken = false;
 
         try {
 
@@ -1475,7 +1882,7 @@ extern "C"
 
             } else {
 
-                s = g_Application->getSlotFromSession( hSession );
+                s = g_Application.getSlotFromSession( hSession );
 
                 if( s.get( ) && s->m_Device.get( ) ) {
 
@@ -1485,12 +1892,16 @@ extern "C"
                     
                     } else {
                         
-                        s->m_Device->beginTransaction( );
-                
+                        bTransTaken = s->m_Device->beginTransaction( );
+
                         s->createObject( hSession, pTemplate, ulCount, phObject );
                     }
                 }
             }
+
+        } catch( MiniDriverException& x) {        
+
+            rv = Token::checkException( x );
 
         } catch( PKCS11Exception& x ) {
 
@@ -1501,16 +1912,19 @@ extern "C"
             rv = CKR_GENERAL_ERROR;
         }
 
-        if( s.get( ) && s->m_Device.get( ) ) {
+        if( s.get( ) && s->m_Device.get( ) && bTransTaken) {
 
             s->m_Device->endTransaction( );
         }
 
-        Log::stop( "C_CreateObject" );
-        Log::logCK_RV( "C_CreateObject", rv );
-        Log::out( "C_CreateObject" );
-        Log::log( "C_CreateObject - phObject <%#02x> (%#02x)", phObject, ( ( NULL_PTR != phObject ) ? *phObject : 0 ) );
-        Log::end( "C_CreateObject" );
+		if (Log::s_bEnableLog)
+		{
+			Log::stop( "C_CreateObject" );
+			Log::logCK_RV( "C_CreateObject", rv );
+			Log::out( "C_CreateObject" );
+			Log::log( "C_CreateObject - phObject <%#02x> (%#02x)", phObject, ( ( NULL_PTR != phObject ) ? *phObject : 0 ) );
+			Log::end( "C_CreateObject" );
+		}
 
         return rv;
     }
@@ -1525,17 +1939,29 @@ extern "C"
     */
     CK_DEFINE_FUNCTION( CK_RV, C_DestroyObject )( CK_SESSION_HANDLE hSession, CK_OBJECT_HANDLE hObject ) {
 
+		if (g_bDllUnloading)
+		{
+#ifndef _WIN32
+			Log::log( "C_DestroyObject -   return CKR_CRYPTOKI_NOT_INITIALIZED (Library unloading)" );
+#endif
+			return CKR_CRYPTOKI_NOT_INITIALIZED;
+		}
+		
         boost::mutex::scoped_lock lock( io_mutex );
 
         CK_RV rv = CKR_OK;
 
-        Log::begin( "C_DestroyObject" );
-        Log::in( "C_DestroyObject" );
-        Log::log( "C_DestroyObject - hSession <%#02x>", hSession );
-        Log::log( "C_DestroyObject - hObject <%#02x>", hObject );
-        Log::start( );
+		if (Log::s_bEnableLog)
+		{
+			Log::begin( "C_DestroyObject" );
+			Log::in( "C_DestroyObject" );
+			Log::log( "C_DestroyObject - hSession <%#02x>", hSession );
+			Log::log( "C_DestroyObject - hObject <%#02x>", hObject );
+			Log::start( );
+		}
 
         boost::shared_ptr< Slot > s;
+		bool bTransTaken = false;
 
         try {
 
@@ -1545,7 +1971,7 @@ extern "C"
 
             } else {
 
-                s = g_Application->getSlotFromSession( hSession );
+                s = g_Application.getSlotFromSession( hSession );
 
                 if( s.get( ) && s->m_Device.get( ) ) {
 
@@ -1555,12 +1981,16 @@ extern "C"
                     
                     } else {
                         
-                        s->m_Device->beginTransaction( );
-                
+                        bTransTaken = s->m_Device->beginTransaction( );
+
                         s->destroyObject( hSession, hObject );
                     }
                 }
             }
+
+        } catch( MiniDriverException& x) {        
+
+            rv = Token::checkException( x );
 
         } catch( PKCS11Exception& x ) {
 
@@ -1571,14 +2001,17 @@ extern "C"
             rv = CKR_GENERAL_ERROR;
         }
 
-        if( s.get( ) && s->m_Device.get( ) ) {
+        if( s.get( ) && s->m_Device.get( ) && bTransTaken) {
 
             s->m_Device->endTransaction( );
         }
 
-        Log::stop( "C_DestroyObject" );
-        Log::logCK_RV( "C_DestroyObject", rv );
-        Log::end( "C_DestroyObject" );
+		if (Log::s_bEnableLog)
+		{
+			Log::stop( "C_DestroyObject" );
+			Log::logCK_RV( "C_DestroyObject", rv );
+			Log::end( "C_DestroyObject" );
+		}
 
         return rv;
     }
@@ -1595,18 +2028,31 @@ extern "C"
     */
     CK_DEFINE_FUNCTION( CK_RV, C_GetAttributeValue )( CK_SESSION_HANDLE hSession, CK_OBJECT_HANDLE hObject, CK_ATTRIBUTE_PTR pTemplate, CK_ULONG ulCount ) {
 
+		if (g_bDllUnloading)
+		{
+#ifndef _WIN32
+			Log::log( "C_GetAttributeValue -   return CKR_CRYPTOKI_NOT_INITIALIZED (Library unloading)" );
+#endif
+			return CKR_CRYPTOKI_NOT_INITIALIZED;
+		}
+		
         boost::mutex::scoped_lock lock( io_mutex );
 
         CK_RV rv = CKR_OK;
 
-        Log::begin( "C_GetAttributeValue" );
-        Log::in( "C_GetAttributeValue" );
-        Log::log( "C_GetAttributeValue - hSession <%#02x>", hSession );
-        Log::logCK_ATTRIBUTE_PTR( "C_GetAttributeValue", pTemplate, ulCount );
-        Log::log( "C_GetAttributeValue - hObject <%#02x>", hObject );
-        Log::start( );
+		if (Log::s_bEnableLog)
+		{
+			Log::begin( "C_GetAttributeValue" );
+			Log::in( "C_GetAttributeValue" );
+			Log::log( "C_GetAttributeValue - hSession <%#02x>", hSession );
+			//Log::logCK_ATTRIBUTE_PTR( "C_GetAttributeValue", pTemplate, ulCount );
+			Log::log( "C_GetAttributeValue - hObject <%#02x>", hObject );
+			Log::start( );
+		}
 
         boost::shared_ptr< Slot > s;
+		bool bTransTaken = false;
+
         try {
 
             if( !g_isInitialized ) {
@@ -1619,7 +2065,7 @@ extern "C"
 
             } else {
 
-                s = g_Application->getSlotFromSession( hSession );
+                s = g_Application.getSlotFromSession( hSession );
 
                 if( s.get( ) && s->m_Device.get( ) ) {
 
@@ -1629,12 +2075,16 @@ extern "C"
                     
                     } else {
                         
-                        s->m_Device->beginTransaction( );
-                
+                        bTransTaken = s->m_Device->beginTransaction( );
+
                         s->getAttributeValue( hSession, hObject, pTemplate, ulCount );
                     }
                 }
             }
+
+        } catch( MiniDriverException& x) {        
+
+            rv = Token::checkException( x );
 
         } catch( PKCS11Exception& x ) {
 
@@ -1644,16 +2094,19 @@ extern "C"
             rv = CKR_GENERAL_ERROR;
         }
 
-        if( s.get( ) && s->m_Device.get( ) ) {
+        if( s.get( ) && s->m_Device.get( ) && bTransTaken) {
 
             s->m_Device->endTransaction( );
         }
 
-        Log::stop( "C_GetAttributeValue" );
-        Log::logCK_RV( "C_GetAttributeValue", rv );
-        Log::out( "C_GetAttributeValue" );
-        Log::logCK_ATTRIBUTE_PTR( "C_GetAttributeValue", pTemplate, ulCount );
-        Log::end( "C_GetAttributeValue" );
+		if (Log::s_bEnableLog)
+		{
+			Log::stop( "C_GetAttributeValue" );
+			Log::logCK_RV( "C_GetAttributeValue", rv );
+			Log::out( "C_GetAttributeValue" );
+			Log::logCK_ATTRIBUTE_PTR( "C_GetAttributeValue", pTemplate, ulCount );
+			Log::end( "C_GetAttributeValue" );
+		}
 
         return rv;
     }
@@ -1670,18 +2123,30 @@ extern "C"
     */
     CK_DEFINE_FUNCTION( CK_RV, C_SetAttributeValue )( CK_SESSION_HANDLE hSession, CK_OBJECT_HANDLE hObject, CK_ATTRIBUTE_PTR pTemplate, CK_ULONG ulCount ) {
 
+		if (g_bDllUnloading)
+		{
+#ifndef _WIN32
+			Log::log( "C_SetAttributeValue -   return CKR_CRYPTOKI_NOT_INITIALIZED (Library unloading)" );
+#endif
+			return CKR_CRYPTOKI_NOT_INITIALIZED;
+		}
+		
         boost::mutex::scoped_lock lock( io_mutex );
 
         CK_RV rv = CKR_OK;
 
-        Log::begin( "C_SetAttributeValue" );
-        Log::in( "C_SetAttributeValue" );
-        Log::log( "C_SetAttributeValue - hSession <%#02x>", hSession );
-        Log::logCK_ATTRIBUTE_PTR( "C_SetAttributeValue", pTemplate, ulCount );
-        Log::log( "C_SetAttributeValue - hObject <%#02x>", hObject );
-        Log::start( );
+		if (Log::s_bEnableLog)
+		{
+			Log::begin( "C_SetAttributeValue" );
+			Log::in( "C_SetAttributeValue" );
+			Log::log( "C_SetAttributeValue - hSession <%#02x>", hSession );
+			Log::logCK_ATTRIBUTE_PTR( "C_SetAttributeValue", pTemplate, ulCount );
+			Log::log( "C_SetAttributeValue - hObject <%#02x>", hObject );
+			Log::start( );
+		}
 
         boost::shared_ptr< Slot > s;
+		bool bTransTaken = false;
 
         try {
 
@@ -1695,7 +2160,7 @@ extern "C"
 
             } else {
 
-                s = g_Application->getSlotFromSession( hSession );
+                s = g_Application.getSlotFromSession( hSession );
 
                 if( s.get( ) && s->m_Device.get( ) ) {
 
@@ -1705,12 +2170,16 @@ extern "C"
                     
                     } else {
                         
-                        s->m_Device->beginTransaction( );
-               
+                        bTransTaken = s->m_Device->beginTransaction( );
+
                         s->setAttributeValue( hSession, hObject, pTemplate, ulCount );
                     }
                 }
             }
+
+        } catch( MiniDriverException& x) {        
+
+            rv = Token::checkException( x );
 
         } catch( PKCS11Exception& x ) {
 
@@ -1721,14 +2190,17 @@ extern "C"
             rv = CKR_GENERAL_ERROR;
         }
 
-        if( s.get( ) && s->m_Device.get( ) ) {
+        if( s.get( ) && s->m_Device.get( ) && bTransTaken) {
 
             s->m_Device->endTransaction( );
         }
 
-        Log::stop( "C_SetAttributeValue" );
-        Log::logCK_RV( "C_SetAttributeValue", rv );
-        Log::end( "C_SetAttributeValue" );
+		if (Log::s_bEnableLog)
+		{
+			Log::stop( "C_SetAttributeValue" );
+			Log::logCK_RV( "C_SetAttributeValue", rv );
+			Log::end( "C_SetAttributeValue" );
+		}
 
         return rv;
     }
@@ -1744,17 +2216,29 @@ extern "C"
     */
     CK_DEFINE_FUNCTION( CK_RV, C_FindObjectsInit )( CK_SESSION_HANDLE hSession, CK_ATTRIBUTE_PTR pTemplate, CK_ULONG ulCount ) {
 
+		if (g_bDllUnloading)
+		{
+#ifndef _WIN32
+			Log::log( "C_FindObjectsInit -   return CKR_CRYPTOKI_NOT_INITIALIZED (Library unloading)" );
+#endif
+			return CKR_CRYPTOKI_NOT_INITIALIZED;
+		}
+		
         boost::mutex::scoped_lock lock( io_mutex );
 
         CK_RV rv = CKR_OK;
 
-        Log::begin( "C_FindObjectsInit" );
-        Log::in( "C_FindObjectsInit" );
-        Log::log( "C_FindObjectsInit - hSession <%#02x>", hSession );
-        Log::logCK_ATTRIBUTE_PTR( "C_FindObjectsInit", pTemplate, ulCount );
-        Log::start( );
+		if (Log::s_bEnableLog)
+		{
+			Log::begin( "C_FindObjectsInit" );
+			Log::in( "C_FindObjectsInit" );
+			Log::log( "C_FindObjectsInit - hSession <%#02x>", hSession );
+			Log::logCK_ATTRIBUTE_PTR( "C_FindObjectsInit", pTemplate, ulCount );
+			Log::start( );
+		}
 
         boost::shared_ptr< Slot > s;
+		bool bTransTaken = false;
 
         try {
 
@@ -1768,7 +2252,7 @@ extern "C"
 
             } else {
 
-                s = g_Application->getSlotFromSession( hSession );
+                s = g_Application.getSlotFromSession( hSession );
 
                 if( s.get( ) && s->m_Device.get( ) ) {
 
@@ -1778,12 +2262,16 @@ extern "C"
                     
                     } else {
                         
-                        s->m_Device->beginTransaction( );
+                        bTransTaken = s->m_Device->beginTransaction( );
 
                         s->findObjectsInit( hSession, pTemplate, ulCount );
                     }
                 }
             }
+
+        } catch( MiniDriverException& x) {        
+
+            rv = Token::checkException( x );
 
         } catch( PKCS11Exception& x ) {
 
@@ -1794,14 +2282,17 @@ extern "C"
             rv = CKR_GENERAL_ERROR;
         }
 
-        if( s.get( ) && s->m_Device.get( ) ) {
+        if( s.get( ) && s->m_Device.get( ) && bTransTaken) {
 
             s->m_Device->endTransaction( );
         }
 
-        Log::stop( "C_FindObjectsInit" );
-        Log::logCK_RV( "C_FindObjectsInit", rv );
-        Log::end( "C_FindObjectsInit" );
+		if (Log::s_bEnableLog)
+		{
+			Log::stop( "C_FindObjectsInit" );
+			Log::logCK_RV( "C_FindObjectsInit", rv );
+			Log::end( "C_FindObjectsInit" );
+		}
 
         return rv;
     }
@@ -1819,19 +2310,31 @@ extern "C"
     */
     CK_DEFINE_FUNCTION( CK_RV, C_FindObjects )(CK_SESSION_HANDLE hSession, CK_OBJECT_HANDLE_PTR phObject, CK_ULONG ulMaxObjectCount, CK_ULONG_PTR pulObjectCount ) {
 
+		if (g_bDllUnloading)
+		{
+#ifndef _WIN32
+			Log::log( "C_FindObjects -   return CKR_CRYPTOKI_NOT_INITIALIZED (Library unloading)" );
+#endif
+			return CKR_CRYPTOKI_NOT_INITIALIZED;
+		}
+		
         boost::mutex::scoped_lock lock( io_mutex );
 
         CK_RV rv = CKR_OK;
 
-        Log::begin( "C_FindObjects" );
-        Log::in( "C_FindObjects" );
-        Log::log( "C_FindObjects - hSession <%#02x>", hSession );
-        Log::log( "C_FindObjects - phObject <%#02x> (%#02x)", phObject, ( ( NULL_PTR != phObject ) ? *phObject : 0 ) );
-        Log::log( "C_FindObjects - ulMaxObjectCount <%#02x>", ulMaxObjectCount );
-        Log::log( "C_FindObjects - pulObjectCount <%#02x> (%#02x)", pulObjectCount, ( ( NULL_PTR != pulObjectCount ) ? *pulObjectCount : 0 ) );
-        Log::start( );
+		if (Log::s_bEnableLog)
+		{
+			Log::begin( "C_FindObjects" );
+			Log::in( "C_FindObjects" );
+			Log::log( "C_FindObjects - hSession <%#02x>", hSession );
+			Log::log( "C_FindObjects - phObject <%#02x> (%#02x)", phObject, ( ( NULL_PTR != phObject ) ? *phObject : 0 ) );
+			Log::log( "C_FindObjects - ulMaxObjectCount <%#02x>", ulMaxObjectCount );
+			Log::log( "C_FindObjects - pulObjectCount <%#02x> (%#02x)", pulObjectCount, ( ( NULL_PTR != pulObjectCount ) ? *pulObjectCount : 0 ) );
+			Log::start( );
+		}
 
         boost::shared_ptr< Slot > s;
+		bool bTransTaken = false;
 
         try {
 
@@ -1845,7 +2348,7 @@ extern "C"
 
             } else {
 
-                s = g_Application->getSlotFromSession( hSession );
+                s = g_Application.getSlotFromSession( hSession );
 
                 if( s.get( ) && s->m_Device.get( ) ) {
 
@@ -1855,12 +2358,16 @@ extern "C"
                     
                     } else {
                         
-                        s->m_Device->beginTransaction( );
+                        bTransTaken = s->m_Device->beginTransaction( );
 
                         s->findObjects( hSession, phObject, ulMaxObjectCount, pulObjectCount );
                     }
                 }
             }
+
+        } catch( MiniDriverException& x) {        
+
+            rv = Token::checkException( x );
 
         } catch( PKCS11Exception& x ) {
 
@@ -1871,17 +2378,20 @@ extern "C"
             rv = CKR_GENERAL_ERROR;
         }
 
-        if( s.get( ) && s->m_Device.get( ) ) {
+        if( s.get( ) && s->m_Device.get( ) && bTransTaken) {
 
             s->m_Device->endTransaction( );
         }
 
-        Log::stop( "C_FindObjects" );
-        Log::logCK_RV( "C_FindObjects", rv );
-        Log::out( "C_FindObjects" );
-        Log::log( "C_FindObjects - phObject <%#02x> (%#02x)", phObject, ( ( NULL_PTR != phObject ) ? *phObject : 0 ) );
-        Log::log( "C_FindObjects - pulObjectCount <%#02x> (%#02x)", pulObjectCount, ( ( NULL_PTR != pulObjectCount ) ? *pulObjectCount : 0 ) );
-        Log::end( "C_FindObjects" );
+		if (Log::s_bEnableLog)
+		{
+			Log::stop( "C_FindObjects" );
+			Log::logCK_RV( "C_FindObjects", rv );
+			Log::out( "C_FindObjects" );
+			Log::log( "C_FindObjects - phObject <%#02x> (%#02x)", phObject, ( ( NULL_PTR != phObject ) ? *phObject : 0 ) );
+			Log::log( "C_FindObjects - pulObjectCount <%#02x> (%#02x)", pulObjectCount, ( ( NULL_PTR != pulObjectCount ) ? *pulObjectCount : 0 ) );
+			Log::end( "C_FindObjects" );
+		}
 
         return rv;
     }
@@ -1894,16 +2404,28 @@ extern "C"
     */
     CK_DEFINE_FUNCTION( CK_RV, C_FindObjectsFinal )( CK_SESSION_HANDLE hSession ) {
 
+		if (g_bDllUnloading)
+		{
+#ifndef _WIN32
+			Log::log( "C_FindObjectsFinal -   return CKR_CRYPTOKI_NOT_INITIALIZED (Library unloading)" );
+#endif
+			return CKR_CRYPTOKI_NOT_INITIALIZED;
+		}
+		
         boost::mutex::scoped_lock lock( io_mutex );
 
         CK_RV rv = CKR_OK;
 
-        Log::begin( "C_FindObjectsFinal" );
-        Log::in( "C_FindObjectsFinal" );
-        Log::log( "C_FindObjectsFinal - hSession <%#02x>", hSession );
-        Log::start( );
+		if (Log::s_bEnableLog)
+		{
+			Log::begin( "C_FindObjectsFinal" );
+			Log::in( "C_FindObjectsFinal" );
+			Log::log( "C_FindObjectsFinal - hSession <%#02x>", hSession );
+			Log::start( );
+		}
 
         boost::shared_ptr< Slot > s;
+		bool bTransTaken = false;
 
         try {
 
@@ -1913,7 +2435,7 @@ extern "C"
 
             } else {
 
-                s = g_Application->getSlotFromSession( hSession );
+                s = g_Application.getSlotFromSession( hSession );
 
                 if( s.get( ) && s->m_Device.get( ) ) {
 
@@ -1923,12 +2445,16 @@ extern "C"
                     
                     } else {
                         
-                        s->m_Device->beginTransaction( );
-                
+                        bTransTaken = s->m_Device->beginTransaction( );
+
                         s->findObjectsFinal( hSession );
                     }
                 }
             }
+
+        } catch( MiniDriverException& x) {        
+
+            rv = Token::checkException( x );
 
         } catch( PKCS11Exception& x ) {
 
@@ -1939,14 +2465,17 @@ extern "C"
             rv = CKR_GENERAL_ERROR;
         }
 
-        if( s.get( ) && s->m_Device.get( ) ) {
+        if( s.get( ) && s->m_Device.get( ) && bTransTaken) {
 
             s->m_Device->endTransaction( );
         }
 
-        Log::stop( "C_FindObjectsFinal" );
-        Log::logCK_RV( "C_FindObjectsFinal", rv );
-        Log::end( "C_FindObjectsFinal" );
+		if (Log::s_bEnableLog)
+		{
+			Log::stop( "C_FindObjectsFinal" );
+			Log::logCK_RV( "C_FindObjectsFinal", rv );
+			Log::end( "C_FindObjectsFinal" );
+		}
 
         return rv;
     }
@@ -1961,18 +2490,30 @@ extern "C"
     */
     CK_DEFINE_FUNCTION( CK_RV, C_EncryptInit )( CK_SESSION_HANDLE hSession, CK_MECHANISM_PTR pMechanism, CK_OBJECT_HANDLE hKey ) {
 
+		if (g_bDllUnloading)
+		{
+#ifndef _WIN32
+			Log::log( "C_EncryptInit -   return CKR_CRYPTOKI_NOT_INITIALIZED (Library unloading)" );
+#endif
+			return CKR_CRYPTOKI_NOT_INITIALIZED;
+		}
+		
         boost::mutex::scoped_lock lock( io_mutex );
 
         CK_RV rv = CKR_OK;
 
-        Log::begin( "C_EncryptInit" );
-        Log::in( "C_EncryptInit" );
-        Log::log( "C_EncryptInit - hSession <%#02x>", hSession );
-        Log::logCK_MECHANISM_PTR( "C_EncryptInit", pMechanism );
-        Log::log( "C_EncryptInit - hKey <%#02x>", hKey );
-        Log::start( );
+		if (Log::s_bEnableLog)
+		{
+			Log::begin( "C_EncryptInit" );
+			Log::in( "C_EncryptInit" );
+			Log::log( "C_EncryptInit - hSession <%#02x>", hSession );
+			Log::logCK_MECHANISM_PTR( "C_EncryptInit", pMechanism );
+			Log::log( "C_EncryptInit - hKey <%#02x>", hKey );
+			Log::start( );
+		}
 
         boost::shared_ptr< Slot > s;
+		bool bTransTaken = false;
 
         try {
 
@@ -1982,7 +2523,7 @@ extern "C"
 
             } else if( pMechanism ) {
 
-                s = g_Application->getSlotFromSession( hSession );
+                s = g_Application.getSlotFromSession( hSession );
 
                 if( s.get( ) && s->m_Device.get( ) ) {
 
@@ -1992,7 +2533,7 @@ extern "C"
                     
                     } else {
                         
-                        s->m_Device->beginTransaction( );
+                        bTransTaken = s->m_Device->beginTransaction( );
 
                         s->encryptInit( hSession, pMechanism, hKey );
                     }
@@ -2003,6 +2544,10 @@ extern "C"
                 rv = CKR_ARGUMENTS_BAD;
             }
 
+        } catch( MiniDriverException& x) {        
+
+            rv = Token::checkException( x );
+
         } catch( PKCS11Exception& x ) {
 
             rv = x.getError( );
@@ -2012,14 +2557,17 @@ extern "C"
             rv = CKR_GENERAL_ERROR;
         }
 
-        if( s.get( ) && s->m_Device.get( ) ) {
+        if( s.get( ) && s->m_Device.get( ) && bTransTaken) {
 
             s->m_Device->endTransaction( );
         }
 
-        Log::stop( "C_EncryptInit" );
-        Log::logCK_RV( "C_EncryptInit", rv );
-        Log::end( "C_EncryptInit" );
+		if (Log::s_bEnableLog)
+		{
+			Log::stop( "C_EncryptInit" );
+			Log::logCK_RV( "C_EncryptInit", rv );
+			Log::end( "C_EncryptInit" );
+		}
 
         return rv;
     }
@@ -2036,18 +2584,31 @@ extern "C"
     */
     CK_DEFINE_FUNCTION( CK_RV, C_Encrypt )( CK_SESSION_HANDLE hSession, CK_BYTE_PTR pData, CK_ULONG ulDataLen, CK_BYTE_PTR pEncryptedData, CK_ULONG_PTR pulEncryptedDataLen ) {
 
+		if (g_bDllUnloading)
+		{
+#ifndef _WIN32
+			Log::log( "C_Encrypt -   return CKR_CRYPTOKI_NOT_INITIALIZED (Library unloading)" );
+#endif
+			return CKR_CRYPTOKI_NOT_INITIALIZED;
+		}
+		
         boost::mutex::scoped_lock lock( io_mutex );
 
         CK_RV rv = CKR_OK;
 
-        Log::begin( "C_Encrypt" );
-        Log::in( "C_Encrypt" );
-        Log::log( "C_Encrypt - hSession <%#02x>", hSession );
-        Log::logCK_UTF8CHAR_PTR( "C_Encrypt - pData", pData, ulDataLen );
-        Log::logCK_UTF8CHAR_PTR( "C_Encrypt - pEncryptedData", pEncryptedData, (NULL_PTR == pulEncryptedDataLen) ? 0 : *pulEncryptedDataLen );
-        Log::start( );      
+		if (Log::s_bEnableLog)
+		{
+			Log::begin( "C_Encrypt" );
+			Log::in( "C_Encrypt" );
+			Log::log( "C_Encrypt - hSession <%#02x>", hSession );
+			Log::log( "C_Encrypt - pData <%s>", pData? "Sensitive" : "NULL" );
+			Log::log( "C_Encrypt - ulDataLen <%s>", ulDataLen? "Sensitive" : "0" );
+			Log::logCK_UTF8CHAR_PTR( "C_Encrypt - pEncryptedData", pEncryptedData, (NULL_PTR == pulEncryptedDataLen) ? 0 : *pulEncryptedDataLen );
+			Log::start( );      
+		}
 
         boost::shared_ptr< Slot > s;
+		bool bTransTaken = false;
 
         try {
 
@@ -2061,7 +2622,7 @@ extern "C"
 
             } else {
 
-                s = g_Application->getSlotFromSession( hSession );
+                s = g_Application.getSlotFromSession( hSession );
 
                 if( s.get( ) && s->m_Device.get( ) ) {
 
@@ -2071,12 +2632,16 @@ extern "C"
                     
                     } else {
                         
-                        s->m_Device->beginTransaction( );
+                        bTransTaken = s->m_Device->beginTransaction( );
 
                         s->encrypt( hSession, pData, ulDataLen, pEncryptedData, pulEncryptedDataLen );
                     }
                  }
            }
+
+        } catch( MiniDriverException& x) {        
+
+            rv = Token::checkException( x );
 
         } catch( PKCS11Exception& x ) {
 
@@ -2086,16 +2651,19 @@ extern "C"
             rv = CKR_GENERAL_ERROR;
         }
 
-        if( s.get( ) && s->m_Device.get( ) ) {
+        if( s.get( ) && s->m_Device.get( ) && bTransTaken) {
 
             s->m_Device->endTransaction( );
         }
 
-        Log::stop( "C_Encrypt" );
-        Log::logCK_RV( "C_Encrypt", rv );
-        Log::out( "C_Encrypt" );
-        Log::logCK_UTF8CHAR_PTR( "C_Encrypt - pEncryptedData", pEncryptedData, (NULL_PTR == pulEncryptedDataLen) ? 0 : *pulEncryptedDataLen );
-        Log::end( "C_Encrypt" );
+		if (Log::s_bEnableLog)
+		{
+			Log::stop( "C_Encrypt" );
+			Log::logCK_RV( "C_Encrypt", rv );
+			Log::out( "C_Encrypt" );
+			Log::logCK_UTF8CHAR_PTR( "C_Encrypt - pEncryptedData", pEncryptedData, (NULL_PTR == pulEncryptedDataLen) ? 0 : *pulEncryptedDataLen );
+			Log::end( "C_Encrypt" );
+		}
 
         return rv;
     }
@@ -2110,18 +2678,30 @@ extern "C"
     */
     CK_DEFINE_FUNCTION( CK_RV, C_DecryptInit )( CK_SESSION_HANDLE hSession, CK_MECHANISM_PTR pMechanism, CK_OBJECT_HANDLE hKey ) {
 
+		if (g_bDllUnloading)
+		{
+#ifndef _WIN32
+			Log::log( "C_DecryptInit -   return CKR_CRYPTOKI_NOT_INITIALIZED (Library unloading)" );
+#endif
+			return CKR_CRYPTOKI_NOT_INITIALIZED;
+		}
+		
         boost::mutex::scoped_lock lock( io_mutex );
 
         CK_RV rv = CKR_OK;
-
-        Log::begin( "C_DecryptInit" );
-        Log::in( "C_DecryptInit" );
-        Log::log( "C_DecryptInit - hSession <%#02x>", hSession );
-        Log::logCK_MECHANISM_PTR( "C_DecryptInit", pMechanism );
-        Log::log( "C_DecryptInit - hKey <%#02x>", hKey );
-        Log::start( );
+		
+		if (Log::s_bEnableLog)
+		{
+			Log::begin( "C_DecryptInit" );
+			Log::in( "C_DecryptInit" );
+			Log::log( "C_DecryptInit - hSession <%#02x>", hSession );
+			Log::logCK_MECHANISM_PTR( "C_DecryptInit", pMechanism );
+			Log::log( "C_DecryptInit - hKey <%#02x>", hKey );
+			Log::start( );
+		}
 
         boost::shared_ptr< Slot > s;
+		bool bTransTaken = false;
 
         try {
 
@@ -2131,7 +2711,7 @@ extern "C"
 
             } else if( pMechanism ) {
 
-                s = g_Application->getSlotFromSession( hSession );
+                s = g_Application.getSlotFromSession( hSession );
 
                 if( s.get( ) && s->m_Device.get( ) ) {
 
@@ -2141,7 +2721,7 @@ extern "C"
                     
                     } else {
                         
-                        s->m_Device->beginTransaction( );
+                        bTransTaken = s->m_Device->beginTransaction( );
 
                         s->decryptInit( hSession, pMechanism, hKey );
                     }
@@ -2152,6 +2732,10 @@ extern "C"
                 rv = CKR_ARGUMENTS_BAD;
             }
 
+        } catch( MiniDriverException& x) {        
+
+            rv = Token::checkException( x );
+
         } catch( PKCS11Exception& x ) {
 
             rv = x.getError( );
@@ -2161,14 +2745,17 @@ extern "C"
             rv = CKR_GENERAL_ERROR;
         }
 
-        if( s.get( ) && s->m_Device.get( ) ) {
+        if( s.get( ) && s->m_Device.get( ) && bTransTaken) {
 
             s->m_Device->endTransaction( );
         }
 
-        Log::stop( "C_DecryptInit" );
-        Log::logCK_RV( "C_DecryptInit", rv );
-        Log::end( "C_DecryptInit" );
+		if (Log::s_bEnableLog)
+		{
+			Log::stop( "C_DecryptInit" );
+			Log::logCK_RV( "C_DecryptInit", rv );
+			Log::end( "C_DecryptInit" );
+		}
 
         return rv;
     }
@@ -2185,18 +2772,30 @@ extern "C"
     */
     CK_DEFINE_FUNCTION( CK_RV, C_Decrypt )( CK_SESSION_HANDLE hSession, CK_BYTE_PTR pEncryptedData, CK_ULONG ulEncryptedDataLen, CK_BYTE_PTR pData, CK_ULONG_PTR pulDataLen ) {
 
+		if (g_bDllUnloading)
+		{
+#ifndef _WIN32
+			Log::log( "C_Decrypt -   return CKR_CRYPTOKI_NOT_INITIALIZED (Library unloading)" );
+#endif
+			return CKR_CRYPTOKI_NOT_INITIALIZED;
+		}
+		
         boost::mutex::scoped_lock lock( io_mutex );
 
         CK_RV rv = CKR_OK;
 
-        Log::begin( "C_Decrypt" );
-        Log::in( "C_Decrypt" );
-        Log::log( "C_Decrypt - hSession <%#02x>", hSession );
-        Log::logCK_UTF8CHAR_PTR( "C_Decrypt - pEncryptedData", pEncryptedData, ulEncryptedDataLen );
-        Log::logCK_UTF8CHAR_PTR( "C_Decrypt - pData", pData, (NULL_PTR == pulDataLen) ? 0 : *pulDataLen );
-        Log::start( );
+		if (Log::s_bEnableLog)
+		{
+			Log::begin( "C_Decrypt" );
+			Log::in( "C_Decrypt" );
+			Log::log( "C_Decrypt - hSession <%#02x>", hSession );
+			Log::logCK_UTF8CHAR_PTR( "C_Decrypt - pEncryptedData", pEncryptedData, ulEncryptedDataLen );
+			Log::logCK_UTF8CHAR_PTR( "C_Decrypt - pData", pData, (NULL_PTR == pulDataLen) ? 0 : *pulDataLen );
+			Log::start( );
+		}
 
         boost::shared_ptr< Slot > s;
+		bool bTransTaken = false;
 
         try {
 
@@ -2210,7 +2809,7 @@ extern "C"
 
             } else {
 
-                s = g_Application->getSlotFromSession( hSession );
+                s = g_Application.getSlotFromSession( hSession );
 
                 if( s.get( ) && s->m_Device.get( ) ) {
 
@@ -2220,12 +2819,16 @@ extern "C"
                     
                     } else {
                         
-                        s->m_Device->beginTransaction( );
-                
+                        bTransTaken = s->m_Device->beginTransaction( );
+
                         s->decrypt( hSession, pEncryptedData, ulEncryptedDataLen, pData, pulDataLen );
                     }
                 }
             }
+
+        } catch( MiniDriverException& x) {        
+
+            rv = Token::checkException( x );
 
         } catch( PKCS11Exception& x ) {
 
@@ -2236,16 +2839,21 @@ extern "C"
             rv = CKR_GENERAL_ERROR;
         }
 
-        if( s.get( ) && s->m_Device.get( ) ) {
+        if( s.get( ) && s->m_Device.get( ) && bTransTaken) {
 
             s->m_Device->endTransaction( );
         }
 
-        Log::stop( "C_Decrypt" );
-        Log::logCK_RV( "C_Decrypt", rv );
-        Log::out( "C_Decrypt" );
-        Log::logCK_UTF8CHAR_PTR( "C_Decrypt - pData", pData, (NULL_PTR == pulDataLen) ? 0 : *pulDataLen );
-        Log::end( "C_Decrypt" );
+		if (Log::s_bEnableLog)
+		{
+			Log::stop( "C_Decrypt" );
+			Log::logCK_RV( "C_Decrypt", rv );
+			Log::out( "C_Decrypt" );
+			Log::log( "C_Decrypt - pData <%s>", pData? "Sensitive" : "NULL" );
+			if (pulDataLen)
+				Log::log( "C_Decrypt - ulDataLen <%s>", (*pulDataLen)? "Sensitive" : "0" );
+			Log::end( "C_Decrypt" );
+		}
 
         return rv;
     }
@@ -2259,17 +2867,29 @@ extern "C"
     */
     CK_DEFINE_FUNCTION( CK_RV, C_DigestInit )( CK_SESSION_HANDLE hSession, CK_MECHANISM_PTR pMechanism ) {
 
+		if (g_bDllUnloading)
+		{
+#ifndef _WIN32
+			Log::log( "C_DigestInit -   return CKR_CRYPTOKI_NOT_INITIALIZED (Library unloading)" );
+#endif
+			return CKR_CRYPTOKI_NOT_INITIALIZED;
+		}
+		
         boost::mutex::scoped_lock lock( io_mutex );
 
         CK_RV rv = CKR_OK;
 
-        Log::begin( "C_DigestInit" );
-        Log::in( "C_DigestInit" );
-        Log::log( "C_DigestInit - hSession <%#02x>", hSession );
-        Log::logCK_MECHANISM_PTR( "C_DigestInit", pMechanism );
-        Log::start( );
+		if (Log::s_bEnableLog)
+		{
+			Log::begin( "C_DigestInit" );
+			Log::in( "C_DigestInit" );
+			Log::log( "C_DigestInit - hSession <%#02x>", hSession );
+			Log::logCK_MECHANISM_PTR( "C_DigestInit", pMechanism );
+			Log::start( );
+		}
 
         boost::shared_ptr< Slot > s;
+		bool bTransTaken = false;
 
         try {
 
@@ -2283,7 +2903,7 @@ extern "C"
 
             } else {
 
-                s = g_Application->getSlotFromSession( hSession );
+                s = g_Application.getSlotFromSession( hSession );
 
                 if( s.get( ) && s->m_Device.get( ) ) {
 
@@ -2293,12 +2913,16 @@ extern "C"
                     
                     } else {
                         
-                        s->m_Device->beginTransaction( );
-                
+                        bTransTaken = s->m_Device->beginTransaction( );
+
                         s->digestInit( hSession, pMechanism );
                     }
                 }
             }
+
+        } catch( MiniDriverException& x) {        
+
+            rv = Token::checkException( x );
 
         } catch( PKCS11Exception& x ) {
 
@@ -2309,14 +2933,17 @@ extern "C"
             rv = CKR_GENERAL_ERROR;
         }
 
-        if( s.get( ) && s->m_Device.get( ) ) {
+        if( s.get( ) && s->m_Device.get( ) && bTransTaken) {
 
             s->m_Device->endTransaction( );
         }
 
-        Log::stop( "C_DigestInit" );
-        Log::logCK_RV( "C_DigestInit", rv );
-        Log::end( "C_DigestInit" );
+		if (Log::s_bEnableLog)
+		{
+			Log::stop( "C_DigestInit" );
+			Log::logCK_RV( "C_DigestInit", rv );
+			Log::end( "C_DigestInit" );
+		}
 
         return rv;
     }
@@ -2333,18 +2960,30 @@ extern "C"
     */
     CK_DEFINE_FUNCTION( CK_RV, C_Digest )( CK_SESSION_HANDLE hSession, CK_BYTE_PTR pData, CK_ULONG ulDataLen, CK_BYTE_PTR pDigest, CK_ULONG_PTR pulDigestLen ) {
 
+		if (g_bDllUnloading)
+		{
+#ifndef _WIN32
+			Log::log( "C_Digest -   return CKR_CRYPTOKI_NOT_INITIALIZED (Library unloading)" );
+#endif
+			return CKR_CRYPTOKI_NOT_INITIALIZED;
+		}
+		
         boost::mutex::scoped_lock lock( io_mutex );
 
         CK_RV rv = CKR_OK;
 
-        Log::begin( "C_Digest" );
-        Log::in( "C_Digest" );
-        Log::log( "C_Digest - hSession <%#02x>", hSession );
-        Log::logCK_UTF8CHAR_PTR( "C_Digest - pData", pData, ulDataLen );
-        Log::logCK_UTF8CHAR_PTR( "C_Digest - pDigest", pDigest, (NULL_PTR == pulDigestLen) ? 0 : *pulDigestLen );
-        Log::start( );
+		if (Log::s_bEnableLog)
+		{
+			Log::begin( "C_Digest" );
+			Log::in( "C_Digest" );
+			Log::log( "C_Digest - hSession <%#02x>", hSession );
+			Log::logCK_UTF8CHAR_PTR( "C_Digest - pData", pData, ulDataLen );
+			Log::logCK_UTF8CHAR_PTR( "C_Digest - pDigest", pDigest, (NULL_PTR == pulDigestLen) ? 0 : *pulDigestLen );
+			Log::start( );
+		}
 
         boost::shared_ptr< Slot > s;
+		bool bTransTaken = false;
 
         try {
 
@@ -2358,7 +2997,7 @@ extern "C"
 
             } else {
 
-                s = g_Application->getSlotFromSession( hSession );
+                s = g_Application.getSlotFromSession( hSession );
 
                 if( s.get( ) && s->m_Device.get( ) ) {
 
@@ -2368,12 +3007,16 @@ extern "C"
                     
                     } else {
                         
-                        s->m_Device->beginTransaction( );
-                
+                        bTransTaken = s->m_Device->beginTransaction( );
+
                         s->digest( hSession, pData, ulDataLen, pDigest, pulDigestLen );
                     }
                 }
             }
+
+        } catch( MiniDriverException& x) {        
+
+            rv = Token::checkException( x );
 
         } catch( PKCS11Exception& x ) {
 
@@ -2384,16 +3027,19 @@ extern "C"
             rv = CKR_GENERAL_ERROR;
         }
 
-        if( s.get( ) && s->m_Device.get( ) ) {
+        if( s.get( ) && s->m_Device.get( ) && bTransTaken) {
 
             s->m_Device->endTransaction( );
         }
 
-        Log::stop( "C_Digest" );
-        Log::logCK_RV( "C_Digest", rv );
-        Log::out( "C_Digest" );
-        Log::logCK_UTF8CHAR_PTR( "C_Digest - pDigest", pDigest, (NULL_PTR == pulDigestLen) ? 0 : *pulDigestLen );
-        Log::end( "C_Digest" );
+		if (Log::s_bEnableLog)
+		{
+			Log::stop( "C_Digest" );
+			Log::logCK_RV( "C_Digest", rv );
+			Log::out( "C_Digest" );
+			Log::logCK_UTF8CHAR_PTR( "C_Digest - pDigest", pDigest, (NULL_PTR == pulDigestLen) ? 0 : *pulDigestLen );
+			Log::end( "C_Digest" );
+		}
 
         return rv;
     }
@@ -2409,17 +3055,29 @@ extern "C"
     */
     CK_DEFINE_FUNCTION( CK_RV, C_DigestUpdate )( CK_SESSION_HANDLE hSession, CK_BYTE_PTR pPart, CK_ULONG ulPartLen ) {
 
+		if (g_bDllUnloading)
+		{
+#ifndef _WIN32
+			Log::log( "C_DigestUpdate -   return CKR_CRYPTOKI_NOT_INITIALIZED (Library unloading)" );
+#endif
+			return CKR_CRYPTOKI_NOT_INITIALIZED;
+		}
+		
         boost::mutex::scoped_lock lock( io_mutex );
 
         CK_RV rv = CKR_OK;
 
-        Log::begin( "C_DigestUpdate" );
-        Log::in( "C_DigestUpdate" );
-        Log::log( "C_DigestUpdate - hSession <%#02x>", hSession );
-        Log::logCK_UTF8CHAR_PTR( "C_DigestUpdate - pPart", pPart, ulPartLen );
-        Log::start( );
+		if (Log::s_bEnableLog)
+		{
+			Log::begin( "C_DigestUpdate" );
+			Log::in( "C_DigestUpdate" );
+			Log::log( "C_DigestUpdate - hSession <%#02x>", hSession );
+			Log::logCK_UTF8CHAR_PTR( "C_DigestUpdate - pPart", pPart, ulPartLen );
+			Log::start( );
+		}
 
         boost::shared_ptr< Slot > s;
+		bool bTransTaken = false;
 
         try {
 
@@ -2433,7 +3091,7 @@ extern "C"
 
             } else {
 
-                s = g_Application->getSlotFromSession( hSession );
+                s = g_Application.getSlotFromSession( hSession );
 
                 if( s.get( ) && s->m_Device.get( ) ) {
 
@@ -2443,12 +3101,16 @@ extern "C"
                     
                     } else {
                         
-                        s->m_Device->beginTransaction( );
+                        bTransTaken = s->m_Device->beginTransaction( );
 
                         s->digestUpdate( hSession, pPart, ulPartLen );
                     }
                 }
             }
+
+        } catch( MiniDriverException& x) {        
+
+            rv = Token::checkException( x );
 
         } catch( PKCS11Exception& x ) {
 
@@ -2459,14 +3121,17 @@ extern "C"
             rv = CKR_GENERAL_ERROR;
         }
 
-        if( s.get( ) && s->m_Device.get( ) ) {
+        if( s.get( ) && s->m_Device.get( ) && bTransTaken) {
 
             s->m_Device->endTransaction( );
         }
 
-        Log::stop( "C_DigestUpdate" );
-        Log::logCK_RV( "C_DigestUpdate", rv );
-        Log::end( "C_DigestUpdate" );
+		if (Log::s_bEnableLog)
+		{
+			Log::stop( "C_DigestUpdate" );
+			Log::logCK_RV( "C_DigestUpdate", rv );
+			Log::end( "C_DigestUpdate" );
+		}
 
         return rv;
     }
@@ -2483,17 +3148,29 @@ extern "C"
     */
     CK_DEFINE_FUNCTION( CK_RV, C_DigestFinal )( CK_SESSION_HANDLE hSession, CK_BYTE_PTR pDigest, CK_ULONG_PTR pulDigestLen ) {
 
+		if (g_bDllUnloading)
+		{
+#ifndef _WIN32
+			Log::log( "C_DigestFinal -   return CKR_CRYPTOKI_NOT_INITIALIZED (Library unloading)" );
+#endif
+			return CKR_CRYPTOKI_NOT_INITIALIZED;
+		}
+		
         boost::mutex::scoped_lock lock( io_mutex );
 
         CK_RV rv = CKR_OK;
 
-        Log::begin( "C_DigestFinal" );
-        Log::in( "C_DigestFinal" );
-        Log::log( "C_DigestFinal - hSession <%#02x>", hSession );
-        Log::logCK_UTF8CHAR_PTR( "C_DigestFinal - pDigest", pDigest, (NULL_PTR == pulDigestLen) ? 0 : *pulDigestLen );
-        Log::start( );
+		if (Log::s_bEnableLog)
+		{
+			Log::begin( "C_DigestFinal" );
+			Log::in( "C_DigestFinal" );
+			Log::log( "C_DigestFinal - hSession <%#02x>", hSession );
+			Log::logCK_UTF8CHAR_PTR( "C_DigestFinal - pDigest", pDigest, (NULL_PTR == pulDigestLen) ? 0 : *pulDigestLen );
+			Log::start( );
+		}
 
         boost::shared_ptr< Slot > s;
+		bool bTransTaken = false;
 
         try {
 
@@ -2507,7 +3184,7 @@ extern "C"
 
             } else {
 
-                s = g_Application->getSlotFromSession( hSession );
+                s = g_Application.getSlotFromSession( hSession );
 
                 if( s.get( ) && s->m_Device.get( ) ) {
 
@@ -2517,12 +3194,16 @@ extern "C"
                     
                     } else {
                         
-                        s->m_Device->beginTransaction( );
+                        bTransTaken = s->m_Device->beginTransaction( );
 
                         s->digestFinal( hSession, pDigest, pulDigestLen );
                     }
                 }
             }
+
+        } catch( MiniDriverException& x) {        
+
+            rv = Token::checkException( x );
 
         } catch( PKCS11Exception& x ) {
 
@@ -2533,16 +3214,19 @@ extern "C"
             rv = CKR_GENERAL_ERROR;
         }
 
-        if( s.get( ) && s->m_Device.get( ) ) {
+        if( s.get( ) && s->m_Device.get( ) && bTransTaken) {
 
             s->m_Device->endTransaction( );
         }
 
-        Log::stop( "C_DigestFinal" );
-        Log::logCK_RV( "C_DigestFinal", rv );
-        Log::out( "C_DigestFinal" );
-        Log::logCK_UTF8CHAR_PTR( "C_DigestFinal - pDigest", pDigest, (NULL_PTR == pulDigestLen) ? 0 : *pulDigestLen );
-        Log::end( "C_DigestFinal" );
+		if (Log::s_bEnableLog)
+		{
+			Log::stop( "C_DigestFinal" );
+			Log::logCK_RV( "C_DigestFinal", rv );
+			Log::out( "C_DigestFinal" );
+			Log::logCK_UTF8CHAR_PTR( "C_DigestFinal - pDigest", pDigest, (NULL_PTR == pulDigestLen) ? 0 : *pulDigestLen );
+			Log::end( "C_DigestFinal" );
+		}
 
         return rv;
     }
@@ -2560,18 +3244,30 @@ extern "C"
     */
     CK_DEFINE_FUNCTION( CK_RV, C_SignInit )( CK_SESSION_HANDLE hSession, CK_MECHANISM_PTR pMechanism, CK_OBJECT_HANDLE hKey ) {
 
+		if (g_bDllUnloading)
+		{
+#ifndef _WIN32
+			Log::log( "C_SignInit -   return CKR_CRYPTOKI_NOT_INITIALIZED (Library unloading)" );
+#endif
+			return CKR_CRYPTOKI_NOT_INITIALIZED;
+		}
+		
         boost::mutex::scoped_lock lock( io_mutex );
 
         CK_RV rv = CKR_OK;
 
-        Log::begin( "C_SignInit" );
-        Log::in( "C_SignInit" );
-        Log::log( "C_SignInit - hSession <%#02x>", hSession );
-        Log::logCK_MECHANISM_PTR( "C_SignInit", pMechanism );
-        Log::log( "C_SignInit - hKey <%#02x>", hKey );
-        Log::start( );
+		if (Log::s_bEnableLog)
+		{
+			Log::begin( "C_SignInit" );
+			Log::in( "C_SignInit" );
+			Log::log( "C_SignInit - hSession <%#02x>", hSession );
+			Log::logCK_MECHANISM_PTR( "C_SignInit", pMechanism );
+			Log::log( "C_SignInit - hKey <%#02x>", hKey );
+			Log::start( );
+		}
 
         boost::shared_ptr< Slot > s;
+		bool bTransTaken = false;
 
         try {
 
@@ -2585,7 +3281,7 @@ extern "C"
 
             } else {
 
-                s = g_Application->getSlotFromSession( hSession );
+                s = g_Application.getSlotFromSession( hSession );
 
                 if( s.get( ) && s->m_Device.get( ) ) {
 
@@ -2595,12 +3291,16 @@ extern "C"
                     
                     } else {
                         
-                        s->m_Device->beginTransaction( );
+                        bTransTaken = s->m_Device->beginTransaction( );
 
                         s->signInit( hSession, pMechanism, hKey );
                     }
                 }
             }
+
+        } catch( MiniDriverException& x) {        
+
+            rv = Token::checkException( x );
 
         } catch( PKCS11Exception& x ) {
 
@@ -2611,14 +3311,17 @@ extern "C"
             rv = CKR_GENERAL_ERROR;
         }
 
-        if( s.get( ) && s->m_Device.get( ) ) {
+        if( s.get( ) && s->m_Device.get( ) && bTransTaken) {
 
             s->m_Device->endTransaction( );
         }
 
-        Log::stop( "C_SignInit" );
-        Log::logCK_RV( "C_SignInit", rv );
-        Log::end( "C_SignInit" );
+		if (Log::s_bEnableLog)
+		{
+			Log::stop( "C_SignInit" );
+			Log::logCK_RV( "C_SignInit", rv );
+			Log::end( "C_SignInit" );
+		}
 
         return rv;
     }
@@ -2638,18 +3341,30 @@ extern "C"
     */
     CK_DEFINE_FUNCTION( CK_RV, C_Sign )( CK_SESSION_HANDLE hSession, CK_BYTE_PTR pData, CK_ULONG ulDataLen, CK_BYTE_PTR pSignature, CK_ULONG_PTR pulSignatureLen ) {
 
+		if (g_bDllUnloading)
+		{
+#ifndef _WIN32
+			Log::log( "C_Sign -   return CKR_CRYPTOKI_NOT_INITIALIZED (Library unloading)" );
+#endif
+			return CKR_CRYPTOKI_NOT_INITIALIZED;
+		}
+		
         boost::mutex::scoped_lock lock( io_mutex );
 
         CK_RV rv = CKR_OK;
 
-        Log::begin( "C_Sign" );
-        Log::in( "C_Sign" );
-        Log::log( "C_Sign - hSession <%#02x>", hSession );
-        Log::logCK_UTF8CHAR_PTR( "C_Sign - pData", pData, ulDataLen );
-        Log::logCK_UTF8CHAR_PTR( "C_Sign - pSignature", pSignature, (NULL_PTR == pulSignatureLen) ? 0 : *pulSignatureLen );
-        Log::start( );
+		if (Log::s_bEnableLog)
+		{
+			Log::begin( "C_Sign" );
+			Log::in( "C_Sign" );
+			Log::log( "C_Sign - hSession <%#02x>", hSession );
+			Log::logCK_UTF8CHAR_PTR( "C_Sign - pData", pData, ulDataLen );
+			Log::logCK_UTF8CHAR_PTR( "C_Sign - pSignature", pSignature, (NULL_PTR == pulSignatureLen) ? 0 : *pulSignatureLen );
+			Log::start( );
+		}
 
         boost::shared_ptr< Slot > s;
+		bool bTransTaken = false;
 
         try {
 
@@ -2657,13 +3372,13 @@ extern "C"
 
                 rv = CKR_CRYPTOKI_NOT_INITIALIZED;
 
-            } else if( !pData || !ulDataLen || !pulSignatureLen ) {
+            } else if( (ulDataLen > 0 && !pData) || !pulSignatureLen ) {
 
                 rv = CKR_ARGUMENTS_BAD;
 
             } else {
 
-                s = g_Application->getSlotFromSession( hSession );
+                s = g_Application.getSlotFromSession( hSession );
 
                 if( s.get( ) && s->m_Device.get( ) ) {
 
@@ -2673,12 +3388,16 @@ extern "C"
                     
                     } else {
                         
-                        s->m_Device->beginTransaction( );
+                        bTransTaken = s->m_Device->beginTransaction( );
 
                         s->sign( hSession, pData, ulDataLen, pSignature, pulSignatureLen );
                     }
                 }
             }
+
+        } catch( MiniDriverException& x) {        
+
+            rv = Token::checkException( x );
 
         } catch( PKCS11Exception& x ) {
 
@@ -2689,16 +3408,19 @@ extern "C"
             rv = CKR_GENERAL_ERROR;
         }
 
-        if( s.get( ) && s->m_Device.get( ) ) {
+        if( s.get( ) && s->m_Device.get( ) && bTransTaken) {
 
             s->m_Device->endTransaction( );
         }
 
-        Log::stop( "C_Sign" );
-        Log::logCK_RV( "C_Sign", rv );
-        Log::out( "C_Sign" );
-        Log::logCK_UTF8CHAR_PTR( "C_Sign - pSignature", pSignature, (NULL_PTR == pulSignatureLen) ? 0 : *pulSignatureLen );
-        Log::end( "C_Sign" );
+		if (Log::s_bEnableLog)
+		{
+			Log::stop( "C_Sign" );
+			Log::logCK_RV( "C_Sign", rv );
+			Log::out( "C_Sign" );
+			Log::logCK_UTF8CHAR_PTR( "C_Sign - pSignature", pSignature, (NULL_PTR == pulSignatureLen) ? 0 : *pulSignatureLen );
+			Log::end( "C_Sign" );
+		}
         return rv;
     }
 
@@ -2714,17 +3436,29 @@ extern "C"
     */
     CK_DEFINE_FUNCTION( CK_RV, C_SignUpdate )( CK_SESSION_HANDLE hSession, CK_BYTE_PTR pPart, CK_ULONG ulPartLen ) {
 
+		if (g_bDllUnloading)
+		{
+#ifndef _WIN32
+			Log::log( "C_SignUpdate -   return CKR_CRYPTOKI_NOT_INITIALIZED (Library unloading)" );
+#endif
+			return CKR_CRYPTOKI_NOT_INITIALIZED;
+		}
+		
         boost::mutex::scoped_lock lock( io_mutex );
 
         CK_RV rv = CKR_OK;
 
-        Log::begin( "C_SignUpdate" );
-        Log::in( "C_SignUpdate" );
-        Log::log( "C_SignUpdate - hSession <%#02x>", hSession );
-        Log::logCK_UTF8CHAR_PTR( "C_SignUpdate - pPart", pPart, ulPartLen );
-        Log::start( );
+		if (Log::s_bEnableLog)
+		{
+			Log::begin( "C_SignUpdate" );
+			Log::in( "C_SignUpdate" );
+			Log::log( "C_SignUpdate - hSession <%#02x>", hSession );
+			Log::logCK_UTF8CHAR_PTR( "C_SignUpdate - pPart", pPart, ulPartLen );
+			Log::start( );
+		}
 
         boost::shared_ptr< Slot > s;
+		bool bTransTaken = false;
 
         try {
 
@@ -2738,7 +3472,7 @@ extern "C"
 
             } else {
 
-                s = g_Application->getSlotFromSession( hSession );
+                s = g_Application.getSlotFromSession( hSession );
 
                 if( s.get( ) && s->m_Device.get( ) ) {
 
@@ -2748,12 +3482,16 @@ extern "C"
                     
                     } else {
                         
-                        s->m_Device->beginTransaction( );
+                        bTransTaken = s->m_Device->beginTransaction( );
 
                         s->signUpdate( hSession, pPart, ulPartLen );
                     }
                 }
             }
+
+        } catch( MiniDriverException& x) {        
+
+            rv = Token::checkException( x );
 
         } catch( PKCS11Exception& x ) {
 
@@ -2764,14 +3502,17 @@ extern "C"
             rv = CKR_GENERAL_ERROR;
         }
 
-        if( s.get( ) && s->m_Device.get( ) ) {
+        if( s.get( ) && s->m_Device.get( ) && bTransTaken) {
 
             s->m_Device->endTransaction( );
         }
 
-        Log::stop( "C_SignUpdate" );
-        Log::logCK_RV( "C_SignUpdate", rv );
-        Log::end( "C_SignUpdate" );
+		if (Log::s_bEnableLog)
+		{
+			Log::stop( "C_SignUpdate" );
+			Log::logCK_RV( "C_SignUpdate", rv );
+			Log::end( "C_SignUpdate" );
+		}
 
         return rv;
     }
@@ -2787,17 +3528,29 @@ extern "C"
     */
     CK_DEFINE_FUNCTION( CK_RV, C_SignFinal )( CK_SESSION_HANDLE hSession, CK_BYTE_PTR pSignature, CK_ULONG_PTR pulSignatureLen ) {
 
+		if (g_bDllUnloading)
+		{
+#ifndef _WIN32
+			Log::log( "C_SignFinal -   return CKR_CRYPTOKI_NOT_INITIALIZED (Library unloading)" );
+#endif
+			return CKR_CRYPTOKI_NOT_INITIALIZED;
+		}
+		
         boost::mutex::scoped_lock lock( io_mutex );
 
         CK_RV rv = CKR_OK;
 
-        Log::begin( "C_SignFinal" );
-        Log::in( "C_SignFinal" );
-        Log::log( "C_SignFinal - hSession <%#02x>", hSession );
-        Log::logCK_UTF8CHAR_PTR( "C_SignFinal - pSignature", pSignature, (NULL_PTR == pulSignatureLen) ? 0 : *pulSignatureLen );
-        Log::start( );
+		if (Log::s_bEnableLog)
+		{
+			Log::begin( "C_SignFinal" );
+			Log::in( "C_SignFinal" );
+			Log::log( "C_SignFinal - hSession <%#02x>", hSession );
+			Log::logCK_UTF8CHAR_PTR( "C_SignFinal - pSignature", pSignature, (NULL_PTR == pulSignatureLen) ? 0 : *pulSignatureLen );
+			Log::start( );
+		}
 
         boost::shared_ptr< Slot > s;
+		bool bTransTaken = false;
 
         try {
 
@@ -2811,7 +3564,7 @@ extern "C"
 
             } else {
 
-                s = g_Application->getSlotFromSession( hSession );
+                s = g_Application.getSlotFromSession( hSession );
 
                 if( s.get( ) && s->m_Device.get( ) ) {
 
@@ -2821,12 +3574,16 @@ extern "C"
                     
                     } else {
                         
-                        s->m_Device->beginTransaction( );
+                        bTransTaken = s->m_Device->beginTransaction( );
 
                         s->signFinal( hSession, pSignature, pulSignatureLen );
                     }
                 }
             }
+
+        } catch( MiniDriverException& x) {        
+
+            rv = Token::checkException( x );
 
         } catch( PKCS11Exception& x ) {
 
@@ -2837,16 +3594,19 @@ extern "C"
             rv = CKR_GENERAL_ERROR;
         }
 
-        if( s.get( ) && s->m_Device.get( ) ) {
+        if( s.get( ) && s->m_Device.get( ) && bTransTaken) {
 
             s->m_Device->endTransaction( );
         }
 
-        Log::stop( "C_SignFinal" );
-        Log::logCK_RV( "C_SignFinal", rv );
-        Log::out( "C_SignFinal" );
-        Log::logCK_UTF8CHAR_PTR( "C_SignFinal - pSignature", pSignature, (NULL_PTR == pulSignatureLen) ? 0 : *pulSignatureLen );
-        Log::end( "C_SignFinal" );
+		if (Log::s_bEnableLog)
+		{
+			Log::stop( "C_SignFinal" );
+			Log::logCK_RV( "C_SignFinal", rv );
+			Log::out( "C_SignFinal" );
+			Log::logCK_UTF8CHAR_PTR( "C_SignFinal - pSignature", pSignature, (NULL_PTR == pulSignatureLen) ? 0 : *pulSignatureLen );
+			Log::end( "C_SignFinal" );
+		}
 
         return rv;
     }
@@ -2864,18 +3624,30 @@ extern "C"
     */
     CK_DEFINE_FUNCTION( CK_RV, C_VerifyInit )( CK_SESSION_HANDLE hSession, CK_MECHANISM_PTR pMechanism, CK_OBJECT_HANDLE hKey ) {
 
+		if (g_bDllUnloading)
+		{
+#ifndef _WIN32
+			Log::log( "C_VerifyInit -   return CKR_CRYPTOKI_NOT_INITIALIZED (Library unloading)" );
+#endif
+			return CKR_CRYPTOKI_NOT_INITIALIZED;
+		}
+		
         boost::mutex::scoped_lock lock( io_mutex );
 
         CK_RV rv = CKR_OK;
 
-        Log::begin( "C_VerifyInit" );
-        Log::in( "C_VerifyInit" );
-        Log::log( "C_VerifyInit - hSession <%#02x>", hSession );
-        Log::logCK_MECHANISM_PTR( "C_VerifyInit", pMechanism );
-        Log::log( "C_VerifyInit - hKey <%#02x>", hKey );
-        Log::start( );
+		if (Log::s_bEnableLog)
+		{
+			Log::begin( "C_VerifyInit" );
+			Log::in( "C_VerifyInit" );
+			Log::log( "C_VerifyInit - hSession <%#02x>", hSession );
+			Log::logCK_MECHANISM_PTR( "C_VerifyInit", pMechanism );
+			Log::log( "C_VerifyInit - hKey <%#02x>", hKey );
+			Log::start( );
+		}
 
         boost::shared_ptr< Slot > s;
+		bool bTransTaken = false;
 
         try {
 
@@ -2889,7 +3661,7 @@ extern "C"
 
             } else {
 
-                s = g_Application->getSlotFromSession( hSession );
+                s = g_Application.getSlotFromSession( hSession );
 
                 if( s.get( ) && s->m_Device.get( ) ) {
 
@@ -2899,12 +3671,16 @@ extern "C"
                     
                     } else {
                         
-                        s->m_Device->beginTransaction( );
+                        bTransTaken = s->m_Device->beginTransaction( );
 
                         s->verifyInit( hSession, pMechanism, hKey );
                     }
                 }
             }
+
+        } catch( MiniDriverException& x) {        
+
+            rv = Token::checkException( x );
 
         } catch( PKCS11Exception& x ) {
 
@@ -2915,14 +3691,17 @@ extern "C"
             rv = CKR_GENERAL_ERROR;
         }
 
-        if( s.get( ) && s->m_Device.get( ) ) {
+        if( s.get( ) && s->m_Device.get( ) && bTransTaken) {
 
             s->m_Device->endTransaction( );
         }
 
-        Log::stop( "C_VerifyInit" );
-        Log::logCK_RV( "C_VerifyInit", rv );
-        Log::end( "C_VerifyInit" );
+		if (Log::s_bEnableLog)
+		{
+			Log::stop( "C_VerifyInit" );
+			Log::logCK_RV( "C_VerifyInit", rv );
+			Log::end( "C_VerifyInit" );
+		}
 
         return rv;
     }
@@ -2941,18 +3720,30 @@ extern "C"
     */
     CK_DEFINE_FUNCTION( CK_RV, C_Verify )( CK_SESSION_HANDLE hSession, CK_BYTE_PTR pData, CK_ULONG ulDataLen, CK_BYTE_PTR pSignature, CK_ULONG ulSignatureLen ) {
 
+		if (g_bDllUnloading)
+		{
+#ifndef _WIN32
+			Log::log( "C_Verify -   return CKR_CRYPTOKI_NOT_INITIALIZED (Library unloading)" );
+#endif
+			return CKR_CRYPTOKI_NOT_INITIALIZED;
+		}
+		
         boost::mutex::scoped_lock lock( io_mutex );
 
         CK_RV rv = CKR_OK;
 
-        Log::begin( "C_Verify" );
-        Log::in( "C_Verify" );
-        Log::log( "C_Verify - hSession <%#02x>", hSession );
-        Log::logCK_UTF8CHAR_PTR( "C_Verify - pData", pData, ulDataLen );
-        Log::logCK_UTF8CHAR_PTR( "C_Verify - pSignature", pSignature, ulSignatureLen );
-        Log::start( );
+		if (Log::s_bEnableLog)
+		{
+			Log::begin( "C_Verify" );
+			Log::in( "C_Verify" );
+			Log::log( "C_Verify - hSession <%#02x>", hSession );
+			Log::logCK_UTF8CHAR_PTR( "C_Verify - pData", pData, ulDataLen );
+			Log::logCK_UTF8CHAR_PTR( "C_Verify - pSignature", pSignature, ulSignatureLen );
+			Log::start( );
+		}
 
         boost::shared_ptr< Slot > s;
+		bool bTransTaken = false;
 
         try {
 
@@ -2966,7 +3757,7 @@ extern "C"
 
             } else {
 
-                s = g_Application->getSlotFromSession( hSession );
+                s = g_Application.getSlotFromSession( hSession );
 
                 if( s.get( ) && s->m_Device.get( ) ) {
 
@@ -2976,12 +3767,16 @@ extern "C"
                     
                     } else {
                         
-                        s->m_Device->beginTransaction( );
+                        bTransTaken = s->m_Device->beginTransaction( );
 
                         s->verify( hSession, pData, ulDataLen, pSignature, ulSignatureLen );
                     }
                 }
             }
+
+        } catch( MiniDriverException& x) {        
+
+            rv = Token::checkException( x );
 
         } catch( PKCS11Exception& x ) {
 
@@ -2992,16 +3787,19 @@ extern "C"
             rv = CKR_GENERAL_ERROR;
         }
 
-        if( s.get( ) && s->m_Device.get( ) ) {
+        if( s.get( ) && s->m_Device.get( ) && bTransTaken) {
 
             s->m_Device->endTransaction( );
         }
 
-        Log::stop( "C_Verify" );
-        Log::logCK_RV( "C_Verify", rv );
-        Log::out( "C_Verify" );
-        Log::logCK_UTF8CHAR_PTR( "C_Verify - pSignature", pSignature, ulSignatureLen );
-        Log::end( "C_Verify" );
+		if (Log::s_bEnableLog)
+		{
+			Log::stop( "C_Verify" );
+			Log::logCK_RV( "C_Verify", rv );
+			Log::out( "C_Verify" );
+			Log::logCK_UTF8CHAR_PTR( "C_Verify - pSignature", pSignature, ulSignatureLen );
+			Log::end( "C_Verify" );
+		}
 
         return rv;
     }
@@ -3012,17 +3810,29 @@ extern "C"
     * and plaintext cannot be recovered from the signature. */
     CK_DEFINE_FUNCTION( CK_RV, C_VerifyUpdate )( CK_SESSION_HANDLE hSession, CK_BYTE_PTR pPart, CK_ULONG ulPartLen ) {
 
+		if (g_bDllUnloading)
+		{
+#ifndef _WIN32
+			Log::log( "C_VerifyUpdate -   return CKR_CRYPTOKI_NOT_INITIALIZED (Library unloading)" );
+#endif
+			return CKR_CRYPTOKI_NOT_INITIALIZED;
+		}
+		
         boost::mutex::scoped_lock lock( io_mutex );
 
         CK_RV rv = CKR_OK;
 
-        Log::begin( "C_VerifyUpdate" );
-        Log::in( "C_VerifyUpdate" );
-        Log::log( "C_VerifyUpdate - hSession <%#02x>", hSession );
-        Log::logCK_UTF8CHAR_PTR( "C_VerifyUpdate - pPart", pPart, ulPartLen );
-        Log::start( );
+		if (Log::s_bEnableLog)
+		{
+			Log::begin( "C_VerifyUpdate" );
+			Log::in( "C_VerifyUpdate" );
+			Log::log( "C_VerifyUpdate - hSession <%#02x>", hSession );
+			Log::logCK_UTF8CHAR_PTR( "C_VerifyUpdate - pPart", pPart, ulPartLen );
+			Log::start( );
+		}
 
         boost::shared_ptr< Slot > s;
+		bool bTransTaken = false;
 
         try {
 
@@ -3036,7 +3846,7 @@ extern "C"
 
             } else {
 
-                s = g_Application->getSlotFromSession( hSession );
+                s = g_Application.getSlotFromSession( hSession );
 
                 if( s.get( ) && s->m_Device.get( ) ) {
 
@@ -3046,12 +3856,16 @@ extern "C"
                     
                     } else {
                         
-                        s->m_Device->beginTransaction( );
+                        bTransTaken = s->m_Device->beginTransaction( );
 
                         s->verifyUpdate( hSession, pPart, ulPartLen );
                     }
                 }
             }
+
+        } catch( MiniDriverException& x) {        
+
+            rv = Token::checkException( x );
 
         } catch( PKCS11Exception& x ) {
 
@@ -3062,14 +3876,17 @@ extern "C"
             rv = CKR_GENERAL_ERROR;
         }
 
-        if( s.get( ) && s->m_Device.get( ) ) {
+        if( s.get( ) && s->m_Device.get( ) && bTransTaken) {
 
             s->m_Device->endTransaction( );
         }
 
-        Log::stop( "C_VerifyUpdate" );
-        Log::logCK_RV( "C_VerifyUpdate", rv );
-        Log::end( "C_VerifyUpdate" );
+		if (Log::s_bEnableLog)
+		{
+			Log::stop( "C_VerifyUpdate" );
+			Log::logCK_RV( "C_VerifyUpdate", rv );
+			Log::end( "C_VerifyUpdate" );
+		}
 
         return rv;
     }
@@ -3079,17 +3896,29 @@ extern "C"
     * operation, checking the signature. */
     CK_DEFINE_FUNCTION( CK_RV, C_VerifyFinal )( CK_SESSION_HANDLE hSession, CK_BYTE_PTR pSignature, CK_ULONG ulSignatureLen ) {
 
+		if (g_bDllUnloading)
+		{
+#ifndef _WIN32
+			Log::log( "C_VerifyFinal -   return CKR_CRYPTOKI_NOT_INITIALIZED (Library unloading)" );
+#endif
+			return CKR_CRYPTOKI_NOT_INITIALIZED;
+		}
+		
         boost::mutex::scoped_lock lock( io_mutex );
 
         CK_RV rv = CKR_OK;
 
-        Log::begin( "C_VerifyFinal" );
-        Log::in( "C_VerifyFinal" );
-        Log::log( "C_VerifyFinal - hSession <%#02x>", hSession );
-        Log::logCK_UTF8CHAR_PTR( "C_VerifyFinal - pSignature", pSignature, ulSignatureLen );
-        Log::start( );
+		if (Log::s_bEnableLog)
+		{
+			Log::begin( "C_VerifyFinal" );
+			Log::in( "C_VerifyFinal" );
+			Log::log( "C_VerifyFinal - hSession <%#02x>", hSession );
+			Log::logCK_UTF8CHAR_PTR( "C_VerifyFinal - pSignature", pSignature, ulSignatureLen );
+			Log::start( );
+		}
 
         boost::shared_ptr< Slot > s;
+		bool bTransTaken = false;
 
         try {
 
@@ -3103,7 +3932,7 @@ extern "C"
 
             } else {
 
-                s = g_Application->getSlotFromSession( hSession );
+                s = g_Application.getSlotFromSession( hSession );
 
                 if( s.get( ) && s->m_Device.get( ) ) {
 
@@ -3113,12 +3942,16 @@ extern "C"
                     
                     } else {
                         
-                        s->m_Device->beginTransaction( );
+                        bTransTaken = s->m_Device->beginTransaction( );
 
                         s->verifyFinal( hSession, pSignature, ulSignatureLen );
                     }
                 }
             }
+
+        } catch( MiniDriverException& x) {        
+
+            rv = Token::checkException( x );
 
         } catch( PKCS11Exception& x ) {
 
@@ -3129,14 +3962,17 @@ extern "C"
             rv = CKR_GENERAL_ERROR;
         }
 
-        if( s.get( ) && s->m_Device.get( ) ) {
+        if( s.get( ) && s->m_Device.get( ) && bTransTaken) {
 
             s->m_Device->endTransaction( );
         }
 
-        Log::stop( "C_VerifyFinal" );
-        Log::logCK_RV( "C_VerifyFinal", rv );
-        Log::end( "C_VerifyFinal" );
+		if (Log::s_bEnableLog)
+		{
+			Log::stop( "C_VerifyFinal" );
+			Log::logCK_RV( "C_VerifyFinal", rv );
+			Log::end( "C_VerifyFinal" );
+		}
 
         return rv;
     }
@@ -3157,21 +3993,33 @@ extern "C"
     */
     CK_DEFINE_FUNCTION( CK_RV, C_GenerateKeyPair )( CK_SESSION_HANDLE hSession, CK_MECHANISM_PTR pMechanism, CK_ATTRIBUTE_PTR pPublicKeyTemplate, CK_ULONG ulPublicKeyAttributeCount, CK_ATTRIBUTE_PTR pPrivateKeyTemplate, CK_ULONG ulPrivateKeyAttributeCount, CK_OBJECT_HANDLE_PTR phPublicKey, CK_OBJECT_HANDLE_PTR phPrivateKey ) {
 
+		if (g_bDllUnloading)
+		{
+#ifndef _WIN32
+			Log::log( "C_GenerateKeyPair -   return CKR_CRYPTOKI_NOT_INITIALIZED (Library unloading)" );
+#endif
+			return CKR_CRYPTOKI_NOT_INITIALIZED;
+		}
+		
         boost::mutex::scoped_lock lock( io_mutex );
 
         CK_RV rv = CKR_OK;
 
-        Log::begin( "C_GenerateKeyPair" );
-        Log::in( "C_GenerateKeyPair" );
-        Log::log( "C_GenerateKeyPair - hSession <%#02x>", hSession );
-        Log::logCK_MECHANISM_PTR( "C_GenerateKeyPair", pMechanism );
-        Log::logCK_ATTRIBUTE_PTR( "C_GenerateKeyPair", pPublicKeyTemplate, ulPublicKeyAttributeCount );
-        Log::logCK_ATTRIBUTE_PTR( "C_GenerateKeyPair", pPrivateKeyTemplate, ulPrivateKeyAttributeCount );
-        Log::log( "C_GenerateKeyPair - phPublicKey <%#02x>", (phPublicKey == NULL_PTR) ? 0 : *phPublicKey );
-        Log::log( "C_GenerateKeyPair - phPrivateKey <%#02x>", (phPrivateKey == NULL_PTR) ? 0 : *phPrivateKey );
-        Log::start( );
+		if (Log::s_bEnableLog)
+		{
+			Log::begin( "C_GenerateKeyPair" );
+			Log::in( "C_GenerateKeyPair" );
+			Log::log( "C_GenerateKeyPair - hSession <%#02x>", hSession );
+			Log::logCK_MECHANISM_PTR( "C_GenerateKeyPair", pMechanism );
+			Log::logCK_ATTRIBUTE_PTR( "C_GenerateKeyPair", pPublicKeyTemplate, ulPublicKeyAttributeCount );
+			Log::logCK_ATTRIBUTE_PTR( "C_GenerateKeyPair", pPrivateKeyTemplate, ulPrivateKeyAttributeCount );
+			Log::log( "C_GenerateKeyPair - phPublicKey <%#02x>", (phPublicKey == NULL_PTR) ? 0 : *phPublicKey );
+			Log::log( "C_GenerateKeyPair - phPrivateKey <%#02x>", (phPrivateKey == NULL_PTR) ? 0 : *phPrivateKey );
+			Log::start( );
+		}
 
         boost::shared_ptr< Slot > s;
+		bool bTransTaken = false;
 
         try {
 
@@ -3183,14 +4031,14 @@ extern "C"
 
                 rv = CKR_ARGUMENTS_BAD;
 
-            } else if( pMechanism->mechanism != CKM_RSA_PKCS_KEY_PAIR_GEN ) {
+            } else if( pMechanism->mechanism != CKM_RSA_PKCS_KEY_PAIR_GEN && pMechanism->mechanism != CKM_EC_KEY_PAIR_GEN && pMechanism->mechanism != CKM_DH_PKCS_KEY_PAIR_GEN) {
 
                 rv = CKR_MECHANISM_INVALID;
             }
 
             if( CKR_OK == rv ) {
 
-                s = g_Application->getSlotFromSession( hSession );
+                s = g_Application.getSlotFromSession( hSession );
 
                 if( s.get( ) && s->m_Device.get( ) ) {
 
@@ -3200,12 +4048,16 @@ extern "C"
                     
                     } else {
                         
-                        s->m_Device->beginTransaction( );
+                        bTransTaken = s->m_Device->beginTransaction( );
 
                         s->generateKeyPair( hSession, pMechanism, pPublicKeyTemplate, ulPublicKeyAttributeCount, pPrivateKeyTemplate, ulPrivateKeyAttributeCount, phPublicKey, phPrivateKey );
                     }
                 }
             }
+
+        } catch( MiniDriverException& x) {        
+
+            rv = Token::checkException( x );
 
         } catch( PKCS11Exception& x ) {
 
@@ -3216,17 +4068,20 @@ extern "C"
             rv = CKR_GENERAL_ERROR;
         }
 
-        if( s.get( ) && s->m_Device.get( ) ) {
+        if( s.get( ) && s->m_Device.get( ) && bTransTaken) {
 
             s->m_Device->endTransaction( );
         }
 
-        Log::stop( "C_GenerateKeyPair" );
-        Log::logCK_RV( "C_GenerateKeyPair", rv );
-        Log::out( "C_GenerateKeyPair" );
-        Log::log( "C_GenerateKeyPair - phPublicKey <%#02x>", (phPublicKey == NULL_PTR) ? 0 : *phPublicKey );
-        Log::log( "C_GenerateKeyPair - phPrivateKey <%#02x>", (phPrivateKey == NULL_PTR) ? 0 : *phPrivateKey );
-        Log::end( "C_GenerateKeyPair" );
+		if (Log::s_bEnableLog)
+		{
+			Log::stop( "C_GenerateKeyPair" );
+			Log::logCK_RV( "C_GenerateKeyPair", rv );
+			Log::out( "C_GenerateKeyPair" );
+			Log::log( "C_GenerateKeyPair - phPublicKey <%#02x>", (phPublicKey == NULL_PTR) ? 0 : *phPublicKey );
+			Log::log( "C_GenerateKeyPair - phPrivateKey <%#02x>", (phPrivateKey == NULL_PTR) ? 0 : *phPrivateKey );
+			Log::end( "C_GenerateKeyPair" );
+		}
 
         return rv;
     }
@@ -3241,16 +4096,28 @@ extern "C"
     */
     CK_DEFINE_FUNCTION( CK_RV, C_GenerateRandom )( CK_SESSION_HANDLE hSession, CK_BYTE_PTR pRandomData, CK_ULONG ulRandomLen ) {
 
+		if (g_bDllUnloading)
+		{
+#ifndef _WIN32
+			Log::log( "C_GenerateRandom -   return CKR_CRYPTOKI_NOT_INITIALIZED (Library unloading)" );
+#endif
+			return CKR_CRYPTOKI_NOT_INITIALIZED;
+		}
+		
         boost::mutex::scoped_lock lock( io_mutex );
 
         CK_RV rv = CKR_OK;
 
-        Log::begin( "C_GenerateRandom" );
-        Log::in( "C_GenerateRandom" );
-        Log::logCK_UTF8CHAR_PTR( "C_GenerateRandom", pRandomData, ulRandomLen );
-        Log::start( );
+		if (Log::s_bEnableLog)
+		{
+			Log::begin( "C_GenerateRandom" );
+			Log::in( "C_GenerateRandom" );
+			Log::logCK_UTF8CHAR_PTR( "C_GenerateRandom", pRandomData, ulRandomLen );
+			Log::start( );
+		}
 
         boost::shared_ptr< Slot > s;
+		bool bTransTaken = false;
 
         try
         {
@@ -3258,13 +4125,13 @@ extern "C"
 
                 rv = CKR_CRYPTOKI_NOT_INITIALIZED;
 
-            } else if( !pRandomData || !ulRandomLen ) {
+            } else if( !pRandomData && ulRandomLen ) {
 
                 rv = CKR_ARGUMENTS_BAD;
 
             } else {
 
-                s = g_Application->getSlotFromSession( hSession );
+                s = g_Application.getSlotFromSession( hSession );
 
                 if( s.get( ) && s->m_Device.get( ) ) {
 
@@ -3274,12 +4141,17 @@ extern "C"
                     
                     } else {
                         
-                        s->m_Device->beginTransaction( );
+                        bTransTaken = s->m_Device->beginTransaction( );
 
-                        s->generateRandom( hSession, pRandomData, ulRandomLen );
+                        if (ulRandomLen > 0)
+                            s->generateRandom( hSession, pRandomData, ulRandomLen );
                     }
                 }
             }
+
+        } catch( MiniDriverException& x) {        
+
+            rv = Token::checkException( x );
 
         } catch( PKCS11Exception& x ) {
 
@@ -3290,20 +4162,25 @@ extern "C"
             rv = CKR_GENERAL_ERROR;
         }
 
-        if( s.get( ) && s->m_Device.get( ) ) {
+        if( s.get( ) && s->m_Device.get( ) && bTransTaken) {
 
             s->m_Device->endTransaction( );
         }
 
-        Log::stop( "C_GenerateRandom" );
-        Log::logCK_RV( "C_GenerateRandom", rv );
-        Log::out( "C_GenerateRandom" );
-        Log::logCK_UTF8CHAR_PTR( "C_GenerateRandom", pRandomData, ulRandomLen );
-        Log::end( "C_GenerateRandom" );
+		if (Log::s_bEnableLog)
+		{
+			Log::stop( "C_GenerateRandom" );
+			Log::logCK_RV( "C_GenerateRandom", rv );
+			Log::out( "C_GenerateRandom" );
+			Log::logCK_UTF8CHAR_PTR( "C_GenerateRandom", pRandomData, ulRandomLen );
+			Log::end( "C_GenerateRandom" );
+		}
 
         return rv;
     }
 
+
+    //// FUNCTION NOT SUPPORTED ////
 
     /**
     * C_WaitForSlotEvent waits for a slot event (token insertion, removal, etc.) to occur.
@@ -3314,109 +4191,37 @@ extern "C"
     */
     CK_DEFINE_FUNCTION( CK_RV, C_WaitForSlotEvent )( CK_FLAGS flags, CK_SLOT_ID_PTR pSlot, CK_VOID_PTR pReserved ) {
         
-        CK_RV rv = CKR_NO_EVENT;
+		UNREFERENCED_PARAMETER (flags);
+		UNREFERENCED_PARAMETER (pSlot); 
+		UNREFERENCED_PARAMETER (pReserved); 
 
-        Log::begin( "C_WaitForSlotEvent" );
-        Log::in( "C_WaitForSlotEvent" );
-        Log::log( "C_WaitForSlotEvent - flags <%ld> (1:CKF_DONT_BLOCK)", flags );
-        Log::log( "C_WaitForSlotEvent - pSlot <%ld>", *pSlot );
-        Log::log( "C_WaitForSlotEvent - pReserved <%#02x>", pReserved );
+		if (g_bDllUnloading)
+		{
+#ifndef _WIN32
+			Log::log( "C_WaitForSlotEvent - return CKR_CRYPTOKI_NOT_INITIALIZED (Library unloading)" );
+#endif
+			return CKR_CRYPTOKI_NOT_INITIALIZED;
+		}
 
-        // Not Initialized
-        if( !g_isInitialized ) {
+		Log::begin( "C_WaitForSlotEvent" );
 
-            rv = CKR_CRYPTOKI_NOT_INITIALIZED;
-        
-        } else if( pReserved || !pSlot  ) {
+		CK_RV rv = CKR_CRYPTOKI_NOT_INITIALIZED;
+		if( g_isInitialized ) {
 
-            rv = CKR_ARGUMENTS_BAD;
-        
-        } else {
+			rv = CKR_FUNCTION_NOT_SUPPORTED;
+		}
 
-            // Block all other incoming calls to C_WaitForSlotEvent
-            {
-                boost::mutex::scoped_lock lock( io_mutex );
+		if (Log::s_bEnableLog)
+		{
+			Log::logCK_RV( "C_WaitForSlotEvent", rv );
+			Log::end( "C_WaitForSlotEvent" );
+		}
 
-                // Search for a state change into the known slots
-                Application::ARRAY_SLOTS sl = g_Application->getSlotList( );
-            
-                BOOST_FOREACH( const boost::shared_ptr< Slot >& s, sl ) {
-
-                    if( s.get( ) && s->getEvent( ) ) {
-
-                        *pSlot = s->getEventSlotId( );
-
-                        s->setEvent( false, 0xFF );
-
-                        Log::log( "C_WaitForSlotEvent -     slot <%ld>", *pSlot );
-                    
-                        rv = CKR_OK;
-                        
-                        break;
-                    }
-                }
-            }
-
-            if( ( CKR_OK != rv ) && ( CKF_DONT_BLOCK != ( flags & CKF_DONT_BLOCK ) ) ) {
-
-                Log::log( "C_WaitForSlotEvent -     Block until new smart card or reader event..." );
-
-                // Initialize the mutex to block the thread until a slot event arrives
-                boost::unique_lock<boost::mutex> lock( g_WaitForSlotEventMutex );
-
-                // Block and wait
-                g_WaitForSlotEventCondition.wait( lock );
-                Log::log( "WaitForSlotEvent -   Unblocked" );
-
-                if( g_bWaitForSlotEvent ) {
-
-                    // ??? TODO ??? lock this code section to modify the varaible in thread-safe mode
-                    g_bWaitForSlotEvent = false;
-
-                    Log::log( "WaitForSlotEvent -   Received a new event..." );
-
-                    // Block all other incoming calls to C_WaitForSlotEvent
-                    {
-                        boost::mutex::scoped_lock lock2( io_mutex );
-
-                        // Search for a state change into the known slots
-                        Application::ARRAY_SLOTS as = g_Application->getSlotList( );
-
-                        *pSlot = CK_UNAVAILABLE_INFORMATION;
-
-                        BOOST_FOREACH( const boost::shared_ptr< Slot >& s, as ) {
-
-                            if( s.get( ) && s->getEvent( ) ) {
-
-                                *pSlot = s->getEventSlotId( );
-
-                                s->setEvent( false, 0xFF );
-
-                                break;
-                            }
-                        }
-
-                        Log::log( "C_WaitForSlotEvent -     slot (Mode blocked) <%ld>", *pSlot );
-                                 
-                        rv = CKR_OK;
-                    }
-                }
-            }
-        }
-
-        Log::logCK_RV( "C_WaitForSlotEvent", rv );
-        Log::out( "C_WaitForSlotEvent" );
-        Log::log( "C_WaitForSlotEvent - flags <%ld> (1:CKF_DONT_BLOCK)", flags );
-        Log::log( "C_WaitForSlotEvent - pSlot <%ld>", *pSlot );
-        Log::log( "C_WaitForSlotEvent - pReserved <%#02x>", pReserved );
-        Log::end( "C_WaitForSlotEvent" );
-
-        return rv;
+		return rv;
     }
 
 
     //// FUNCTION NOT SUPPORTED ////
-
 
     /**
     * C_GetFunctionStatus is a legacy function; it obtains an
@@ -3427,6 +4232,14 @@ extern "C"
     */
     CK_DEFINE_FUNCTION( CK_RV, C_GetFunctionStatus )( CK_SESSION_HANDLE ) {
 
+		if (g_bDllUnloading)
+		{
+#ifndef _WIN32
+			Log::log( "C_GetFunctionStatus -   return CKR_CRYPTOKI_NOT_INITIALIZED (Library unloading)" );
+#endif
+			return CKR_CRYPTOKI_NOT_INITIALIZED;
+		}
+		
         Log::begin( "C_GetFunctionStatus" );
 
         CK_RV rv = CKR_CRYPTOKI_NOT_INITIALIZED;
@@ -3435,13 +4248,18 @@ extern "C"
             rv = CKR_FUNCTION_NOT_SUPPORTED;
         }
 
-        Log::logCK_RV( "C_GetFunctionStatus", rv );
-        Log::end( "C_GetFunctionStatus" );
+		if (Log::s_bEnableLog)
+		{
+			Log::logCK_RV( "C_GetFunctionStatus", rv );
+			Log::end( "C_GetFunctionStatus" );
+		}
         return rv;
     }
 
 
-    /**
+    //// FUNCTION NOT SUPPORTED ////
+
+	/**
     * C_CancelFunction is a legacy function; it cancels a function
     * running in parallel.
     *
@@ -3449,6 +4267,14 @@ extern "C"
     */
     CK_DEFINE_FUNCTION( CK_RV, C_CancelFunction )( CK_SESSION_HANDLE ) {
 
+		if (g_bDllUnloading)
+		{
+#ifndef _WIN32
+			Log::log( "C_CancelFunction -   return CKR_CRYPTOKI_NOT_INITIALIZED (Library unloading)" );
+#endif
+			return CKR_CRYPTOKI_NOT_INITIALIZED;
+		}
+		
         Log::begin( "C_CancelFunction" );
 
         CK_RV rv = CKR_CRYPTOKI_NOT_INITIALIZED;
@@ -3457,9 +4283,13 @@ extern "C"
             rv = CKR_FUNCTION_NOT_SUPPORTED;
         }
 
-        Log::logCK_RV( "C_CancelFunction", rv );
-        Log::end( "C_CancelFunction" );
-        return rv;
+		if (Log::s_bEnableLog)
+		{
+			Log::logCK_RV( "C_CancelFunction", rv );
+			Log::end( "C_CancelFunction" );
+		}
+
+		return rv;
     }
 
 
@@ -3473,6 +4303,14 @@ extern "C"
     */
     CK_DEFINE_FUNCTION( CK_RV, C_GetOperationState )( CK_SESSION_HANDLE, CK_BYTE_PTR, CK_ULONG_PTR ) {
 
+		if (g_bDllUnloading)
+		{
+#ifndef _WIN32
+			Log::log( "C_GetOperationState -   return CKR_CRYPTOKI_NOT_INITIALIZED (Library unloading)" );
+#endif
+			return CKR_CRYPTOKI_NOT_INITIALIZED;
+		}
+		
         Log::begin( "C_GetOperationState" );
 
         CK_RV rv = CKR_CRYPTOKI_NOT_INITIALIZED;
@@ -3480,8 +4318,11 @@ extern "C"
 
             rv = CKR_FUNCTION_NOT_SUPPORTED;
         }
-        Log::logCK_RV( "C_GetOperationState", rv );
-        Log::end( "C_GetOperationState" );
+		if (Log::s_bEnableLog)
+		{
+			Log::logCK_RV( "C_GetOperationState", rv );
+			Log::end( "C_GetOperationState" );
+		}
         return rv;
     }
 
@@ -3498,6 +4339,14 @@ extern "C"
     */
     CK_DEFINE_FUNCTION( CK_RV, C_SetOperationState )( CK_SESSION_HANDLE, CK_BYTE_PTR, CK_ULONG, CK_OBJECT_HANDLE, CK_OBJECT_HANDLE ) {
 
+		if (g_bDllUnloading)
+		{
+#ifndef _WIN32
+			Log::log( "C_SetOperationState -   return CKR_CRYPTOKI_NOT_INITIALIZED (Library unloading)" );
+#endif
+			return CKR_CRYPTOKI_NOT_INITIALIZED;
+		}
+		
         Log::begin( "C_SetOperationState" );
 
         CK_RV rv = CKR_CRYPTOKI_NOT_INITIALIZED;
@@ -3505,8 +4354,12 @@ extern "C"
 
             rv = CKR_FUNCTION_NOT_SUPPORTED;
         }
-        Log::logCK_RV( "C_SetOperationState", rv );
-        Log::end( "C_SetOperationState" );
+
+		if (Log::s_bEnableLog)
+		{
+			Log::logCK_RV( "C_SetOperationState", rv );
+			Log::end( "C_SetOperationState" );
+		}
         return rv;
     }
 
@@ -3523,6 +4376,14 @@ extern "C"
     */
     CK_DEFINE_FUNCTION( CK_RV, C_WrapKey )( CK_SESSION_HANDLE, CK_MECHANISM_PTR, CK_OBJECT_HANDLE, CK_OBJECT_HANDLE, CK_BYTE_PTR, CK_ULONG_PTR ) {
 
+		if (g_bDllUnloading)
+		{
+#ifndef _WIN32
+			Log::log( "C_WrapKey -   return CKR_CRYPTOKI_NOT_INITIALIZED (Library unloading)" );
+#endif
+			return CKR_CRYPTOKI_NOT_INITIALIZED;
+		}
+		
         Log::begin( "C_WrapKey" );
 
         CK_RV rv = CKR_CRYPTOKI_NOT_INITIALIZED;
@@ -3531,8 +4392,11 @@ extern "C"
             rv = CKR_FUNCTION_NOT_SUPPORTED;
         }
 
-        Log::logCK_RV( "C_WrapKey", rv );
-        Log::end( "C_WrapKey" );
+		if (Log::s_bEnableLog)
+		{
+			Log::logCK_RV( "C_WrapKey", rv );
+			Log::end( "C_WrapKey" );
+		}
         return rv;
     }
 
@@ -3552,7 +4416,16 @@ extern "C"
     *
     */
     CK_DEFINE_FUNCTION( CK_RV,C_UnwrapKey )(CK_SESSION_HANDLE, CK_MECHANISM_PTR, CK_OBJECT_HANDLE, CK_BYTE_PTR, CK_ULONG, CK_ATTRIBUTE_PTR, CK_ULONG, CK_OBJECT_HANDLE_PTR ) {
-        Log::begin( "C_UnwrapKey" );
+        
+		if (g_bDllUnloading)
+		{
+#ifndef _WIN32
+			Log::log( "C_UnwrapKey -   return CKR_CRYPTOKI_NOT_INITIALIZED (Library unloading)" );
+#endif
+			return CKR_CRYPTOKI_NOT_INITIALIZED;
+		}
+		
+		Log::begin( "C_UnwrapKey" );
 
         CK_RV rv = CKR_CRYPTOKI_NOT_INITIALIZED;
         if( g_isInitialized ) {
@@ -3560,8 +4433,11 @@ extern "C"
             rv = CKR_FUNCTION_NOT_SUPPORTED;
         }
 
-        Log::logCK_RV( "C_UnwrapKey", rv );
-        Log::end( "C_UnwrapKey" );
+		if (Log::s_bEnableLog)
+		{
+			Log::logCK_RV( "C_UnwrapKey", rv );
+			Log::end( "C_UnwrapKey" );
+		}
         return rv;
     }
 
@@ -3578,18 +4454,94 @@ extern "C"
     * @param phKey                 gets new handle
     *
     */
-    CK_DEFINE_FUNCTION( CK_RV, C_DeriveKey )( CK_SESSION_HANDLE, CK_MECHANISM_PTR, CK_OBJECT_HANDLE, CK_ATTRIBUTE_PTR, CK_ULONG, CK_OBJECT_HANDLE_PTR ) {
+    CK_DEFINE_FUNCTION( CK_RV, C_DeriveKey )( CK_SESSION_HANDLE hSession, CK_MECHANISM_PTR pMechanism, CK_OBJECT_HANDLE hBaseKey, CK_ATTRIBUTE_PTR pTemplate, CK_ULONG ulAttributeCount, CK_OBJECT_HANDLE_PTR phKey) {
 
-        Log::begin( "C_DeriveKey" );
+		if (g_bDllUnloading)
+		{
+#ifndef _WIN32
+			Log::log( "C_DeriveKey -   return CKR_CRYPTOKI_NOT_INITIALIZED (Library unloading)" );
+#endif
+			return CKR_CRYPTOKI_NOT_INITIALIZED;
+		}
+		
+        boost::mutex::scoped_lock lock( io_mutex );
 
-        CK_RV rv = CKR_CRYPTOKI_NOT_INITIALIZED;
-        if( g_isInitialized ) {
+        CK_RV rv = CKR_OK;
+		if (Log::s_bEnableLog)
+		{
+			Log::begin( "C_DeriveKey" );
+			Log::in( "C_DeriveKey" );
+			Log::log( "C_DeriveKey - hSession <%#02x>", hSession );
+			Log::logCK_MECHANISM_PTR( "C_DeriveKey", pMechanism );
+            Log::log( "C_DeriveKey - hBaseKey <%#02x>", hBaseKey );
+            Log::logCK_ATTRIBUTE_PTR( "C_DeriveKey", pTemplate, ulAttributeCount );
+			Log::log( "C_DeriveKey - phKey <%#02x>", (phKey == NULL_PTR) ? 0 : *phKey );
+			Log::start( );
+		}
 
-            rv = CKR_FUNCTION_NOT_SUPPORTED;
+        boost::shared_ptr< Slot > s;
+		bool bTransTaken = false;
+
+        try {
+
+            if( !g_isInitialized ) {
+
+                rv = CKR_CRYPTOKI_NOT_INITIALIZED;
+
+            } else if( !pMechanism || !pTemplate || !ulAttributeCount || !phKey ) {
+
+                rv = CKR_ARGUMENTS_BAD;
+
+            } else if( pMechanism->mechanism != CKM_ECDH1_DERIVE) {
+
+                rv = CKR_MECHANISM_INVALID;
+            }
+
+            if( CKR_OK == rv ) {
+
+                s = g_Application.getSlotFromSession( hSession );
+
+                if( s.get( ) && s->m_Device.get( ) ) {
+
+                     if( !s->getToken( ).get( ) && !s->isTokenInserted( ) ) { //->getToken( ).get( ) ) {
+                    
+                        rv = CKR_TOKEN_NOT_PRESENT;
+                    
+                    } else {
+                        
+                        bTransTaken = s->m_Device->beginTransaction( );
+
+                        s->deriveKey( hSession, pMechanism, hBaseKey, pTemplate, ulAttributeCount, phKey );
+                    }
+                }
+            }
+
+        } catch( MiniDriverException& x) {        
+
+            rv = Token::checkException( x );
+
+        } catch( PKCS11Exception& x ) {
+
+            rv = x.getError( );
+
+        } catch( ... ) {
+
+            rv = CKR_GENERAL_ERROR;
         }
 
-        Log::logCK_RV( "C_DeriveKey", rv );
-        Log::end( "C_DeriveKey" );
+        if( s.get( ) && s->m_Device.get( ) && bTransTaken) {
+
+            s->m_Device->endTransaction( );
+        }
+
+		if (Log::s_bEnableLog)
+		{
+			Log::stop( "C_DeriveKey" );
+			Log::logCK_RV( "C_DeriveKey", rv );
+			Log::out( "C_DeriveKey" );
+			Log::log( "C_DeriveKey - phKey <%#02x>", (phKey == NULL_PTR) ? 0 : *phKey );
+			Log::end( "C_DeriveKey" );
+		}
         return rv;
     }
 
@@ -3604,6 +4556,14 @@ extern "C"
     */
     CK_DEFINE_FUNCTION( CK_RV,C_SeedRandom )( CK_SESSION_HANDLE, CK_BYTE_PTR, CK_ULONG ) {
 
+		if (g_bDllUnloading)
+		{
+#ifndef _WIN32
+			Log::log( "C_SeedRandom -   return CKR_CRYPTOKI_NOT_INITIALIZED (Library unloading)" );
+#endif
+			return CKR_CRYPTOKI_NOT_INITIALIZED;
+		}
+		
         Log::begin( "C_SeedRandom" );
 
         CK_RV rv = CKR_CRYPTOKI_NOT_INITIALIZED;
@@ -3612,8 +4572,11 @@ extern "C"
             rv = CKR_RANDOM_SEED_NOT_SUPPORTED;
         }
 
-        Log::logCK_RV( "C_SeedRandom", rv );
-        Log::end( "C_SeedRandom" );
+		if (Log::s_bEnableLog)
+		{
+			Log::logCK_RV( "C_SeedRandom", rv );
+			Log::end( "C_SeedRandom" );
+		}
         return rv;
     }
 
@@ -3621,6 +4584,14 @@ extern "C"
     /* C_VerifyRecoverInit initializes a signature verification operation, where the data is recovered from the signature. */
     CK_DEFINE_FUNCTION( CK_RV, C_VerifyRecoverInit )( CK_SESSION_HANDLE, CK_MECHANISM_PTR, CK_OBJECT_HANDLE ) {
 
+		if (g_bDllUnloading)
+		{
+#ifndef _WIN32
+			Log::log( "C_VerifyRecoverInit -   return CKR_CRYPTOKI_NOT_INITIALIZED (Library unloading)" );
+#endif
+			return CKR_CRYPTOKI_NOT_INITIALIZED;
+		}
+		
         Log::begin( "C_VerifyRecoverInit" );
 
         CK_RV rv = CKR_CRYPTOKI_NOT_INITIALIZED;
@@ -3629,8 +4600,11 @@ extern "C"
             rv = CKR_FUNCTION_NOT_SUPPORTED;
         }
 
-        Log::logCK_RV( "C_VerifyRecoverInit", rv );
-        Log::end( "C_VerifyRecoverInit" );
+		if (Log::s_bEnableLog)
+		{
+			Log::logCK_RV( "C_VerifyRecoverInit", rv );
+			Log::end( "C_VerifyRecoverInit" );
+		}
         return rv;
     }
 
@@ -3639,6 +4613,14 @@ extern "C"
     * operation, where the data is recovered from the signature. */
     CK_DEFINE_FUNCTION( CK_RV, C_VerifyRecover )( CK_SESSION_HANDLE, CK_BYTE_PTR, CK_ULONG, CK_BYTE_PTR, CK_ULONG_PTR ) {
 
+		if (g_bDllUnloading)
+		{
+#ifndef _WIN32
+			Log::log( "C_VerifyRecover -   return CKR_CRYPTOKI_NOT_INITIALIZED (Library unloading)" );
+#endif
+			return CKR_CRYPTOKI_NOT_INITIALIZED;
+		}
+		
         Log::begin( "C_VerifyRecover" );
 
         CK_RV rv = CKR_CRYPTOKI_NOT_INITIALIZED;
@@ -3647,8 +4629,11 @@ extern "C"
             rv = CKR_FUNCTION_NOT_SUPPORTED;
         }
 
-        Log::logCK_RV( "C_VerifyRecover", rv );
-        Log::end( "C_VerifyRecover" );
+		if (Log::s_bEnableLog)
+		{
+			Log::logCK_RV( "C_VerifyRecover", rv );
+			Log::end( "C_VerifyRecover" );
+		}
         return rv;
     }
 
@@ -3656,6 +4641,14 @@ extern "C"
     /* C_DigestEncryptUpdate continues a multiple-part digesting and encryption operation. */
     CK_DEFINE_FUNCTION( CK_RV, C_DigestEncryptUpdate )( CK_SESSION_HANDLE, CK_BYTE_PTR, CK_ULONG, CK_BYTE_PTR, CK_ULONG_PTR ) {
 
+		if (g_bDllUnloading)
+		{
+#ifndef _WIN32
+			Log::log( "C_DigestEncryptUpdate -   return CKR_CRYPTOKI_NOT_INITIALIZED (Library unloading)" );
+#endif
+			return CKR_CRYPTOKI_NOT_INITIALIZED;
+		}
+		
         Log::begin( "C_DigestEncryptUpdate" );
 
         CK_RV rv = CKR_CRYPTOKI_NOT_INITIALIZED;
@@ -3664,8 +4657,11 @@ extern "C"
             rv = CKR_FUNCTION_NOT_SUPPORTED;
         }
 
-        Log::logCK_RV( "C_DigestEncryptUpdate", rv );
-        Log::end( "C_DigestEncryptUpdate" );
+		if (Log::s_bEnableLog)
+		{
+			Log::logCK_RV( "C_DigestEncryptUpdate", rv );
+			Log::end( "C_DigestEncryptUpdate" );
+		}
         return rv;
     }
 
@@ -3673,6 +4669,14 @@ extern "C"
     /* C_DecryptDigestUpdate continues a multiple-part decryption and digesting operation. */
     CK_DEFINE_FUNCTION( CK_RV, C_DecryptDigestUpdate )( CK_SESSION_HANDLE, CK_BYTE_PTR, CK_ULONG, CK_BYTE_PTR, CK_ULONG_PTR ) {
 
+		if (g_bDllUnloading)
+		{
+#ifndef _WIN32
+			Log::log( "C_DecryptDigestUpdate -   return CKR_CRYPTOKI_NOT_INITIALIZED (Library unloading)" );
+#endif
+			return CKR_CRYPTOKI_NOT_INITIALIZED;
+		}
+		
         Log::begin( "C_DecryptDigestUpdate" );
 
         CK_RV rv = CKR_CRYPTOKI_NOT_INITIALIZED;
@@ -3681,8 +4685,11 @@ extern "C"
             rv = CKR_FUNCTION_NOT_SUPPORTED;
         }
 
-        Log::logCK_RV( "C_DecryptDigestUpdate", rv );
-        Log::end( "C_DecryptDigestUpdate" );
+		if (Log::s_bEnableLog)
+		{
+			Log::logCK_RV( "C_DecryptDigestUpdate", rv );
+			Log::end( "C_DecryptDigestUpdate" );
+		}
         return rv;
     }
 
@@ -3690,6 +4697,14 @@ extern "C"
     /* C_SignEncryptUpdate continues a multiple-part signing and encryption operation. */
     CK_DEFINE_FUNCTION( CK_RV, C_SignEncryptUpdate )( CK_SESSION_HANDLE, CK_BYTE_PTR, CK_ULONG, CK_BYTE_PTR, CK_ULONG_PTR ) {
 
+		if (g_bDllUnloading)
+		{
+#ifndef _WIN32
+			Log::log( "C_SignEncryptUpdate -   return CKR_CRYPTOKI_NOT_INITIALIZED (Library unloading)" );
+#endif
+			return CKR_CRYPTOKI_NOT_INITIALIZED;
+		}
+		
         Log::begin( "C_SignEncryptUpdate" );
 
         CK_RV rv = CKR_CRYPTOKI_NOT_INITIALIZED;
@@ -3698,8 +4713,11 @@ extern "C"
             rv = CKR_FUNCTION_NOT_SUPPORTED;
         }
 
-        Log::logCK_RV( "C_SignEncryptUpdate", rv );
-        Log::end( "C_SignEncryptUpdate" );
+		if (Log::s_bEnableLog)
+		{
+			Log::logCK_RV( "C_SignEncryptUpdate", rv );
+			Log::end( "C_SignEncryptUpdate" );
+		}
         return rv;
     }
 
@@ -3708,6 +4726,14 @@ extern "C"
     * C_DecryptVerifyUpdate continues a multiple-part decryption and verify operation. */
     CK_DEFINE_FUNCTION( CK_RV, C_DecryptVerifyUpdate )( CK_SESSION_HANDLE, CK_BYTE_PTR, CK_ULONG, CK_BYTE_PTR , CK_ULONG_PTR ) {
 
+		if (g_bDllUnloading)
+		{
+#ifndef _WIN32
+			Log::log( "C_DecryptVerifyUpdate -   return CKR_CRYPTOKI_NOT_INITIALIZED (Library unloading)" );
+#endif
+			return CKR_CRYPTOKI_NOT_INITIALIZED;
+		}
+		
         Log::begin( "C_DecryptVerifyUpdate" );
 
         CK_RV rv = CKR_CRYPTOKI_NOT_INITIALIZED;
@@ -3716,8 +4742,11 @@ extern "C"
             rv = CKR_FUNCTION_NOT_SUPPORTED;
         }
 
-        Log::logCK_RV( "C_DecryptVerifyUpdate", rv );
-        Log::end( "C_DecryptVerifyUpdate" );
+		if (Log::s_bEnableLog)
+		{
+			Log::logCK_RV( "C_DecryptVerifyUpdate", rv );
+			Log::end( "C_DecryptVerifyUpdate" );
+		}
         return rv;
     }
 
@@ -3733,6 +4762,14 @@ extern "C"
     */
     CK_DEFINE_FUNCTION( CK_RV, C_GenerateKey )( CK_SESSION_HANDLE, CK_MECHANISM_PTR, CK_ATTRIBUTE_PTR, CK_ULONG, CK_OBJECT_HANDLE_PTR ) {
 
+		if (g_bDllUnloading)
+		{
+#ifndef _WIN32
+			Log::log( "C_GenerateKey -   return CKR_CRYPTOKI_NOT_INITIALIZED (Library unloading)" );
+#endif
+			return CKR_CRYPTOKI_NOT_INITIALIZED;
+		}
+		
         Log::begin( "C_GenerateKey" );
 
         CK_RV rv = CKR_CRYPTOKI_NOT_INITIALIZED;
@@ -3741,14 +4778,25 @@ extern "C"
             rv = CKR_FUNCTION_NOT_SUPPORTED;
         }
 
-        Log::logCK_RV( "C_GenerateKey", rv );
-        Log::end( "C_GenerateKey" );
+		if (Log::s_bEnableLog)
+		{
+			Log::logCK_RV( "C_GenerateKey", rv );
+			Log::end( "C_GenerateKey" );
+		}
         return rv;
     }
 
     /* C_SignRecoverInit initializes a signature operation, where the data can be recovered from the signature. */
     CK_DEFINE_FUNCTION( CK_RV, C_SignRecoverInit )( CK_SESSION_HANDLE, CK_MECHANISM_PTR, CK_OBJECT_HANDLE ) {
 
+		if (g_bDllUnloading)
+		{
+#ifndef _WIN32
+			Log::log( "C_SignRecoverInit -   return CKR_CRYPTOKI_NOT_INITIALIZED (Library unloading)" );
+#endif
+			return CKR_CRYPTOKI_NOT_INITIALIZED;
+		}
+		
         Log::begin( "C_SignRecoverInit" );
 
         CK_RV rv = CKR_CRYPTOKI_NOT_INITIALIZED;
@@ -3757,8 +4805,11 @@ extern "C"
             rv = CKR_FUNCTION_NOT_SUPPORTED;
         }
 
-        Log::logCK_RV( "C_SignRecoverInit", rv );
-        Log::end( "C_SignRecoverInit" );
+		if (Log::s_bEnableLog)
+		{
+			Log::logCK_RV( "C_SignRecoverInit", rv );
+			Log::end( "C_SignRecoverInit" );
+		}
         return rv;
     }
 
@@ -3766,6 +4817,14 @@ extern "C"
     /* C_SignRecover signs data in a single operation, where the data can be recovered from the signature. */
     CK_DEFINE_FUNCTION( CK_RV, C_SignRecover )( CK_SESSION_HANDLE, CK_BYTE_PTR, CK_ULONG, CK_BYTE_PTR, CK_ULONG_PTR ) {
 
+		if (g_bDllUnloading)
+		{
+#ifndef _WIN32
+			Log::log( "C_SignRecover -   return CKR_CRYPTOKI_NOT_INITIALIZED (Library unloading)" );
+#endif
+			return CKR_CRYPTOKI_NOT_INITIALIZED;
+		}
+		
         Log::begin( "C_SignRecover" );
 
         CK_RV rv = CKR_CRYPTOKI_NOT_INITIALIZED;
@@ -3774,8 +4833,11 @@ extern "C"
             rv = CKR_FUNCTION_NOT_SUPPORTED;
         }
 
-        Log::logCK_RV( "C_SignRecover", rv );
-        Log::end( "C_SignRecover" );
+		if (Log::s_bEnableLog)
+		{
+			Log::logCK_RV( "C_SignRecover", rv );
+			Log::end( "C_SignRecover" );
+		}
         return rv;
     }
 
@@ -3783,6 +4845,14 @@ extern "C"
     /* C_CopyObject copies an object, creating a new object for the copy. */
     CK_DEFINE_FUNCTION(CK_RV, C_CopyObject )( CK_SESSION_HANDLE, CK_OBJECT_HANDLE, CK_ATTRIBUTE_PTR, CK_ULONG, CK_OBJECT_HANDLE_PTR ) {
 
+		if (g_bDllUnloading)
+		{
+#ifndef _WIN32
+			Log::log( "C_CopyObject -   return CKR_CRYPTOKI_NOT_INITIALIZED (Library unloading)" );
+#endif
+			return CKR_CRYPTOKI_NOT_INITIALIZED;
+		}
+		
         Log::begin( "C_CopyObject" );
 
         CK_RV rv = CKR_CRYPTOKI_NOT_INITIALIZED;
@@ -3791,8 +4861,11 @@ extern "C"
             rv = CKR_FUNCTION_NOT_SUPPORTED;
         }
 
-        Log::logCK_RV( "C_CopyObject", rv );
-        Log::end( "C_CopyObject" );
+		if (Log::s_bEnableLog)
+		{
+			Log::logCK_RV( "C_CopyObject", rv );
+			Log::end( "C_CopyObject" );
+		}
         return rv;
     }
 
@@ -3800,6 +4873,14 @@ extern "C"
     /* C_GetObjectSize gets the size of an object in bytes */
     CK_DEFINE_FUNCTION( CK_RV, C_GetObjectSize )( CK_SESSION_HANDLE, CK_OBJECT_HANDLE, CK_ULONG_PTR ) {
 
+		if (g_bDllUnloading)
+		{
+#ifndef _WIN32
+			Log::log( "C_GetObjectSize -   return CKR_CRYPTOKI_NOT_INITIALIZED (Library unloading)" );
+#endif
+			return CKR_CRYPTOKI_NOT_INITIALIZED;
+		}
+		
         Log::begin( "C_GetObjectSize" );
 
         CK_RV rv = CKR_CRYPTOKI_NOT_INITIALIZED;
@@ -3808,8 +4889,11 @@ extern "C"
             rv = CKR_FUNCTION_NOT_SUPPORTED;
         }
 
-        Log::logCK_RV( "C_GetObjectSize", rv );
-        Log::end( "C_GetObjectSize" );
+		if (Log::s_bEnableLog)
+		{
+			Log::logCK_RV( "C_GetObjectSize", rv );
+			Log::end( "C_GetObjectSize" );
+		}
         return rv;
     }
 
@@ -3827,6 +4911,14 @@ extern "C"
     */
     CK_DEFINE_FUNCTION(CK_RV,C_EncryptUpdate)( CK_SESSION_HANDLE, CK_BYTE_PTR, CK_ULONG, CK_BYTE_PTR, CK_ULONG_PTR ) {
 
+		if (g_bDllUnloading)
+		{
+#ifndef _WIN32
+			Log::log( "C_EncryptUpdate -   return CKR_CRYPTOKI_NOT_INITIALIZED (Library unloading)" );
+#endif
+			return CKR_CRYPTOKI_NOT_INITIALIZED;
+		}
+		
         Log::begin( "C_EncryptUpdate" );
 
         CK_RV rv = CKR_CRYPTOKI_NOT_INITIALIZED;
@@ -3835,8 +4927,11 @@ extern "C"
             rv = CKR_FUNCTION_NOT_SUPPORTED;
         }
 
-        Log::logCK_RV( "C_EncryptUpdate", rv );
-        Log::end( "C_EncryptUpdate" );
+		if (Log::s_bEnableLog)
+		{
+			Log::logCK_RV( "C_EncryptUpdate", rv );
+			Log::end( "C_EncryptUpdate" );
+		}
         return rv;
     }
 
@@ -3851,6 +4946,14 @@ extern "C"
     */
     CK_DEFINE_FUNCTION( CK_RV, C_EncryptFinal )( CK_SESSION_HANDLE, CK_BYTE_PTR, CK_ULONG_PTR ) {
 
+		if (g_bDllUnloading)
+		{
+#ifndef _WIN32
+			Log::log( "C_EncryptFinal -   return CKR_CRYPTOKI_NOT_INITIALIZED (Library unloading)" );
+#endif
+			return CKR_CRYPTOKI_NOT_INITIALIZED;
+		}
+		
         Log::begin( "C_EncryptFinal" );
 
         CK_RV rv = CKR_CRYPTOKI_NOT_INITIALIZED;
@@ -3859,8 +4962,11 @@ extern "C"
             rv = CKR_FUNCTION_NOT_SUPPORTED;
         }
 
-        Log::logCK_RV( "C_EncryptFinal", rv );
-        Log::end( "C_EncryptFinal" );
+		if (Log::s_bEnableLog)
+		{
+			Log::logCK_RV( "C_EncryptFinal", rv );
+			Log::end( "C_EncryptFinal" );
+		}
         return rv;
     }
 
@@ -3877,6 +4983,14 @@ extern "C"
     */
     CK_DEFINE_FUNCTION(CK_RV,C_DecryptUpdate)( CK_SESSION_HANDLE, CK_BYTE_PTR, CK_ULONG, CK_BYTE_PTR, CK_ULONG_PTR ) {
 
+		if (g_bDllUnloading)
+		{
+#ifndef _WIN32
+			Log::log( "C_DecryptUpdate -   return CKR_CRYPTOKI_NOT_INITIALIZED (Library unloading)" );
+#endif
+			return CKR_CRYPTOKI_NOT_INITIALIZED;
+		}
+		
         Log::begin( "C_DecryptUpdate" );
 
         CK_RV rv = CKR_CRYPTOKI_NOT_INITIALIZED;
@@ -3885,8 +4999,11 @@ extern "C"
             rv = CKR_FUNCTION_NOT_SUPPORTED;
         }
 
-        Log::logCK_RV( "C_DecryptUpdate", rv );
-        Log::end( "C_DecryptUpdate" );
+		if (Log::s_bEnableLog)
+		{
+			Log::logCK_RV( "C_DecryptUpdate", rv );
+			Log::end( "C_DecryptUpdate" );
+		}
         return rv;
     }
 
@@ -3901,6 +5018,14 @@ extern "C"
     */
     CK_DEFINE_FUNCTION( CK_RV, C_DecryptFinal )( CK_SESSION_HANDLE, CK_BYTE_PTR, CK_ULONG_PTR ) {
 
+		if (g_bDllUnloading)
+		{
+#ifndef _WIN32
+			Log::log( "C_DecryptFinal -   return CKR_CRYPTOKI_NOT_INITIALIZED (Library unloading)" );
+#endif
+			return CKR_CRYPTOKI_NOT_INITIALIZED;
+		}
+		
         Log::begin( "C_DecryptFinal" );
 
         CK_RV rv = CKR_CRYPTOKI_NOT_INITIALIZED;
@@ -3909,8 +5034,11 @@ extern "C"
             rv = CKR_FUNCTION_NOT_SUPPORTED;
         }
 
-        Log::logCK_RV( "C_DecryptFinal", rv );
-        Log::end( "C_DecryptFinal" );
+		if (Log::s_bEnableLog)
+		{
+			Log::logCK_RV( "C_DecryptFinal", rv );
+			Log::end( "C_DecryptFinal" );
+		}
         return rv;
     }
 
@@ -3919,6 +5047,14 @@ extern "C"
     * the data already digested. */
     CK_DEFINE_FUNCTION( CK_RV, C_DigestKey )( CK_SESSION_HANDLE, CK_OBJECT_HANDLE ) {
 
+		if (g_bDllUnloading)
+		{
+#ifndef _WIN32
+			Log::log( "C_DigestKey -   return CKR_CRYPTOKI_NOT_INITIALIZED (Library unloading)" );
+#endif
+			return CKR_CRYPTOKI_NOT_INITIALIZED;
+		}
+		
         Log::begin( "C_DigestKey" );
 
         CK_RV rv = CKR_CRYPTOKI_NOT_INITIALIZED;
@@ -3927,8 +5063,11 @@ extern "C"
             rv = CKR_FUNCTION_NOT_SUPPORTED;
         }
 
-        Log::logCK_RV( "C_DigestKey", rv );
-        Log::end( "C_DigestKey" );
+		if (Log::s_bEnableLog)
+		{
+			Log::logCK_RV( "C_DigestKey", rv );
+			Log::end( "C_DigestKey" );
+		}
         return rv;
     }
 

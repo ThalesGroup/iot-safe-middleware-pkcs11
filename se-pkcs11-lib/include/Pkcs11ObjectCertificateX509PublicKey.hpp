@@ -1,6 +1,7 @@
 /*
-*  PKCS#11 library for .Net smart cards
+*  PKCS#11 library for IoT Safe
 *  Copyright (C) 2007-2009 Gemalto <support@gemalto.com>
+*  Copyright (C) 2009-2021 Thales
 *
 *  This library is free software; you can redistribute it and/or
 *  modify it under the terms of the GNU Lesser General Public
@@ -17,8 +18,6 @@
 *  Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301  USA
 *
 */
-
-
 #ifndef __GEMALTO_OBJECT_CERTIFICATE_X509_PUBLIC_KEY__
 #define __GEMALTO_OBJECT_CERTIFICATE_X509_PUBLIC_KEY__
 
@@ -31,28 +30,30 @@ class X509PubKeyCertObject : public CertificateObject {
 
 public:
 
-    boost::shared_ptr< Marshaller::u1Array > m_pSubject;
+    boost::shared_ptr< u1Array > m_pSubject;
 
-    boost::shared_ptr< Marshaller::u1Array > m_pID;
+    boost::shared_ptr< u1Array > m_pID;
 	
-    boost::shared_ptr< Marshaller::u1Array > m_pIssuer;
+    boost::shared_ptr< u1Array > m_pIssuer;
 	
-    boost::shared_ptr< Marshaller::u1Array > m_pSerialNumber;
+    boost::shared_ptr< u1Array > m_pSerialNumber;
 	
-    boost::shared_ptr< Marshaller::u1Array > m_pValue;
+    boost::shared_ptr< u1Array > m_pValue;
 	
-    boost::shared_ptr< Marshaller::u1Array > m_pURL;
+    boost::shared_ptr< u1Array > m_pURL;
 	
-    boost::shared_ptr< Marshaller::u1Array > m_pHashOfSubjectPubKey;
+    boost::shared_ptr< u1Array > m_pHashOfSubjectPubKey;
 	
-    boost::shared_ptr< Marshaller::u1Array > m_pHashOfIssuerPubKey;
+    boost::shared_ptr< u1Array > m_pHashOfIssuerPubKey;
 
     bool m_bIsSmartCardLogon;
 
     bool m_bIsRoot;
 
-	boost::shared_ptr< Marshaller::u1Array > m_pModulus;
+    bool m_bIsRSA;
 
+	boost::shared_ptr< u1Array > m_pPublicKeyValue; // Modulus for RSA, DER of public point Q for ECC
+    boost::shared_ptr< u1Array > m_pOID;
 
 	X509PubKeyCertObject( );
 
@@ -69,6 +70,8 @@ public:
 	virtual void deserialize( std::vector< u1 >&, CK_ULONG_PTR );
 
     virtual void print( void );
+
+    bool validate();
 
 };
 

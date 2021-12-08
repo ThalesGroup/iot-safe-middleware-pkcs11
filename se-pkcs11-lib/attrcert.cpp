@@ -1,23 +1,23 @@
 /*
- *  PKCS#11 library for .Net smart cards
- *  Copyright (C) 2007-2009 Gemalto <support@gemalto.com>
- *
- *  This library is free software; you can redistribute it and/or
- *  modify it under the terms of the GNU Lesser General Public
- *  License as published by the Free Software Foundation; either
- *  version 2.1 of the License, or (at your option) any later version.
- *
- *  This library is distributed in the hope that it will be useful,
- *  but WITHOUT ANY WARRANTY; without even the implied warranty of
- *  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
- *  Lesser General Public License for more details.
- *
- *  You should have received a copy of the GNU Lesser General Public
- *  License along with this library; if not, write to the Free Software
- *  Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301  USA
- *
- */
-
+*  PKCS#11 library for IoT Safe
+*  Copyright (C) 2007-2009 Gemalto <support@gemalto.com>
+*  Copyright (C) 2009-2021 Thales
+*
+*  This library is free software; you can redistribute it and/or
+*  modify it under the terms of the GNU Lesser General Public
+*  License as published by the Free Software Foundation; either
+*  version 2.1 of the License, or (at your option) any later version.
+*
+*  This library is distributed in the hope that it will be useful,
+*  but WITHOUT ANY WARRANTY; without even the implied warranty of
+*  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+*  Lesser General Public License for more details.
+*
+*  You should have received a copy of the GNU Lesser General Public
+*  License along with this library; if not, write to the Free Software
+*  Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301  USA
+*
+*/
 // This code is based on class in ACS baseline.
 
 //#pragma warning(disable : 4251)
@@ -28,7 +28,6 @@
 #include <functional>
 #include "attrcert.h"
 #include "digest.h"
-#include "sha1.h"
 
 
 namespace
@@ -145,10 +144,11 @@ CAttributedCertificate::DerivedId(BEROctet::Blob const & data)
 BEROctet::Blob
 CAttributedCertificate::DerivedId(unsigned char const * data, size_t length)
 {
-    CSHA1 sha1;
+    CDigest* sha1 = CDigest::getInstance(CDigest::SHA1);
     unsigned char hash[20];
-    sha1.hashCore(const_cast<CK_BYTE_PTR>(data), 0, static_cast<CK_LONG>(length));
-    sha1.hashFinal(hash);
+    sha1->hashUpdate(const_cast<CK_BYTE_PTR>(data), 0, static_cast<CK_LONG>(length));
+    sha1->hashFinal(hash);
+    delete sha1;
 
     return BEROctet::Blob(hash, 20);
 }
@@ -168,11 +168,11 @@ CAttributedCertificate::DerivedUniqueName(BEROctet::Blob const & data)
 std::string
 CAttributedCertificate::DerivedUniqueName(unsigned char const * data, size_t length)
 {
-    CSHA1 sha1;
+    CDigest* sha1 = CDigest::getInstance(CDigest::SHA1);
     unsigned char hash[20];
-    sha1.hashCore(const_cast<CK_BYTE_PTR>(data), 0, static_cast<CK_LONG>(length));
-    sha1.hashFinal(hash);
-
+    sha1->hashUpdate(const_cast<CK_BYTE_PTR>(data), 0, static_cast<CK_LONG>(length));
+    sha1->hashFinal(hash);
+    delete sha1;
     // Format as a GUID
 
     char name[40];

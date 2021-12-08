@@ -1,6 +1,7 @@
 /*
-*  PKCS#11 library for .Net smart cards
+*  PKCS#11 library for IoT Safe
 *  Copyright (C) 2007-2009 Gemalto <support@gemalto.com>
+*  Copyright (C) 2009-2021 Thales
 *
 *  This library is free software; you can redistribute it and/or
 *  modify it under the terms of the GNU Lesser General Public
@@ -17,8 +18,6 @@
 *  Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301  USA
 *
 */
-
-
 #include "Log.hpp"
 #include "util.h"
 #include "Pkcs11ObjectKeyPrivateRSA.hpp"
@@ -45,7 +44,7 @@ RSAPrivateKeyObject::RSAPrivateKeyObject( const RSAPrivateKeyObject* p ) : Priva
 
         if( p->m_pPublicExponent.get( ) ) {
 
-            Marshaller::u1Array* e = new Marshaller::u1Array( *(p->m_pPublicExponent.get( )) );
+            u1Array* e = new u1Array( *(p->m_pPublicExponent.get( )) );
 
             m_pPublicExponent.reset( e );
 
@@ -56,7 +55,7 @@ RSAPrivateKeyObject::RSAPrivateKeyObject( const RSAPrivateKeyObject* p ) : Priva
 
         if( p->m_pModulus.get( ) ) {
 
-            Marshaller::u1Array* m = new Marshaller::u1Array( *(p->m_pModulus.get( )) );
+            u1Array* m = new u1Array( *(p->m_pModulus.get( )) );
 
             m_pModulus.reset( m );
 
@@ -67,7 +66,7 @@ RSAPrivateKeyObject::RSAPrivateKeyObject( const RSAPrivateKeyObject* p ) : Priva
 
         if( p->m_pPrivateExponent.get( ) ) {
 
-            Marshaller::u1Array* e = new Marshaller::u1Array( *(p->m_pPrivateExponent.get( )) );
+            u1Array* e = new u1Array( *(p->m_pPrivateExponent.get( )) );
 
             m_pPrivateExponent.reset( e );
 
@@ -78,7 +77,7 @@ RSAPrivateKeyObject::RSAPrivateKeyObject( const RSAPrivateKeyObject* p ) : Priva
 
         if( p->m_pPrime1.get( ) ) {
 
-            Marshaller::u1Array* m = new Marshaller::u1Array( *(p->m_pPrime1.get( )) );
+            u1Array* m = new u1Array( *(p->m_pPrime1.get( )) );
 
             m_pPrime1.reset( m );
 
@@ -89,7 +88,7 @@ RSAPrivateKeyObject::RSAPrivateKeyObject( const RSAPrivateKeyObject* p ) : Priva
 
         if( p->m_pPrime2.get( ) ) {
 
-            Marshaller::u1Array* m = new Marshaller::u1Array( *(p->m_pPrime2.get( )) );
+            u1Array* m = new u1Array( *(p->m_pPrime2.get( )) );
 
             m_pPrime2.reset( m );
 
@@ -100,7 +99,7 @@ RSAPrivateKeyObject::RSAPrivateKeyObject( const RSAPrivateKeyObject* p ) : Priva
 
         if( p->m_pExponent1.get( ) ) {
 
-            Marshaller::u1Array* e = new Marshaller::u1Array( *(p->m_pExponent1.get( )) );
+            u1Array* e = new u1Array( *(p->m_pExponent1.get( )) );
 
             m_pExponent1.reset( e );
 
@@ -111,7 +110,7 @@ RSAPrivateKeyObject::RSAPrivateKeyObject( const RSAPrivateKeyObject* p ) : Priva
 
         if( p->m_pExponent2.get( ) ) {
 
-            Marshaller::u1Array* e = new Marshaller::u1Array( *(p->m_pExponent2.get( )) );
+            u1Array* e = new u1Array( *(p->m_pExponent2.get( )) );
 
             m_pExponent2.reset( e );
 
@@ -122,7 +121,7 @@ RSAPrivateKeyObject::RSAPrivateKeyObject( const RSAPrivateKeyObject* p ) : Priva
 
         if( p->m_pCoefficient.get( ) ) {
 
-            Marshaller::u1Array* e = new Marshaller::u1Array( *(p->m_pCoefficient.get( )) );
+            u1Array* e = new u1Array( *(p->m_pCoefficient.get( )) );
 
             m_pCoefficient.reset( e );
 
@@ -155,28 +154,28 @@ bool RSAPrivateKeyObject::compare( const CK_ATTRIBUTE& attribute ) {
     switch( attribute.type ) {
 
     case CKA_MODULUS:
-        return Util::compareU1Arrays(m_pModulus.get( ), (unsigned char*)attribute.pValue, attribute.ulValueLen );
+        return Util::compareArraysAsBigIntegers(m_pModulus.get( ), (unsigned char*)attribute.pValue, attribute.ulValueLen );
 
     case CKA_PUBLIC_EXPONENT:
-        return Util::compareU1Arrays(m_pPublicExponent.get( ), (unsigned char*)attribute.pValue, attribute.ulValueLen );
+        return Util::compareArraysAsBigIntegers(m_pPublicExponent.get( ), (unsigned char*)attribute.pValue, attribute.ulValueLen );
 
     case CKA_PRIVATE_EXPONENT:
-        return Util::compareU1Arrays(m_pPrivateExponent.get( ), (unsigned char*)attribute.pValue, attribute.ulValueLen );
+        return Util::compareArraysAsBigIntegers(m_pPrivateExponent.get( ), (unsigned char*)attribute.pValue, attribute.ulValueLen );
 
     case CKA_PRIME_1:
-        return Util::compareU1Arrays(m_pPrime1.get( ), (unsigned char*)attribute.pValue, attribute.ulValueLen );
+        return Util::compareArraysAsBigIntegers(m_pPrime1.get( ), (unsigned char*)attribute.pValue, attribute.ulValueLen );
 
     case CKA_PRIME_2:
-        return Util::compareU1Arrays(m_pPrime2.get( ), (unsigned char*)attribute.pValue, attribute.ulValueLen );
+        return Util::compareArraysAsBigIntegers(m_pPrime2.get( ), (unsigned char*)attribute.pValue, attribute.ulValueLen );
 
     case CKA_EXPONENT_1:
-        return Util::compareU1Arrays(m_pExponent1.get( ), (unsigned char*)attribute.pValue, attribute.ulValueLen );
+        return Util::compareArraysAsBigIntegers(m_pExponent1.get( ), (unsigned char*)attribute.pValue, attribute.ulValueLen );
 
     case CKA_EXPONENT_2:
-        return Util::compareU1Arrays(m_pExponent2.get( ), (unsigned char*)attribute.pValue, attribute.ulValueLen );
+        return Util::compareArraysAsBigIntegers(m_pExponent2.get( ), (unsigned char*)attribute.pValue, attribute.ulValueLen );
 
     case CKA_COEFFICIENT:
-        return Util::compareU1Arrays(m_pCoefficient.get( ), (unsigned char*)attribute.pValue, attribute.ulValueLen );
+        return Util::compareArraysAsBigIntegers(m_pCoefficient.get( ), (unsigned char*)attribute.pValue, attribute.ulValueLen );
 
     default:
         return PrivateKeyObject::compare( attribute );
@@ -370,7 +369,7 @@ void RSAPrivateKeyObject::print( void ) {
 
     if( m_pPrivateExponent.get( ) ) {
 
-        Log::logCK_UTF8CHAR_PTR( "CKA_PRIVATE_EXPONENT", m_pPrivateExponent->GetBuffer( ), m_pPrivateExponent->GetLength( ) );
+        Log::log( "CKA_PRIVATE_EXPONENT <Sensitive>");
 
     } else {
 
@@ -379,7 +378,7 @@ void RSAPrivateKeyObject::print( void ) {
 
     if( m_pPrime1.get( ) ) {
 
-        Log::logCK_UTF8CHAR_PTR( "CKA_PRIME_1", m_pPrime1->GetBuffer( ), m_pPrime1->GetLength( ) );
+        Log::log( "CKA_PRIME_1 <Sensitive>" );
 
     } else {
 
@@ -388,7 +387,7 @@ void RSAPrivateKeyObject::print( void ) {
 
     if( m_pPrime2.get( ) ) {
 
-        Log::logCK_UTF8CHAR_PTR( "CKA_PRIME_2", m_pPrime2->GetBuffer( ), m_pPrime2->GetLength( ) );
+        Log::log( "CKA_PRIME_2 <Sensitive>" );
 
     } else {
 
@@ -397,7 +396,7 @@ void RSAPrivateKeyObject::print( void ) {
 
     if( m_pExponent1.get( ) ) {
 
-        Log::logCK_UTF8CHAR_PTR( "CKA_EXPONENT_1", m_pExponent1->GetBuffer( ), m_pExponent1->GetLength( ) );
+        Log::log( "CKA_EXPONENT_1 <Sensitive>");
 
     } else {
 
@@ -406,7 +405,7 @@ void RSAPrivateKeyObject::print( void ) {
 
     if( m_pExponent2.get( ) ) {
 
-        Log::logCK_UTF8CHAR_PTR( "CKA_EXPONENT_2", m_pExponent2->GetBuffer( ), m_pExponent2->GetLength( ) );
+        Log::log( "CKA_EXPONENT_2 <Sensitive>" );
 
     } else {
 
@@ -415,10 +414,124 @@ void RSAPrivateKeyObject::print( void ) {
 
     if( m_pCoefficient.get( ) ) {
 
-        Log::logCK_UTF8CHAR_PTR( "CKA_COEFFICIENT", m_pCoefficient->GetBuffer( ), m_pCoefficient->GetLength( ) );
+        Log::log( "CKA_COEFFICIENT <Sensitive>" );
 
     } else {
 
         Log::log( "CKA_COEFFICIENT <null>" );
     }
+}
+
+/*
+*/
+u1Array* RSAPrivateKeyObject::PadRSAPKCS1v15( u1Array* dataToSign, const CK_ULONG& modulusLen ) {
+
+    u1Array* messageToSign = new u1Array( modulusLen );
+
+    memset( messageToSign->GetBuffer( ), 0, modulusLen );
+
+    messageToSign->SetU1At( 1, 1 );
+
+    s4 offsetMessageToSign = modulusLen - dataToSign->GetLength( ) - 3;
+
+    for( s4 i = 0 ; i < offsetMessageToSign ; ++i ) {
+
+        messageToSign->SetU1At( 2 + i, 0xFF );
+    }
+
+    offsetMessageToSign += 3;
+
+    memcpy( (unsigned char*)&messageToSign->GetBuffer( )[ offsetMessageToSign ], dataToSign->GetBuffer( ), dataToSign->GetLength( ) );
+
+    return messageToSign;
+}
+
+/*
+*/
+u1Array* RSAPrivateKeyObject::PadRSAX509( u1Array* dataToSign, const CK_ULONG& modulusLen ) {
+
+    u1Array* messageToSign = new u1Array( modulusLen );
+
+    memset( messageToSign->GetBuffer( ), 0, modulusLen );
+
+    s4 offsetMessageToSign = modulusLen - dataToSign->GetLength( );
+
+    memcpy( (unsigned char*)&messageToSign->GetBuffer( )[ offsetMessageToSign ], dataToSign->GetBuffer( ), dataToSign->GetLength( ) );
+
+    return messageToSign;
+}
+
+
+/*
+*/
+u1Array* RSAPrivateKeyObject::EncodeHashForSigning( u1Array* hashedData, const CK_ULONG& modulusLen, const CK_ULONG& hashAlgo ) {
+
+    unsigned char DER_SHA1_Encoding[ ]   = { 0x30, 0x21, 0x30, 0x09, 0x06, 0x05, 0x2B, 0x0E, 0x03, 0x02, 0x1A, 0x05, 0x00, 0x04, 0x14 };
+
+    unsigned char DER_SHA256_Encoding[ ] = { 0x30, 0x31, 0x30, 0x0d, 0x06, 0x09, 0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x01, 0x05, 0x00, 0x04, 0x20 };
+
+    unsigned char DER_SHA384_Encoding[ ] = { 0x30, 0x41, 0x30, 0x0d, 0x06, 0x09, 0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x02, 0x05, 0x00, 0x04, 0x30 };
+    
+    unsigned char DER_SHA512_Encoding[ ] = { 0x30, 0x51, 0x30, 0x0d, 0x06, 0x09, 0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x03, 0x05, 0x00, 0x04, 0x40 };
+
+    unsigned char DER_MD5_Encoding[ ]    = { 0x30, 0x20, 0x30, 0x0C, 0x06, 0x08, 0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x02, 0x05, 0x05, 0x00, 0x04, 0x10 };
+
+    unsigned char* DER_Encoding = NULL_PTR;
+
+    s4 DER_Encoding_Len = 0;
+
+    switch( hashAlgo ) {
+
+    case CKM_SHA_1:
+        DER_Encoding_Len = sizeof(DER_SHA1_Encoding);
+        DER_Encoding = new unsigned char[DER_Encoding_Len]; //(unsigned char*)malloc(DER_Encoding_Len);
+        memcpy(DER_Encoding,DER_SHA1_Encoding,DER_Encoding_Len);
+        break;
+
+    case CKM_SHA256:
+        DER_Encoding_Len = sizeof(DER_SHA256_Encoding);
+        DER_Encoding = new unsigned char[DER_Encoding_Len]; //(unsigned char*)malloc(DER_Encoding_Len);
+        memcpy(DER_Encoding,DER_SHA256_Encoding,DER_Encoding_Len);
+        break;
+
+    case CKM_SHA384:
+        DER_Encoding_Len = sizeof(DER_SHA384_Encoding);
+        DER_Encoding = new unsigned char[DER_Encoding_Len];
+        memcpy(DER_Encoding,DER_SHA384_Encoding,DER_Encoding_Len);
+        break;
+
+    case CKM_SHA512:
+        DER_Encoding_Len = sizeof(DER_SHA512_Encoding);
+        DER_Encoding = new unsigned char[DER_Encoding_Len]; //(unsigned char*)malloc(DER_Encoding_Len);
+        memcpy(DER_Encoding,DER_SHA512_Encoding,DER_Encoding_Len);
+        break;
+
+    case CKM_MD5:
+        DER_Encoding_Len = sizeof(DER_MD5_Encoding);
+        DER_Encoding = new unsigned char[DER_Encoding_Len]; //(unsigned char*)malloc(DER_Encoding_Len);
+        memcpy(DER_Encoding,DER_MD5_Encoding,DER_Encoding_Len);
+        break;
+
+    }
+
+    u1Array* messageToSign = new u1Array( modulusLen );
+
+    memset( messageToSign->GetBuffer( ), 0, modulusLen );
+
+    messageToSign->SetU1At( 1, 1 );
+
+    // caluclate pos
+    int pos = modulusLen - DER_Encoding_Len - hashedData->GetLength( );
+
+    for( int i = 2 ; i < (pos - 1) ; ++i ) {
+
+        messageToSign->SetU1At( i, 0xFF );
+    }
+
+    memcpy((unsigned char*)&messageToSign->GetBuffer()[pos],DER_Encoding,DER_Encoding_Len);
+    memcpy((unsigned char*)&messageToSign->GetBuffer()[pos+DER_Encoding_Len],hashedData->GetBuffer(),hashedData->GetLength());
+
+    delete DER_Encoding;
+
+    return messageToSign;
 }

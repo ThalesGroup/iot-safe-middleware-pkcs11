@@ -1,6 +1,3 @@
-/* pkcs11.h include file for PKCS #11. */
-/* $Revision: 1.1 $ */
-
 /* License to copy and use this software is granted provided that it is
  * identified as "RSA Security Inc. PKCS #11 Cryptographic Token Interface
  * (Cryptoki)" in all material mentioning or referencing this software.
@@ -15,6 +12,9 @@
  * any particular purpose. It is provided "as is" without express or implied
  * warranty of any kind.
  */
+ 
+/* pkcs11.h include file for PKCS #11. */
+/* $Revision: 1.3 $ */
 
 #ifndef _PKCS11_H_
 #define _PKCS11_H_ 1

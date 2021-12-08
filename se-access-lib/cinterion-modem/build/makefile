@@ -64,15 +64,18 @@ CXX := g++
 BUILDDIR := $(PROJECT_DIR)/binaries/$(BUILDMODE)/$(LIBRARY_NAME)
 TARGET   := $(BUILDDIR)/$(TARGET_NAME)
 
-SRCDIR := ../src
+SRCDIR1 := ../../iotsafe-middleware/iotsafelib/platform/modem/src
+SRCDIR2 := ../src
 
-INCLUDES := -I../inc
 
-SOURCES := $(SRCDIR)/ATInterface.cpp \
-	$(SRCDIR)/CinterionModem.cpp \
-	$(SRCDIR)/LSerial.cpp \
-	$(SRCDIR)/ModemAccess.cpp \
-	$(SRCDIR)/Serial.cpp
+INCLUDES := -I../../iotsafe-middleware/iotsafelib/platform/modem/inc -I../../iotsafe-middleware/iotsafelib/common/inc
+
+SOURCES := $(SRCDIR1)/ATInterface.cpp \
+            $(SRCDIR1)/../../../common/src/SEInterface.cpp \
+        	$(SRCDIR1)/GenericModem.cpp \
+        	$(SRCDIR1)/LSerial.cpp \
+        	$(SRCDIR2)/ModemAccess.cpp \
+        	$(SRCDIR1)/Serial.cpp \
 
 OBJECTS := $(patsubst %.cpp, $(BUILDDIR)/%.o, $(notdir $(SOURCES)))
 
@@ -86,7 +89,7 @@ CXXFLAGS := \
 	-Wextra \
 	-pedantic \
 	-std=c++11 \
-	-fPIC \
+	-fPIC
 
 ifeq ($(BUILDMODE), Debug)
 	CXXFLAGS += -O0 -g -DDEBUG
@@ -104,16 +107,29 @@ $(TARGET): $(OBJECTS)
 	@echo "   Build mode : $(BUILDMODE) - Building target $@ ..."
 	$(CXX) $(CXXFLAGS) $(LDFLAGS) -o $(TARGET) $^ $(LIBS)
 ifeq ($(BUILDMODE), CodeCoverage)
-	-cp $(SRCDIR)/*.c $(BUILDDIR)
-	-cp $(SRCDIR)/*.cpp $(BUILDDIR)
-	-cp $(SRCDIR)/../inc/*.h $(BUILDDIR)
-	-cp $(SRCDIR)/../inc/*.hpp $(BUILDDIR)
+	-cp $(SRCDIR1)/*.c $(BUILDDIR)
+	-cp $(SRCDIR1)/*.cpp $(BUILDDIR)
+	-cp $(SRCDIR2)/*.cpp $(BUILDDIR)
+	-cp $(SRCDIR1)/../inc/*.h $(BUILDDIR)
+	-cp $(SRCDIR1)/../inc/*.h $(BUILDDIR)
+	-cp $(SRCDIR1)/../../../common/inc/*.h $(BUILDDIR)
+	-cp $(SRCDIR1)/../../../common/src/SEInterface.cpp $(BUILDDIR)
 endif
 
-$(BUILDDIR)/%.o: $(SRCDIR)/%.cpp
+
+$(BUILDDIR)/SEInterface.o: $(SRCDIR1)/../../../common/src/SEInterface.cpp
+	@echo "   Build mode : $(BUILDMODE) - Compiling $< ..."
+	$(CXX) $(CXXFLAGS) $(INCLUDES) -c -o $@ $<
+
+$(BUILDDIR)/ModemAccess.o: $(SRCDIR2)/ModemAccess.cpp
+	@echo "   Build mode : $(BUILDMODE) - Compiling $< ..."
+	$(CXX) $(CXXFLAGS) $(INCLUDES) -c -o $@ $<
+
+$(BUILDDIR)/%.o: $(SRCDIR1)/%.cpp
 	@echo "   Build mode : $(BUILDMODE) - Compiling $< ..."
 	mkdir -p $(BUILDDIR)
 	$(CXX) $(CXXFLAGS) $(INCLUDES) -c -o $@ $<
+
 
 install:
 	@echo "   Installing the library in $(INSTALL_PREFIX)/lib directory ..."

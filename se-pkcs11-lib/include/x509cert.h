@@ -1,6 +1,7 @@
 /*
-*  PKCS#11 library for .Net smart cards
+*  PKCS#11 library for IoT Safe
 *  Copyright (C) 2007-2009 Gemalto <support@gemalto.com>
+*  Copyright (C) 2009-2021 Thales
 *
 *  This library is free software; you can redistribute it and/or
 *  modify it under the terms of the GNU Lesser General Public
@@ -17,8 +18,6 @@
 *  Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301  USA
 *
 */
-
-
 #ifndef _include_x509cert_h
 #define _include_x509cert_h
 
@@ -53,6 +52,18 @@ public:
    BEROctet::Blob RawModulus() const;
    BEROctet::Blob PublicExponent() const;
    BEROctet::Blob RawPublicExponent() const;
+   
+    //Return only the raw certificate - remy
+   BEROctet::Blob getRawCertificate() const;
+
+   // return EC public point Q in uncompressed format
+   BEROctet::Blob EcPublicPoint() const;
+
+   // return the DER of the object identifier of the curve
+   BEROctet::Blob EcCurveOid() const;
+
+   bool IsEccPublicKey() const;
+   bool IsRsaPublicKey() const;
 
    unsigned long KeyUsage() const;
    bool ExtendedKeyUsage(std::string const &strOID) const;

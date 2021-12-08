@@ -68,13 +68,11 @@ BUILDDIR := $(PROJECT_DIR)/binaries/$(BUILDMODE)/$(LIBRARY_NAME)
 TARGET   := $(BUILDDIR)/$(TARGET_NAME)
 
 SRCDIR := ..
-SRCEXT := cpp
 
 INCLUDES := -I../include -I../../se-access-lib
 
 SOURCES := \
 	algo_des.cpp \
-	algo_utils.cpp \
 	Application.cpp \
 	Array.cpp \
 	attrcert.cpp \
@@ -83,20 +81,16 @@ SOURCES := \
 	CardManager.cpp \
 	CardModuleAPI.cpp \
 	CardModuleAppletIoTSAFE.cpp \
-	cert_utils.cpp \
 	Configuration.cpp \
 	cr_digit.cpp \
 	cr_nn.cpp \
 	cr_random.cpp \
 	cr_rsa.cpp \
 	DataShare.cpp \
-	des.cpp \
 	Device.cpp \
 	Digest.cpp \
 	EccUtils.cpp \
 	filesystem.cpp \
-	gem_aes.cpp \
-	gem_des.cpp \
 	Log.cpp \
 	MiniDriverAuthentication.cpp \
 	MiniDriverCardCacheFile.cpp \
@@ -107,7 +101,6 @@ SOURCES := \
 	MiniDriverModuleService.cpp \
 	MiniDriverPinPolicy.cpp \
 	Module.cpp \
-	PinPolicy.cpp \
 	PKCS11.cpp \
 	Pkcs11ObjectCertificate.cpp \
 	Pkcs11ObjectCertificateX509PublicKey.cpp \
@@ -133,11 +126,11 @@ SOURCES := \
 	util.cpp \
 	x509cert.cpp
 
-OBJECTS := $(patsubst %.$(SRCEXT), $(BUILDDIR)/%.o, $(notdir $(SOURCES)))
+OBJECTS := $(patsubst %.cpp, $(BUILDDIR)/%.o, $(notdir $(SOURCES)))
 
 ifeq ($(BUILDTYPE), CodeCoverage)
-	CODE_COV_GCNO := $(patsubst %.$(SRCEXT), $(BUILDDIR)/%.gcno, $(notdir $(SOURCES)))
-	CODE_COV_GCDA := $(patsubst %.$(SRCEXT), $(BUILDDIR)/%.gcda, $(notdir $(SOURCES)))
+	CODE_COV_GCNO := $(patsubst %.cpp, $(BUILDDIR)/%.gcno, $(notdir $(SOURCES)))
+	CODE_COV_GCDA := $(patsubst %.cpp, $(BUILDDIR)/%.gcda, $(notdir $(SOURCES)))
 endif
 
 CXXFLAGS := \
@@ -187,8 +180,14 @@ LIBS += \
 $(TARGET): $(OBJECTS)
 	@echo "   Build mode : $(BUILDMODE) - Building target $@ ..."
 	$(CXX) $(CXXFLAGS) $(LDFLAGS) -o $(TARGET) $^ $(LIBS)
+ifeq ($(BUILDMODE), CodeCoverage)
+	-cp $(SRCDIR)/*.c $(BUILDDIR)
+	-cp $(SRCDIR)/*.cpp $(BUILDDIR)
+	-cp $(SRCDIR)/include/*.h $(BUILDDIR)
+	-cp $(SRCDIR)/include/*.hpp $(BUILDDIR)
+endif
 
-$(BUILDDIR)/%.o: $(SRCDIR)/%.$(SRCEXT)
+$(BUILDDIR)/%.o: $(SRCDIR)/%.cpp
 	@echo "   Build mode : $(BUILDMODE) - Compiling $< ..."
 	mkdir -p $(BUILDDIR)
 	$(CXX) $(CXXFLAGS) $(INCLUDES) -c -o $@ $<
@@ -208,10 +207,11 @@ endif
 
 clean:
 	@echo "   Cleaning $(BUILDDIR) directory ..."
-	$(RM) -f $(OBJECTS) $(TARGET)
+	$(RM) $(OBJECTS) $(TARGET)
 ifeq ($(BUILDMODE), CodeCoverage)
-	$(RM) -f $(CODE_COV_GCNO)
-	$(RM) -f $(CODE_COV_GCDA)
+	$(RM) $(CODE_COV_GCNO)
+	$(RM) $(CODE_COV_GCDA)
+	$(RM) *.c *.cpp *.h *.hpp
 endif
 
 .PHONY: clean install

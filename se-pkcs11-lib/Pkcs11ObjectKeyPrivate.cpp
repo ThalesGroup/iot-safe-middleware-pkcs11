@@ -1,24 +1,23 @@
 /*
- *  PKCS#11 library for .Net smart cards
- *  Copyright (C) 2007-2009 Gemalto <support@gemalto.com>
- *
- *  This library is free software; you can redistribute it and/or
- *  modify it under the terms of the GNU Lesser General Public
- *  License as published by the Free Software Foundation; either
- *  version 2.1 of the License, or (at your option) any later version.
- *
- *  This library is distributed in the hope that it will be useful,
- *  but WITHOUT ANY WARRANTY; without even the implied warranty of
- *  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
- *  Lesser General Public License for more details.
- *
- *  You should have received a copy of the GNU Lesser General Public
- *  License along with this library; if not, write to the Free Software
- *  Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301  USA
- *
- */
-
-
+*  PKCS#11 library for IoT Safe
+*  Copyright (C) 2007-2009 Gemalto <support@gemalto.com>
+*  Copyright (C) 2009-2021 Thales
+*
+*  This library is free software; you can redistribute it and/or
+*  modify it under the terms of the GNU Lesser General Public
+*  License as published by the Free Software Foundation; either
+*  version 2.1 of the License, or (at your option) any later version.
+*
+*  This library is distributed in the hope that it will be useful,
+*  but WITHOUT ANY WARRANTY; without even the implied warranty of
+*  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+*  Lesser General Public License for more details.
+*
+*  You should have received a copy of the GNU Lesser General Public
+*  License along with this library; if not, write to the Free Software
+*  Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301  USA
+*
+*/
 #include "Log.hpp"
 #include "util.h"
 #include "Pkcs11ObjectKeyPrivate.hpp"
@@ -207,6 +206,8 @@ void PrivateKeyObject::setAttribute( const CK_ATTRIBUTE& a_Attribute, const bool
             case CKA_ALWAYS_AUTHENTICATE:
             case CKA_ALWAYS_SENSITIVE:
             case CKA_NEVER_EXTRACTABLE:
+                if (a_Attribute.pValue && (a_Attribute.ulValueLen != sizeof(CK_BBOOL)))
+                    throw PKCS11Exception( CKR_ATTRIBUTE_VALUE_INVALID );
                 throw PKCS11Exception( CKR_ATTRIBUTE_READ_ONLY );
 
             case CKA_DECRYPT:
@@ -216,9 +217,14 @@ void PrivateKeyObject::setAttribute( const CK_ATTRIBUTE& a_Attribute, const bool
             case CKA_SIGN_RECOVER:
             case CKA_UNWRAP:
             case CKA_WRAP_WITH_TRUSTED:
-                if( *(CK_BBOOL*)a_Attribute.pValue ) {
+                if (a_Attribute.pValue)
+                {
+                    if (a_Attribute.ulValueLen != sizeof(CK_BBOOL))
+                        throw PKCS11Exception( CKR_ATTRIBUTE_VALUE_INVALID );
+                    if( *(CK_BBOOL*)a_Attribute.pValue ) {
 
-                    throw PKCS11Exception( CKR_ATTRIBUTE_READ_ONLY );
+                        throw PKCS11Exception( CKR_ATTRIBUTE_READ_ONLY );
+                    }
                 }
                 break;
         }

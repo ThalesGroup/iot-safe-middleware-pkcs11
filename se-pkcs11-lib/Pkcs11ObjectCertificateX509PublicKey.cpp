@@ -1,6 +1,7 @@
 /*
-*  PKCS#11 library for .Net smart cards
+*  PKCS#11 library for IoT Safe
 *  Copyright (C) 2007-2009 Gemalto <support@gemalto.com>
+*  Copyright (C) 2009-2021 Thales
 *
 *  This library is free software; you can redistribute it and/or
 *  modify it under the terms of the GNU Lesser General Public
@@ -17,13 +18,11 @@
 *  Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301  USA
 *
 */
-
-
 #include "Log.hpp"
 #include "util.h"
 #include "Pkcs11ObjectCertificateX509PublicKey.hpp"
 #include "PKCS11Exception.hpp"
-
+#include "x509cert.h"
 
 /*
 */
@@ -38,6 +37,8 @@ X509PubKeyCertObject::X509PubKeyCertObject( ) {
 	m_bIsSmartCardLogon = false;
 
     m_bIsRoot = false;
+
+    m_bIsRSA = true;
 }
 
 
@@ -311,7 +312,41 @@ void X509PubKeyCertObject::print( void ) {
         Log::log( "CKA_HASH_OF_ISSUER_PUBLIC_KEY <null>" );
     }
 
-    Log::log( "[IsSmartCardLogon <%d>]", m_bIsSmartCardLogon );
+    Log::log( "[IsSmartCardLogon <%d>]", m_bIsSmartCardLogon? 1 : 0 );
 
-    Log::log( "[IsRoot <%d>]", m_bIsRoot );
+    Log::log( "[IsRoot <%d>]", m_bIsRoot? 1 : 0 );
+
+    Log::log( "[IsRSA <%d>]", m_bIsRSA? 1 : 0 );
+}
+
+bool X509PubKeyCertObject::validate()
+{
+   bool bIsValid = false;
+
+   if (m_pValue)
+   {
+      try
+      {
+          X509Cert x509cert( m_pValue->GetBuffer( ), m_pValue->GetLength( ) );
+          BEROctet::Blob serial = x509cert.SerialNumber();
+          BEROctet::Blob issuer = x509cert.Issuer();
+          BEROctet::Blob subject = x509cert.Subject();
+
+          if (   (m_pSubject && m_pSubject->GetLength() && (((size_t) m_pSubject->GetLength() != subject.size()) || (memcmp(subject.data(), m_pSubject->GetBuffer(), subject.size()))))
+             ||  (m_pIssuer && m_pIssuer->GetLength() && (((size_t) m_pIssuer->GetLength() != issuer.size()) || (memcmp(issuer.data(), m_pIssuer->GetBuffer(), issuer.size()))))
+             // ||  (m_pSerialNumber && m_pSerialNumber->GetLength() && (((size_t) m_pSerialNumber->GetLength() != serial.size()) || (memcmp(serial.data(), m_pSerialNumber->GetBuffer(), serial.size()))))
+             )
+          {
+             // attributes mismatch
+             bIsValid = false;
+          }
+          else
+          {
+             bIsValid = true;
+          }
+      }
+      catch (...) {}
+   }
+
+   return bIsValid;
 }

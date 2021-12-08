@@ -1,23 +1,23 @@
 /*
- *  PKCS#11 library for .Net smart cards
- *  Copyright (C) 2007-2009 Gemalto <support@gemalto.com>
- *
- *  This library is free software; you can redistribute it and/or
- *  modify it under the terms of the GNU Lesser General Public
- *  License as published by the Free Software Foundation; either
- *  version 2.1 of the License, or (at your option) any later version.
- *
- *  This library is distributed in the hope that it will be useful,
- *  but WITHOUT ANY WARRANTY; without even the implied warranty of
- *  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
- *  Lesser General Public License for more details.
- *
- *  You should have received a copy of the GNU Lesser General Public
- *  License along with this library; if not, write to the Free Software
- *  Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301  USA
- *
- */
-
+*  PKCS#11 library for IoT Safe
+*  Copyright (C) 2007-2009 Gemalto <support@gemalto.com>
+*  Copyright (C) 2009-2021 Thales
+*
+*  This library is free software; you can redistribute it and/or
+*  modify it under the terms of the GNU Lesser General Public
+*  License as published by the Free Software Foundation; either
+*  version 2.1 of the License, or (at your option) any later version.
+*
+*  This library is distributed in the hope that it will be useful,
+*  but WITHOUT ANY WARRANTY; without even the implied warranty of
+*  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+*  Lesser General Public License for more details.
+*
+*  You should have received a copy of the GNU Lesser General Public
+*  License along with this library; if not, write to the Free Software
+*  Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301  USA
+*
+*/
 // This implementation is based on RFC 2459 which can be fetched from http://www.ietf.org.
 
 
@@ -63,6 +63,11 @@ X509Cert& X509Cert::operator=(const BEROctet::Blob &buffer)
    Decode();
 
    return *this;
+}
+
+BEROctet::Blob X509Cert::getRawCertificate() const
+{
+   return m_Cert.Octet();
 }
 
 // Returns whole DER std::string of Serial Number.
@@ -228,6 +233,91 @@ BEROctet::Blob X509Cert::Modulus() const
 
    return BEROctet::Blob(&RawMod[i],RawMod.size()-i);
 
+}
+
+bool X509Cert::IsRsaPublicKey() const
+{
+   if(m_SubjectPublicKeyInfo.SubOctetList().size()!=2)
+      throw std::runtime_error("X509CertFormatError");
+
+   BEROctet PubKeyAlg = *(m_SubjectPublicKeyInfo.SubOctetList()[0]);
+   if (PubKeyAlg.SubOctetList().size() != 2)
+      throw std::runtime_error("X509CertFormatError");
+
+   BEROctet algId = *(PubKeyAlg.SubOctetList()[0]);
+
+   std::string stAlgId = algId.ObjectID();
+
+   return ("1 2 840 113549 1 1 1" == stAlgId);
+}
+
+bool X509Cert::IsEccPublicKey() const
+{
+   if(m_SubjectPublicKeyInfo.SubOctetList().size()!=2)
+      throw std::runtime_error("X509CertFormatError");
+
+   BEROctet PubKeyAlg = *(m_SubjectPublicKeyInfo.SubOctetList()[0]);
+   if (PubKeyAlg.SubOctetList().size() != 2)
+      throw std::runtime_error("X509CertFormatError");
+
+   BEROctet algId = *(PubKeyAlg.SubOctetList()[0]);
+
+   std::string stAlgId = algId.ObjectID();
+
+   return ("1 2 840 10045 2 1" == stAlgId);
+}
+
+BEROctet::Blob X509Cert::EcPublicPoint() const
+{
+   if(m_SubjectPublicKeyInfo.SubOctetList().size()!=2)
+      throw std::runtime_error("X509CertFormatError");
+
+   BEROctet PubKeyAlg = *(m_SubjectPublicKeyInfo.SubOctetList()[0]);
+   if (PubKeyAlg.SubOctetList().size() != 2)
+      throw std::runtime_error("X509CertFormatError");
+
+   BEROctet algId = *(PubKeyAlg.SubOctetList()[0]);
+
+   std::string stAlgId = algId.ObjectID();
+
+   if (stAlgId != "1 2 840 10045 2 1")
+   {
+       throw std::runtime_error("X509CertFormatError");
+   }
+
+   BEROctet PubKeyString = *(m_SubjectPublicKeyInfo.SubOctetList()[1]);
+
+   BEROctet::Blob KeyBlob = PubKeyString.Data();
+   if ((KeyBlob.size() < 4) || (KeyBlob[0] != 0x00) || (KeyBlob[1] != 0x04))
+       throw std::runtime_error("X509CertFormatError");
+
+   BEROctet octetString(tcUniversal, false, dwBerUnivOctetString);
+   octetString.Data(BEROctet::Blob(KeyBlob.data() + 1, KeyBlob.size() - 1));
+  
+   return octetString.Octet();
+}
+
+BEROctet::Blob X509Cert::EcCurveOid() const
+{
+   if(m_SubjectPublicKeyInfo.SubOctetList().size()!=2)
+      throw std::runtime_error("X509CertFormatError");
+
+   BEROctet PubKeyAlg = *(m_SubjectPublicKeyInfo.SubOctetList()[0]);
+   if (PubKeyAlg.SubOctetList().size() != 2)
+      throw std::runtime_error("X509CertFormatError");
+
+   BEROctet algId = *(PubKeyAlg.SubOctetList()[0]);
+
+   std::string stAlgId = algId.ObjectID();
+
+   if (stAlgId != "1 2 840 10045 2 1")
+   {
+       throw std::runtime_error("X509CertFormatError");
+   }
+
+   BEROctet curveId = *(PubKeyAlg.SubOctetList()[1]);
+
+   return curveId.Octet();
 }
 
 // Returns public exponent from SubjectPublicKeyInfo, possibly with leading zero(s).

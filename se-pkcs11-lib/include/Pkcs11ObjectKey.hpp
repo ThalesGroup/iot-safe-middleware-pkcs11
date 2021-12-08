@@ -1,6 +1,7 @@
 /*
-*  PKCS#11 library for .Net smart cards
+*  PKCS#11 library for IoT Safe
 *  Copyright (C) 2007-2009 Gemalto <support@gemalto.com>
+*  Copyright (C) 2009-2021 Thales
 *
 *  This library is free software; you can redistribute it and/or
 *  modify it under the terms of the GNU Lesser General Public
@@ -17,8 +18,6 @@
 *  Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301  USA
 *
 */
-
-
 #ifndef __GEMLATO_OBJECT_KEY__
 #define __GEMLATO_OBJECT_KEY__
 
@@ -33,11 +32,13 @@ public:
 
 	CK_ULONG _keyType;
 
-	boost::shared_ptr< Marshaller::u1Array > m_pID;
+	boost::shared_ptr< u1Array > m_pID;
 	
-    boost::shared_ptr< Marshaller::u1Array > m_pStartDate;
+    boost::shared_ptr< u1Array > m_pStartDate;
 	
-    boost::shared_ptr< Marshaller::u1Array > m_pEndDate;
+    boost::shared_ptr< u1Array > m_pEndDate;
+
+    CK_BYTE m_role;
 	
     CK_BBOOL _derive;
 	
@@ -45,7 +46,7 @@ public:
 	
     CK_ULONG _mechanismType;
 	
-    boost::shared_ptr< Marshaller::u4Array > m_pAllowedMechanism;
+    boost::shared_ptr< u4Array > m_pAllowedMechanism;
 
    	unsigned char m_ucContainerIndex;
 	

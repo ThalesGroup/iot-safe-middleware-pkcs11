@@ -1,24 +1,23 @@
 /*
- *  PKCS#11 library for .Net smart cards
- *  Copyright (C) 2007-2009 Gemalto <support@gemalto.com>
- *
- *  This library is free software; you can redistribute it and/or
- *  modify it under the terms of the GNU Lesser General Public
- *  License as published by the Free Software Foundation; either
- *  version 2.1 of the License, or (at your option) any later version.
- *
- *  This library is distributed in the hope that it will be useful,
- *  but WITHOUT ANY WARRANTY; without even the implied warranty of
- *  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
- *  Lesser General Public License for more details.
- *
- *  You should have received a copy of the GNU Lesser General Public
- *  License along with this library; if not, write to the Free Software
- *  Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301  USA
- *
- */
-
-
+*  PKCS#11 library for IoT Safe
+*  Copyright (C) 2007-2009 Gemalto <support@gemalto.com>
+*  Copyright (C) 2009-2021 Thales
+*
+*  This library is free software; you can redistribute it and/or
+*  modify it under the terms of the GNU Lesser General Public
+*  License as published by the Free Software Foundation; either
+*  version 2.1 of the License, or (at your option) any later version.
+*
+*  This library is distributed in the hope that it will be useful,
+*  but WITHOUT ANY WARRANTY; without even the implied warranty of
+*  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+*  Lesser General Public License for more details.
+*
+*  You should have received a copy of the GNU Lesser General Public
+*  License along with this library; if not, write to the Free Software
+*  Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301  USA
+*
+*/
 #include "Log.hpp"
 #include "util.h"
 #include "Pkcs11ObjectStorage.hpp"
@@ -63,7 +62,7 @@ StorageObject::StorageObject( const StorageObject& a_Object ) {
 
     if( a_Object.m_pLabel.get( ) ) {
     
-        Marshaller::u1Array* pLabel = new Marshaller::u1Array( *(a_Object.m_pLabel.get( )) );
+        u1Array* pLabel = new u1Array( *(a_Object.m_pLabel.get( )) );
 
         m_pLabel.reset( pLabel );
     
@@ -124,9 +123,14 @@ void StorageObject::setAttribute( const CK_ATTRIBUTE& a_attribute, const bool& a
         switch( a_attribute.type ) {
 
             case CKA_CLASS:
+                if (a_attribute.pValue && a_attribute.ulValueLen != sizeof(CK_OBJECT_CLASS))
+                    throw PKCS11Exception( CKR_ATTRIBUTE_VALUE_INVALID );
+                throw PKCS11Exception( CKR_ATTRIBUTE_READ_ONLY );
             case CKA_PRIVATE:
             case CKA_TOKEN:
             case CKA_MODIFIABLE:
+                if (a_attribute.pValue && a_attribute.ulValueLen != sizeof(CK_BBOOL))
+                    throw PKCS11Exception( CKR_ATTRIBUTE_VALUE_INVALID );
                 throw PKCS11Exception( CKR_ATTRIBUTE_READ_ONLY );
         }
     }
@@ -242,7 +246,7 @@ void StorageObject::deserialize( const std::vector<u1>& from, CK_ULONG_PTR idx )
 
 /*
 */
-void StorageObject::putU1ArrayInAttribute( Marshaller::u1Array* value, CK_ATTRIBUTE_PTR attribute ) {
+void StorageObject::putU1ArrayInAttribute( u1Array* value, CK_ATTRIBUTE_PTR attribute ) {
     
     if( !attribute->pValue ) {
 
@@ -277,10 +281,46 @@ void StorageObject::putU1ArrayInAttribute( Marshaller::u1Array* value, CK_ATTRIB
     memcpy((CK_BYTE_PTR)attribute->pValue,value->GetBuffer(),attribute->ulValueLen);
 }
 
+/*
+*/
+void StorageObject::putBytearrayInAttribute( CK_BYTE* value, CK_ULONG valueLen, CK_ATTRIBUTE_PTR attribute ) {
+    
+    if( !attribute->pValue ) {
+
+        if( !value ) {
+
+            attribute->ulValueLen = 0; 
+        
+        } else {
+        
+            attribute->ulValueLen = valueLen;
+        }
+
+        return;
+    }
+
+    if( !value ) {
+
+        attribute->ulValueLen = 0;
+
+        return;
+    }
+
+    if( attribute->ulValueLen < valueLen ) {
+
+        attribute->ulValueLen = CK_UNAVAILABLE_INFORMATION;
+        
+        throw PKCS11Exception(  CKR_BUFFER_TOO_SMALL );
+    }
+
+    attribute->ulValueLen = valueLen;
+    
+    memcpy((CK_BYTE_PTR)attribute->pValue,value,attribute->ulValueLen);
+}
 
 /*
 */
-void StorageObject::putU4ArrayInAttribute( Marshaller::u4Array* value,CK_ATTRIBUTE_PTR attribute)
+void StorageObject::putU4ArrayInAttribute( u4Array* value,CK_ATTRIBUTE_PTR attribute)
 {
     if( !attribute->pValue ) {
 
@@ -399,9 +439,9 @@ CK_BBOOL StorageObject::readBBoolFromAttribute( const CK_ATTRIBUTE& a_Attribute 
 
 /*
 */
-Marshaller::u1Array* StorageObject::readU1ArrayFromAttribute( const CK_ATTRIBUTE& a_Attribute ) {
+u1Array* StorageObject::readU1ArrayFromAttribute( const CK_ATTRIBUTE& a_Attribute ) {
 
-    Marshaller::u1Array* val = new Marshaller::u1Array( a_Attribute.ulValueLen );
+    u1Array* val = new u1Array( a_Attribute.ulValueLen );
 
     val->SetBuffer( (CK_BYTE_PTR) a_Attribute.pValue );
 
@@ -411,7 +451,7 @@ Marshaller::u1Array* StorageObject::readU1ArrayFromAttribute( const CK_ATTRIBUTE
 
 /*
 */
-Marshaller::u1Array* StorageObject::readDateFromAttribute( const CK_ATTRIBUTE& a_Attribute ) {
+u1Array* StorageObject::readDateFromAttribute( const CK_ATTRIBUTE& a_Attribute ) {
 
     if( a_Attribute.ulValueLen != 8 ) {
 

@@ -1,6 +1,7 @@
 /*
-*  PKCS#11 library for .Net smart cards
+*  PKCS#11 library for IoT Safe
 *  Copyright (C) 2007-2009 Gemalto <support@gemalto.com>
+*  Copyright (C) 2009-2021 Thales
 *
 *  This library is free software; you can redistribute it and/or
 *  modify it under the terms of the GNU Lesser General Public
@@ -17,8 +18,6 @@
 *  Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301  USA
 *
 */
-
-
 #ifndef __GEMALTO_OBJECT_KEY_PUBLIC__
 #define __GEMALTO_OBJECT_KEY_PUBLIC__
 
@@ -30,7 +29,7 @@ class Pkcs11ObjectKeyPublic : public KeyObject {
 
 public:
 
-	boost::shared_ptr< Marshaller::u1Array > m_pSubject;
+	boost::shared_ptr< u1Array > m_pSubject;
 	
     CK_BBOOL     _encrypt;
 	

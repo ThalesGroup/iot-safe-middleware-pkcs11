@@ -1,6 +1,7 @@
 /*
-*  PKCS#11 library for .Net smart cards
+*  PKCS#11 library for IoT Safe
 *  Copyright (C) 2007-2009 Gemalto <support@gemalto.com>
+*  Copyright (C) 2009-2021 Thales
 *
 *  This library is free software; you can redistribute it and/or
 *  modify it under the terms of the GNU Lesser General Public
@@ -68,16 +69,11 @@ double Timer::getCurrentDuration( void ) {
       timeval now;         
       gettimeofday( &now, NULL );  
 
-      timeval diff;          
-      diff.tv_sec = now.tv_sec - m_clockStart.tv_sec;
-      diff.tv_usec = now.tv_usec - m_clockStart.tv_usec; 
-      while( diff.tv_usec < 0 )
-      {
-         diff.tv_sec--;
-         diff.tv_usec = 1000000 + ( now.tv_usec - m_clockStart.tv_usec );
-      }
-      double duration = diff.tv_sec;         
-      duration += (double)( diff.tv_usec / 1e6 ); 
+		double duration1 = now.tv_sec;         
+      duration1 += (double)( (double) now.tv_usec / (double) 1e6 );       
+      double duration2 = m_clockStart.tv_sec;         
+      duration2 += (double)( (double) m_clockStart.tv_usec / (double) 1e6 );
+      double duration = duration1 - duration2;
  
       //memset( &m_clockStart, 0, sizeof( timeval ) );
 #endif

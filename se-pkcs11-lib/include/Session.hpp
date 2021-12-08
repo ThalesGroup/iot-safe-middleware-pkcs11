@@ -1,6 +1,7 @@
 /*
-*  PKCS#11 library for .Net smart cards
+*  PKCS#11 library for IoT Safe
 *  Copyright (C) 2007-2009 Gemalto <support@gemalto.com>
+*  Copyright (C) 2009-2021 Thales
 *
 *  This library is free software; you can redistribute it and/or
 *  modify it under the terms of the GNU Lesser General Public
@@ -17,21 +18,23 @@
 *  Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301  USA
 *
 */
-
-
 #ifndef __GEMALTO_SESSION__
 #define __GEMALTO_SESSION__
 
 
 #include "Template.hpp"
 #include "digest.h"
-#include "Pkcs11ObjectStorage.hpp"
+#include "Pkcs11ObjectKeyPublic.hpp"
+#include "Pkcs11ObjectKeyPrivate.hpp"
+#include "Pkcs11ObjectKeySecret.hpp"
 #include <set>
 #include <vector>
+#include <map>
 #include <boost/smart_ptr.hpp>
 #include <boost/ptr_container/ptr_map.hpp>
-#include "Array.hpp"
+#include "Array.h"
 #include "cryptoki.h"
+#include "util.h"
 
 
 class Slot;
@@ -40,16 +43,21 @@ class Slot;
 /*
 */
 class CryptoOperation {
-
-    CK_ULONG m_ulMechanism;
-
-    CK_OBJECT_HANDLE m_hObject;
+       
     //StorageObject* m_pObject;
-
+    u1Array m_pParams;
+    CK_ULONG m_ulMechanism;
+    CK_OBJECT_HANDLE m_hObject;
 public:
 
     //CryptoOperation( const CK_ULONG& a_ulMechanism, StorageObject* a_pObject ) : m_ulMechanism( a_ulMechanism ), m_pObject( a_pObject ) { }
-    CryptoOperation( const CK_ULONG& a_ulMechanism, const CK_OBJECT_HANDLE& a_hObject ) : m_ulMechanism( a_ulMechanism ), m_hObject( a_hObject ) { }
+    CryptoOperation( CK_MECHANISM_PTR a_pMechanism, const CK_OBJECT_HANDLE& a_hObject ) : m_pParams(a_pMechanism->ulParameterLen > 0 && a_pMechanism->ulParameterLen <= 256 ? a_pMechanism->ulParameterLen : 0 ), m_ulMechanism( a_pMechanism->mechanism ), m_hObject( a_hObject ) 
+    { 
+        if (m_pParams.GetLength())
+        {
+            m_pParams.SetBuffer((u1*) a_pMechanism->pParameter);
+        }
+    }
 
     //virtual ~CryptoOperation( ) { };
 
@@ -59,6 +67,8 @@ public:
 
     //inline StorageObject* getObject( void ) { return m_pObject; }
     inline CK_OBJECT_HANDLE& getObject( void ) { return m_hObject; }
+
+    inline CK_VOID_PTR getParameters( void ) { if ( m_pParams.GetLength() ) return (CK_VOID_PTR) m_pParams.GetBuffer(); else return NULL;}
 
 };
 
@@ -72,11 +82,11 @@ public:
 
     typedef std::set< CK_OBJECT_HANDLE > EXPLORED_HANDLES;
 
-    typedef boost::ptr_map< CK_OBJECT_HANDLE, StorageObject > SESSION_OBJECTS;
+    typedef std::map< CK_OBJECT_HANDLE, StorageObject* > SESSION_OBJECTS;
 
     Session( Slot*, const CK_SESSION_HANDLE&, const CK_BBOOL& );
 
-    //inline virtual ~Session( ) { }
+    virtual ~Session( );
 
     inline CK_BBOOL isReadWrite( void ) { return m_bIsReadWrite; }
 
@@ -86,7 +96,7 @@ public:
 
     CDigest* getDigest( void ) { return m_Digest.get( ); }
 
-    inline Marshaller::u1Array* getPinSO( void ) { return m_PinSO.get( ); }
+    inline CSecureString* getPinSO( void ) { return m_PinSO.get( ); }
 
     inline void setSearchTemplate( Template* templ ) { _searchTempl.reset( templ ); m_bIsSearchActive = true; m_SessionObjectsReturnedInSearch.clear( ); }
 
@@ -102,11 +112,31 @@ public:
 
     inline bool isDigestActive( void ) { return m_bIsDigestActive; }
 
-    inline bool isDigestActiveRSA( void ) { return m_bIsDigestActiveRSA; }
+    inline bool isDigestActiveKeyOp( void ) { return m_bIsDigestActiveKeyOp; }
 
-    inline bool isDigestVerificationActiveRSA( void ) { return m_bIsDigestVerificationActiveRSA; }
+    inline bool isDigestVerificationActiveKeyOp( void ) { return m_bIsDigestVerificationActiveKeyOp; }
 
     void addObject( StorageObject*, CK_OBJECT_HANDLE_PTR );
+
+    void generateKeyPair( Pkcs11ObjectKeyPublic*, PrivateKeyObject*, CK_OBJECT_HANDLE_PTR , CK_OBJECT_HANDLE_PTR );
+
+    void deriveKey( PrivateKeyObject*, CK_ECDH1_DERIVE_PARAMS_PTR, SecretKeyObject*, CK_OBJECT_HANDLE_PTR );
+
+    static void setDefaultAttributesKeyPublic( Pkcs11ObjectKeyPublic* );
+
+    static void setDefaultAttributesKeyPrivate( PrivateKeyObject* );
+
+    static void generateLabel( boost::shared_ptr< u1Array>&, boost::shared_ptr< u1Array>& );
+
+    static void generateID(boost::shared_ptr< u1Array>&, boost::shared_ptr< u1Array>& );
+
+    static u1Array* computeSHA1( const unsigned char* a_pData, const size_t& a_uiLength );
+
+    void sign( const KeyObject*, u1Array*, const CK_ULONG&, CK_BYTE_PTR );
+
+    void verify( const StorageObject*, u1Array*, const CK_ULONG&, u1Array* );
+
+    void decrypt( const StorageObject*, u1Array*, const CK_ULONG&, unsigned char, CK_BYTE_PTR , CK_ULONG_PTR );
 
     void deleteObject( const CK_OBJECT_HANDLE& );
 
@@ -118,7 +148,7 @@ public:
 
     inline void setSlot( boost::shared_ptr< Slot > a_pSlot ) { m_Slot = a_pSlot.get( ); }
 
-    StorageObject* getObject( const CK_OBJECT_HANDLE& a_hObject );
+    StorageObject* getObject( const CK_OBJECT_HANDLE& a_hObject, bool bOwned = false );
 
     inline boost::shared_ptr< CryptoOperation >& getSignature( void ) { return m_Signature; }
 
@@ -142,19 +172,19 @@ public:
 
     inline void removeSignatureOperation( void ) { m_Signature.reset( ); }
 
-    inline void setPinSO( Marshaller::u1Array& a ) { m_PinSO.reset( new Marshaller::u1Array( a.GetLength( ) ) ); m_PinSO->SetBuffer( a.GetBuffer( ) ); }
+    inline void setPinSO( u1Array& a ) { m_PinSO.reset( new CSecureString() ); m_PinSO->CopyFrom( a.GetBuffer( ), a.GetLength( ) ); }
 
     inline void setDigest(CDigest *digest) { m_Digest.reset( digest ); m_bIsDigestActive = true; }
 
     inline void removeDigest( void ) { m_Digest.reset( ); m_bIsDigestActive = false; }
 
-    inline void setDigestRSA( CDigest *digest ) { _digestRSA.reset( digest ); m_bIsDigestActiveRSA = true; }
+    inline void setDigestKeyOp( CDigest *digest ) { _digestKeyOp.reset( digest ); m_bIsDigestActiveKeyOp = true; }
 
-    inline void removeDigestRSA( void ) { _digestRSA.reset( ); m_bIsDigestActiveRSA = false; }
+    inline void removeDigestKeyOp( void ) { _digestKeyOp.reset( ); m_bIsDigestActiveKeyOp = false; }
 
-    inline void setDigestRSAVerification( CDigest *digest ) { _digestRSAVerification.reset( digest ); m_bIsDigestVerificationActiveRSA = true; }
+    inline void setDigestKeyVerification( CDigest *digest ) { _digestKeyVerification.reset( digest ); m_bIsDigestVerificationActiveKeyOp = true; }
 
-    inline void removeDigestRSAVerification( void ) { _digestRSAVerification.reset( ); m_bIsDigestVerificationActiveRSA = false; }
+    inline void removeDigestKeyVerification( void ) { _digestKeyVerification.reset( ); m_bIsDigestVerificationActiveKeyOp = false; }
 
     //private:
     static unsigned char s_ucSessionObjectIndex;
@@ -167,13 +197,15 @@ public:
 
     SESSION_OBJECTS m_Objects;
 
+    std::set< CK_OBJECT_HANDLE > m_TokenObjectsReturnedInSearch;
+
     boost::shared_ptr< Template > _searchTempl;
 
     boost::shared_ptr< CDigest > m_Digest;
 
-    boost::shared_ptr< CDigest > _digestRSA;
+    boost::shared_ptr< CDigest > _digestKeyOp;
 
-    boost::shared_ptr< CDigest > _digestRSAVerification;
+    boost::shared_ptr< CDigest > _digestKeyVerification;
 
     EXPLORED_HANDLES m_SessionObjectsReturnedInSearch;
 
@@ -189,23 +221,25 @@ public:
 
     bool m_bIsDigestActive;
 
-    bool m_bIsDigestActiveRSA;
+    bool m_bIsDigestActiveKeyOp;
 
-    bool m_bIsDigestVerificationActiveRSA;
+    bool m_bIsDigestVerificationActiveKeyOp;
 
     CK_ULONG m_ulId;
 
     Slot* m_Slot;
 
-    boost::shared_ptr< Marshaller::u1Array > m_AccumulatedDataToSign;
+    boost::shared_ptr< u1Array > m_AccumulatedDataToSign;
 
-    boost::shared_ptr< Marshaller::u1Array > m_AccumulatedDataToVerify;
+    boost::shared_ptr< u1Array > m_AccumulatedDataToVerify;
+
+    boost::shared_ptr< u1Array > m_LastBlockToSign;
 
     // The CardModule interface requires cryptogram as part of ChangeReferenceData method whereas
     // PKCS#11 first log SO in and then call InitPIN. InitPIN does not have any information about 
     // SO PIN so what we do here is to cache it momentarily. Basically during Login (as SO) we 
     // cache it and destroy it during closing of session
-    boost::shared_ptr< Marshaller::u1Array > m_PinSO;
+    boost::shared_ptr< CSecureString > m_PinSO;
 
 };
 

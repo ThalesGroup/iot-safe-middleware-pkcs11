@@ -1,6 +1,7 @@
 /*
-*  PKCS#11 library for .Net smart cards
+*  PKCS#11 library for IoT Safe
 *  Copyright (C) 2007-2009 Gemalto <support@gemalto.com>
+*  Copyright (C) 2009-2021 Thales
 *
 *  This library is free software; you can redistribute it and/or
 *  modify it under the terms of the GNU Lesser General Public
@@ -17,27 +18,18 @@
 *  Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301  USA
 *
 */
-
-
 #ifndef __GEMALTO_MINIDRIVER_AUTHENTICATION__
 #define __GEMALTO_MINIDRIVER_AUTHENTICATION__
 
 
-#include <boost/serialization/extended_type_info.hpp>
-#include <boost/serialization/singleton.hpp>
 #include <boost/serialization/serialization.hpp>
 #include <boost/serialization/shared_ptr.hpp>
+#include <boost/archive/archive_exception.hpp>
 #include <boost/shared_ptr.hpp>
 #include "MiniDriverPinPolicy.hpp"
-#include "Array.hpp"
+#include "Array.h"
 #include "MiniDriverException.hpp"
-
-
-class SmartCardReader;
-
-
-const unsigned char CARD_PROPERTY_PIN_INFO_EX = 0x87;
-
+#include "PCSCMissing.h"
 
 /*
 */
@@ -53,144 +45,152 @@ public:
 
     typedef enum { PIN_TYPE_REGULAR = 0, PIN_TYPE_EXTERNAL, PIN_TYPE_CHALLENGE_RESPONSE, PIN_TYPE_NO_PIN } PIN_TYPES;
 
+	typedef enum { PIN_CACHE_NORMAL = 0, PIN_CACHE_TIMED, PIN_CACHE_NONE, PIN_CACHE_ALWAYS_PROMPT } PIN_CACHE_TYPES;
+
     static const unsigned char g_ucAuthenticateError = 0;
     static const unsigned char g_ucAuthenticateRegular = 1;
     static const unsigned char g_ucAuthenticateSecure = 2;
     static const unsigned char g_AuthenticateBiometry = 3;
 
+	static std::string g_sPinUserLabel;
+	static std::string g_sPinAdminLabel;
+	static std::string g_sPin3Label;
+	static std::string g_sPin4Label;
+	static std::string g_sPin5Label;
+	static std::string g_sPin6Label;
+	static std::string g_sPin7Label;
+
+
     MiniDriverAuthentication( );
 
-    inline void setCardModule( CardModuleService* a_pCardModule ) { m_CardModule = a_pCardModule; m_PinPolicy.setCardModuleService( m_CardModule ); }
-
-    inline void setSmartCardReader( SmartCardReader* a_pSmartCardReader ) { m_SmartCardReader = a_pSmartCardReader; }
-
-    inline void setRole( const unsigned char& a_ucRole = PIN_USER ) { m_ucRole = a_ucRole; m_PinPolicy.setRole( m_ucRole ); }
+    inline void setCardModule( MiniDriverModuleService* a_pCardModule ) { m_CardModule = a_pCardModule; for (int i=0; i < 6; i++) m_PinPolicyForRole[i].setCardModuleService( m_CardModule ); }
 
     void read( void );
+
+	void setStaticRoles(std::list<u1> roles);
+	const std::list<MiniDriverAuthentication::ROLES>& getStaticRoles() const { return m_listStaticRoles; }
 
 
     // User role management
 
-    bool isSSO( void );
+    bool isSSO( MiniDriverAuthentication::ROLES role );
 
-    inline bool isNoPin( void ) { return ( m_ucTypePIN == PIN_TYPE_NO_PIN ); }
+    inline bool isNoPin( MiniDriverAuthentication::ROLES role ) const { if (PIN_NONE == role) return true; else return ( m_ucTypePINForRole[getRoleIndex(role)] == PIN_TYPE_NO_PIN );}
 
-    inline bool isAuthenticated( void ) { if( m_CardModule ) return m_CardModule->isAuthenticated( m_ucRole ); else throw MiniDriverException( SCARD_E_NO_SMARTCARD ); }
+    inline bool isAuthenticated( MiniDriverAuthentication::ROLES role ) { if( m_CardModule ) return m_CardModule->isAuthenticated( (u1) role, true ); else throw MiniDriverException( SCARD_E_NO_SMARTCARD ); }
 
-    inline bool isPinInitialized( void ) { bool bRet = true; Marshaller::u1Array* a = 0; if( m_CardModule ) { try { a = m_CardModule->getCardProperty( CARD_CHANGE_PIN_FIRST, m_ucRole ); } catch( ... ) { a = 0; } if( a ) { bRet = ( 0 == a->ReadU1At( 0 ) ); } } return bRet; }
+    inline bool isPinExpired( MiniDriverAuthentication::ROLES role ) { if( m_CardModule ) return m_CardModule->isPinExpired( (u1) role ); else throw MiniDriverException( SCARD_E_NO_SMARTCARD ); }
 
-    inline bool isExternalPin( void ) { return ( m_ucTypePIN == PIN_TYPE_EXTERNAL ); }
+    inline bool isPinInitialized( MiniDriverAuthentication::ROLES role ) { if (PIN_NONE == role) return false; bool bRet = true; u1Array* a = 0; if( m_CardModule ) { try { a = m_CardModule->getCardProperty( CARD_CHANGE_PIN_FIRST, (u1) role ); } catch( ... ) { a = 0; } if( a ) { bRet = ( 0 == a->ReadU1At( 0 ) ); delete a;} } return bRet; }
 
-    inline bool isModePinOnly( void ) { return ( m_wActiveMode == UVM_PIN_ONLY ); }
+    inline bool isExternalPin( MiniDriverAuthentication::ROLES role ) const { if (PIN_NONE == role) return false; return (m_ucTypePINForRole[getRoleIndex(role)] == PIN_TYPE_EXTERNAL);}
 
-    inline bool isModeNotPinOnly( void ) { return ( m_wActiveMode != UVM_PIN_ONLY ); }
+    inline bool isRegularPin( MiniDriverAuthentication::ROLES role ) const { if (PIN_NONE == role) return false; return (m_ucTypePINForRole[getRoleIndex(role)] == PIN_TYPE_REGULAR);}
 
-    inline bool isModePinOrBiometry( void ) { return ( m_wActiveMode == UVM_PIN_OR_FP ); }
+    inline bool isModePinOnly( MiniDriverAuthentication::ROLES role ) const { if (PIN_NONE == role) return false; return ( m_wActiveModeForRole[getRoleIndex(role)] == UVM_PIN_ONLY );}
 
-    void login( Marshaller::u1Array* );
+    inline bool isModeNotPinOnly( MiniDriverAuthentication::ROLES role ) const { if (PIN_NONE == role) return false; return ( m_wActiveModeForRole[getRoleIndex(role)] != UVM_PIN_ONLY );}
 
-    inline void verifyPin( Marshaller::u1Array* a_Pin ) { if( m_CardModule ) m_CardModule->verifyPin( m_ucRole, a_Pin ); else throw MiniDriverException( SCARD_E_NO_SMARTCARD ); }
+    inline bool isModePinOrBiometry( MiniDriverAuthentication::ROLES role ) const { if (PIN_NONE == role) return false; return ( m_wActiveModeForRole[getRoleIndex(role)] == UVM_PIN_OR_FP );}
 
-    inline void changePin( Marshaller::u1Array* a_pOldPIN, Marshaller::u1Array* a_pNewPIN ) { if( m_CardModule ) m_CardModule->changeReferenceData( MODE_CHANGE_PIN, m_ucRole, a_pOldPIN, a_pNewPIN, -1 ); else throw MiniDriverException( SCARD_E_NO_SMARTCARD ); }
+	inline bool isPinCacheNormal( MiniDriverAuthentication::ROLES role ) const { if (PIN_NONE == role) return false; return ( m_ucCachePINForRole[getRoleIndex(role)] == PIN_CACHE_NORMAL );}
 
-    inline void logOut( void ) { if( m_CardModule ) m_CardModule->logOut( m_ucRole ); else throw MiniDriverException( SCARD_E_NO_SMARTCARD ); }
+	inline bool isPinCacheTimed( MiniDriverAuthentication::ROLES role ) const { if (PIN_NONE == role) return false; return ( m_ucCachePINForRole[getRoleIndex(role)] == PIN_CACHE_TIMED );}
 
-    void unblockPin( Marshaller::u1Array*, Marshaller::u1Array* );
+	inline bool isPinCacheNone( MiniDriverAuthentication::ROLES role ) const { if (PIN_NONE == role) return false; return ( m_ucCachePINForRole[getRoleIndex(role)] == PIN_CACHE_NONE );}
 
-    bool isLoggedIn( void );
+	inline bool isPinCacheAlwaysPrompt( MiniDriverAuthentication::ROLES role ) const { if (PIN_NONE == role) return false; return ( m_ucCachePINForRole[getRoleIndex(role)] == PIN_CACHE_ALWAYS_PROMPT );}
+
+    void login( MiniDriverAuthentication::ROLES role, u1Array* );
+
+    inline void verifyPin( MiniDriverAuthentication::ROLES role, u1Array* a_Pin) { if( m_CardModule ) m_CardModule->verifyPin( (u1) role, a_Pin ); else throw MiniDriverException( SCARD_E_NO_SMARTCARD ); }
+
+	bool generateSessionPinEx(MiniDriverAuthentication::ROLES role, u1Array* pPin, u1ArraySecure& sbSessionPin,s4* pcAttemptsRemaining) { if( m_CardModule ) return m_CardModule->generateSessionPinEx( (u1) role, pPin, sbSessionPin, pcAttemptsRemaining ); else throw MiniDriverException( SCARD_E_NO_SMARTCARD ); }
+
+    void changePin( MiniDriverAuthentication::ROLES role, u1Array* a_pOldPIN, u1Array* a_pNewPIN );
+
+	inline void logOut( MiniDriverAuthentication::ROLES role ) { if( m_CardModule ) { if (PIN_NONE != role) m_CardModule->logOut( (u1) role );} else throw MiniDriverException( SCARD_E_NO_SMARTCARD ); }
+
+    void unblockPin( MiniDriverAuthentication::ROLES role, u1Array*, u1Array* );
+
+    bool isLoggedIn( MiniDriverAuthentication::ROLES role );
+
+	bool isPinPadSupported();
+
+	bool isSessionPinSupported(MiniDriverAuthentication::ROLES role);
 
     void synchronizePIN( void );
 
-    inline unsigned char getPinMinPinLength( void ) { return m_PinPolicy.getPinMinLength( ); }
+    inline unsigned char getPinMinPinLength( MiniDriverAuthentication::ROLES role ) { int i = getRoleIndex(role); if (m_PinPolicyForRole[i].empty()) read(); return m_PinPolicyForRole[i].getPinMinLength( ); }
 
-    inline unsigned char getPinMaxPinLength( void ) { return m_PinPolicy.getPinMaxLength( ); }
+    inline unsigned char getPinMaxPinLength( MiniDriverAuthentication::ROLES role ) { int i = getRoleIndex(role); if (m_PinPolicyForRole[i].empty()) read(); return m_PinPolicyForRole[i].getPinMaxLength( ); }
 
-    inline unsigned char getPinMaxAttempts( void ) { return m_PinPolicy.getMaxAttemps( ); }
+    inline unsigned char getPinMaxAttempts( MiniDriverAuthentication::ROLES role ) { int i = getRoleIndex(role); if (m_PinPolicyForRole[i].empty()) read(); return m_PinPolicyForRole[i].getMaxAttemps( ); }
 
-    inline unsigned char getPinType( void ) { return m_ucTypePIN; }
+    inline unsigned char getPinType( MiniDriverAuthentication::ROLES role ) { return m_ucTypePINForRole[getRoleIndex(role)]; }
 
     // Get the card mode (1=PIN, 2=FingerPrint, 3=PIN or FP, 4=PIN and FP). The default mode is PIN
-    inline unsigned short getPinMode( void ) { return m_wActiveMode; }
+    inline unsigned short getPinMode( MiniDriverAuthentication::ROLES role ) { return m_wActiveModeForRole[getRoleIndex(role)]; }
 
-    inline unsigned char getTriesRemaining( void ) { if( m_CardModule ) return (unsigned char)m_CardModule->getTriesRemaining( m_ucRole ); else throw MiniDriverException( SCARD_E_NO_SMARTCARD ); }
+	inline unsigned char getPinCacheType( MiniDriverAuthentication::ROLES role ) { return m_ucCachePINForRole[getRoleIndex(role)]; }
+
+	inline ROLES getPinUnblockRole( MiniDriverAuthentication::ROLES role ) { return m_unblockForRole[getRoleIndex(role)]; }
+
+    inline unsigned char getTriesRemaining( MiniDriverAuthentication::ROLES role ) { if( m_CardModule ) return (unsigned char)m_CardModule->getTriesRemaining( (u1) role ); else throw MiniDriverException( SCARD_E_NO_SMARTCARD ); }
 
 
     // Administrator key management
 
-    void administratorLogin( Marshaller::u1Array* );
+    void administratorLogin( u1Array* );
 
     inline void administratorLogout( void ) {if( m_CardModule ) m_CardModule->logOut( PIN_ADMIN ); else throw MiniDriverException( SCARD_E_NO_SMARTCARD ); }
 
-    void administratorChangeKey( Marshaller::u1Array*, Marshaller::u1Array* );
+    void administratorChangeKey( u1Array*, u1Array* );
 
     inline unsigned char administratorGetTriesRemaining( void ) { if( m_CardModule ) return (unsigned char)m_CardModule->getTriesRemaining( PIN_ADMIN ); else throw MiniDriverException( SCARD_E_NO_SMARTCARD ); }
 
     bool administratorIsAuthenticated( void );
 
     void print( void );
+
+    static const char* getRoleDescription(ROLES role);
+    static int getRoleIndex(ROLES role);
+	static int getRolePinID(ROLES role);
+    static MiniDriverAuthentication::ROLES getRoleFromIndex( int index);
+	static MiniDriverAuthentication::ROLES getRoleFromDesc( const char* szDesc);
     
 private:
 
-    void verifyPinWithBio( void );
+    // void verifyPinWithBio( void );
 
-    void computeCryptogram( Marshaller::u1Array*, Marshaller::u1Array* );
+    void computeCryptogram( u1Array*, u1Array* );
 
-    unsigned char howToAuthenticate( unsigned char bPinLen );
+    unsigned char howToAuthenticate( MiniDriverAuthentication::ROLES role, unsigned char bPinLen );
 
-    void authenticateUser( Marshaller::u1Array* );
+	unsigned char howToChangePin( MiniDriverAuthentication::ROLES role, unsigned char bOldPinLen, unsigned char bNewPinLen );
 
-    void authenticateAdmin( Marshaller::u1Array* );
+	unsigned char howToUnblock( MiniDriverAuthentication::ROLES role, unsigned char bPinLen ) { return howToAuthenticate(role, bPinLen); }
 
-    unsigned short m_wActiveMode;
+    void authenticateAdmin( u1Array* );
 
-    unsigned char m_ucTypePIN;
+    MiniDriverModuleService* m_CardModule;
 
-    MiniDriverPinPolicy m_PinPolicy;
+    u1ArraySerializable m_Cryptogram;
 
-    CardModuleService* m_CardModule;
-
-    SmartCardReader* m_SmartCardReader;
-
-    Marshaller::u1Array m_PinInfoEx;
-
-    Marshaller::u1Array m_Cryptogram;
-
-    bool m_bIsRoleLogged;
+    ROLES m_AuthenticatedRole;
 
     bool m_bIsAdministratorLogged;
 
-    unsigned char m_ucRole;
-
-    // Disk serialization and deserialization
-    friend class boost::serialization::access;
-
-    template< class Archive > void serialize( Archive &ar, const unsigned int /*version*/ ) {
-       
-        //Log::begin( "MiniDriverAuthentication::serialize" );
-
-        ar & m_ucRole;
-
-        ar & m_PinInfoEx;
-
-        ar & m_PinPolicy;
-
-        ar & m_wActiveMode;
-
-        ar & m_ucTypePIN;
-
-        //Log::log( "Role <%ld>", m_ucRole );
-        //Log::logCK_UTF8CHAR_PTR( "PIN info Ex %s", m_PinInfoEx.GetBuffer( ), m_PinInfoEx.GetLength( ) );
-        //m_PinPolicy.print( );
-        //Log::log( "Active mode <%ld>", m_wActiveMode );
-        //Log::log( "PIN type <%ld>", m_ucTypePIN );
-
-        //Log::end( "MiniDriverAuthentication::serialize" );
-    }
+    // handle roles PIN_USER and PIN_3 to PIN_7
+    unsigned short m_wActiveModeForRole[6];
+    unsigned char m_ucTypePINForRole[6];
+	unsigned char m_ucCachePINForRole[6];
+	MiniDriverAuthentication::ROLES m_unblockForRole[6];
+    u1ArraySerializable m_PinInfoExForRole[6];
+    MiniDriverPinPolicy m_PinPolicyForRole[6];
+	std::list<MiniDriverAuthentication::ROLES> m_listStaticRoles;
 
 };
-
-
-BOOST_CLASS_VERSION( MiniDriverAuthentication, 1 )
 
 
 #endif // __GEMALTO_MINIDRIVER_AUTHENTICATION__

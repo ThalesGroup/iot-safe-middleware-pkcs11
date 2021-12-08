@@ -1,0 +1,70 @@
+#------------------------------------------------------------------------------
+# Makefile for the Secure Element Access library Test
+#
+# Required : 
+#        PROJECT_DIR environment variable should be set to the absolute
+#                    root path of the project folder  
+#                    The parent of 'src' directory
+#
+# To build, use one of this command lines :
+#       make                        (release mode)
+#       make BUILDTYPE=Release      (release mode)
+#       make BUILDTYPE=Debug        (debug mode)
+#------------------------------------------------------------------------------
+
+ 
+# Check that given variables are set and all have non-empty values,
+# Abort with an error otherwise.
+#
+# Params:
+#   1. Variable name(s) to test.
+#   2. (optional) Error message to print.
+check_defined = \
+    $(strip $(foreach 1,$1, \
+        $(call __check_defined,$1,$(strip $(value 2)))))
+__check_defined = \
+    $(if $(value $1),, \
+      $(error Undefined $1$(if $2, ($2))))
+
+# Check if the evironment variable is defined and stop if not	  
+$(call check_defined, PROJECT_DIR, The root path of the project : The parent of 'src' directory)
+ 
+ifeq ($(BUILDTYPE), Debug)
+   BUILDMODE := Debug
+else
+   BUILDMODE := Release
+endif
+
+CC := g++
+
+TARGETNAME := cinterion-modem-access-test
+BUILDDIR := $(PROJECT_DIR)/binaries/$(BUILDMODE)/$(TARGETNAME)
+TARGET := $(BUILDDIR)/$(TARGETNAME)
+ 
+SOURCES := ../cinterion-modem.cpp
+OBJECTS := $(BUILDDIR)/cinterion-modem-access.o
+LIB := -lcinmodem_access
+INC := -I../.. -I$(PROJECT_DIR)/src/se-pkcs11-lib/include
+
+ifeq ($(BUILDMODE), Debug)
+  CFLAGS := -DDEBUG -g -Wall
+else
+  CFLAGS := -O2 -Wall
+endif
+
+$(TARGET): $(OBJECTS)
+	@echo "   Build mode : $(BUILDMODE) - Building target $@ ..."
+	@echo "   $(CC) $^ -o $(TARGET) $(LIB)"
+	$(CC) $^ -o $(TARGET) $(LIB)
+
+$(OBJECTS): $(SOURCES)
+	@echo "   Build mode : $(BUILDMODE) - Compiling $< ..."
+	@mkdir -p $(BUILDDIR)
+	@echo "   $(CC) $(CFLAGS) $(INC) -c -o $@ $<"
+	$(CC) $(CFLAGS) $(INC) -c -o $@ $<
+
+clean:
+	@echo "   Cleaning $(BUILDDIR) directory ..." 
+	@echo "   $(RM) -r $(BUILDDIR)"; $(RM) -r $(BUILDDIR) $(TARGET)
+
+.PHONY: clean

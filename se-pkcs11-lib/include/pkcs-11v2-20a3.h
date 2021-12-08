@@ -1,8 +1,3 @@
-/* pkcs-11v2-20a3.h include file for the PKCS #11 Version 2.20 Amendment 3
-   document. */
-
-/* $Revision: 1.1 $ */
-
 /* License to copy and use this software is granted provided that it is
  * identified as "RSA Security Inc. PKCS #11 Cryptographic Token Interface
  * (Cryptoki) Version 2.20 Amendment 3" in all material mentioning or
@@ -15,6 +10,11 @@
  */
 
 /* This file is preferably included after inclusion of pkcs11.h */
+
+/* pkcs-11v2-20a3.h include file for the PKCS #11 Version 2.20 Amendment 3
+   document. */
+
+/* $Revision: 1.3 $ */
 
 #ifndef _PKCS_11V2_20A3_H_
 #define _PKCS_11V2_20A3_H_ 1

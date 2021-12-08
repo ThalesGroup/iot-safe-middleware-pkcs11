@@ -1,6 +1,7 @@
 /*
-*  PKCS#11 library for .Net smart cards
+*  PKCS#11 library for IoT Safe
 *  Copyright (C) 2007-2009 Gemalto <support@gemalto.com>
+*  Copyright (C) 2009-2021 Thales
 *
 *  This library is free software; you can redistribute it and/or
 *  modify it under the terms of the GNU Lesser General Public
@@ -17,29 +18,22 @@
 *  Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301  USA
 *
 */
-
-
 #ifndef __GEMALTO_MINIDRIVER_CONTAINER_MAP_FILE__
 #define __GEMALTO_MINIDRIVER_CONTAINER_MAP_FILE__
 
-
-#include <boost/serialization/singleton.hpp>
-#include <boost/serialization/extended_type_info.hpp>
+#ifndef NO_FILESYSTEM
 #include <boost/serialization/serialization.hpp>
 #include <boost/serialization/shared_ptr.hpp>
-#include <boost/version.hpp>
-#if BOOST_VERSION >= 106400
-#include <boost/serialization/boost_array.hpp>
-#else
 #include <boost/serialization/array.hpp>
-#include <boost/array.hpp>
+#include <boost/archive/archive_exception.hpp>
 #endif
+
+#include <array>
 #include <boost/shared_ptr.hpp>
 #include <string>
-#include "Log.hpp"
-#include "Array.hpp"
-#include "CardModuleService.hpp"
 #include "MiniDriverContainer.hpp"
+#include "Array.h"
+#include "MiniDriverModuleService.hpp"
 
 
 const int g_MaxContainer = 15;
@@ -56,47 +50,41 @@ public:
 
     static unsigned char CONTAINER_INDEX_INVALID;
 
-    typedef boost::array< MiniDriverContainer, g_MaxContainer > ARRAY_CONTAINERS;
+	MiniDriverContainerMapFile( const MiniDriverAuthentication& authentication) : m_Authentication(authentication)  { }    
 
-    MiniDriverContainerMapFile( ) { }
-
-    inline void setMiniDriverFiles( MiniDriverFiles* p ) { m_MiniDriverFiles = p; }
-
+	inline void setMiniDriverFiles( MiniDriverFiles* p ) { m_MiniDriverFiles = p; }
     void clear( void );
+    void containerDelete( const unsigned char&, const unsigned char& );
+    inline MiniDriverContainer& containerGet( const unsigned char& a_ucContainerIndex ) { if( a_ucContainerIndex > g_MaxContainer ) { throw MiniDriverException( ); } return m_Containers[ a_ucContainerIndex ]; }
 
-    void containerDelete( const unsigned char& );
+    void containerSearch( MiniDriverAuthentication::ROLES,unsigned char& );
+    void containerSearch( MiniDriverAuthentication::ROLES,unsigned char&, MiniDriverAuthentication::ROLES& );
 
-    inline const MiniDriverContainer& containerGet( const unsigned char& a_ucContainerIndex ) { if( a_ucContainerIndex > m_Containers.size( ) ) { throw MiniDriverException( ); } return m_Containers[ a_ucContainerIndex ]; }
-
-    void containerSearch( unsigned char& );
-
-    inline const ARRAY_CONTAINERS& containerGet( void ) { return m_Containers; }
+    inline const MiniDriverContainer* containerGet( void ) { return m_Containers; }
 
     void containerRead( void );
-
-    void containerCreate( unsigned char&, const bool&, unsigned char&, Marshaller::u1Array*, const int&, Marshaller::u1Array* );
-
+    void containerCreate( MiniDriverAuthentication::ROLES, unsigned char&, const bool&, unsigned char&, u1Array*, const int&, u1Array* );
     void containerSetDefault( const unsigned char&, const bool& );
-
-    bool containerGetMatching( unsigned char& a_ucContainerIndex, unsigned char& a_ucKeySpec, const Marshaller::u1Array* a_pPublicKeyModulus );
-
-    inline unsigned char containerCount( void ) { return (unsigned char)m_Containers.size( ); }
-
+    bool containerGetMatching( MiniDriverAuthentication::ROLES role, unsigned char& a_ucContainerIndex, unsigned char& a_ucKeySpec, const u1Array* a_pPublicKeyModulus );
+    inline unsigned char containerCount( void ) { return (unsigned char)g_MaxContainer; }
     inline void containerSetTypeForSignatureKey( const unsigned char& a_ucContainerIndex, const unsigned char& a_ContainerTypeForSignatureKey ) { m_Containers[ a_ucContainerIndex ].setContainerTypeForSignatureKey( a_ContainerTypeForSignatureKey ); }
-
     inline void containerSetTypeForExchangeKey( const unsigned char& a_ucContainerIndex, const unsigned char& a_ContainerTypeForExchangeKey ) { m_Containers[ a_ucContainerIndex ].setContainerTypeForExchangeKey( a_ContainerTypeForExchangeKey ); }
-
     inline void containerSetPinIdentifier( const unsigned char& a_ucContainerIndex, const MiniDriverAuthentication::ROLES& a_ContainerPinIdentifier ) { m_Containers[ a_ucContainerIndex ].setPinIdentifier( a_ContainerPinIdentifier ); }
-
     inline bool containerIsImportedSignatureKey( const unsigned char& a_ucContainerIndex ) { return m_Containers[ a_ucContainerIndex ].isImportedSignatureKey( ); }
-
     inline bool containerIsImportedExchangeKey( const unsigned char& a_ucContainerIndex ) { return m_Containers[ a_ucContainerIndex ].isImportedExchangeKey( ); }
-
     inline MiniDriverAuthentication::ROLES containerGetPinIdentifier( const unsigned char& a_ucContainerIndex ) { return m_Containers[ a_ucContainerIndex ].getPinIdentifier( ); }
-
     unsigned char containerGetFree( void );
  
-    void print( void );
+    // void print( void );
+
+    void containerUpdatePinInfo( void );
+
+	inline bool Validate () { 
+		for (size_t i = 0; i < g_MaxContainer; i++)
+			if (!m_Containers[i].Validate())
+				return false;
+		return true; 
+	}
 
 private:
 
@@ -105,31 +93,40 @@ private:
     void write( void );
 
     // Containers managed by the MiniDriver
-    ARRAY_CONTAINERS m_Containers;
-
-    Marshaller::u1Array m_ContainerMapFileBinary;
-
+	MiniDriverContainer m_Containers [ g_MaxContainer ];
+	u1ArraySerializable m_ContainerMapFileBinary;
     MiniDriverFiles* m_MiniDriverFiles;
+    const MiniDriverAuthentication& m_Authentication;
 
-    // Disk serialization and deserialization
+	///////////////////////////
+	// Disk cache management //
+	//////////////////////////
+
+#ifndef NO_FILESYSTEM
+
+	// Disk serialization and deserialization
     friend class boost::serialization::access;
 
-    template< class Archive > void serialize( Archive &ar, const unsigned int /*version*/ ) {
+    template< class Archive > void serialize( Archive &ar, const unsigned int version ) {
 
         //Log::begin( "MiniDriverContainerMapFile::serialize" );
+       if (version < 128)
+          throw boost::archive::archive_exception(boost::archive::archive_exception::unsupported_class_version);
 
         ar & m_Containers;
         //print( );
 
-        ar & m_ContainerMapFileBinary;
-        //Log::logCK_UTF8CHAR_PTR( "Container Map File Binary", m_ContainerMapFileBinary.GetBuffer( ), m_ContainerMapFileBinary.GetLength( ) );
+        ar & (m_ContainerMapFileBinary);
+		Log::logCK_UTF8CHAR_PTR ( "Container Map File Binary", m_ContainerMapFileBinary.GetBuffer( ), m_ContainerMapFileBinary.GetLength( ) );
 
         //Log::end( "MiniDriverContainerMapFile::serialize" );
     }
 
+#endif
 };
 
-BOOST_CLASS_VERSION( MiniDriverContainerMapFile, 1 )
-
+#ifndef NO_FILESYSTEM
+BOOST_CLASS_VERSION( MiniDriverContainerMapFile, 128 )
+#endif
 
 #endif // __GEMALTO_CARD_CACHE__

@@ -1,6 +1,7 @@
 /*
-*  PKCS#11 library for .Net smart cards
+*  PKCS#11 library for IoT Safe
 *  Copyright (C) 2007-2009 Gemalto <support@gemalto.com>
+*  Copyright (C) 2009-2021 Thales
 *
 *  This library is free software; you can redistribute it and/or
 *  modify it under the terms of the GNU Lesser General Public
@@ -18,9 +19,8 @@
 *
 */
 
-
+#include <string.h>
 #include "Template.hpp"
-#include <boost/foreach.hpp>
 #include "PKCS11Exception.hpp"
 #include "Log.hpp"
 
@@ -58,14 +58,12 @@ Template::Template( CK_ATTRIBUTE_PTR a_Template, const CK_ULONG& a_ulCount ) {
 */
 Template::~Template( ) {
 
-    BOOST_FOREACH( CK_ATTRIBUTE& a, m_Attributes ) {
+	for (std::vector<CK_ATTRIBUTE>::iterator iter = m_Attributes.begin () ; iter != m_Attributes.end (); ++iter) {
+		CK_ATTRIBUTE& a = (CK_ATTRIBUTE&)*iter;
 
         if( 1 == a.ulValueLen ) {
-
             delete ( ( CK_BYTE* ) a.pValue );
-
         } else if( a.ulValueLen > 1 ) {
-        
             delete[ ] ( ( CK_BYTE* ) a.pValue );
         }
     }
@@ -150,6 +148,18 @@ CK_CERTIFICATE_TYPE Template::getCertificateType( CK_ATTRIBUTE_PTR a_pTemplate, 
     return CK_UNAVAILABLE_INFORMATION;
 }
 
+CK_KEY_TYPE Template::getKeyType( CK_ATTRIBUTE_PTR a_pTemplate, const CK_ULONG& a_ulCount )
+{
+    for( CK_ULONG idx = 0; idx < a_ulCount ; ++idx ) {
+
+        if( CKA_KEY_TYPE == a_pTemplate[ idx ].type ) {
+
+            return (*(CK_ULONG*)a_pTemplate[ idx ].pValue);
+        }
+    }
+
+    return CK_UNAVAILABLE_INFORMATION;
+}
 
 /*
 */
@@ -244,10 +254,27 @@ void Template::checkTemplate( CK_ATTRIBUTE_PTR a_pTemplate, const CK_ULONG& a_ul
 
         case CKO_PUBLIC_KEY:
             {
-                if(  isPresent( a_pTemplate, a_ulCount, CKA_CLASS ) && isPresent( a_pTemplate, a_ulCount, CKA_KEY_TYPE ) && !isPresent( a_pTemplate, a_ulCount, CKA_LOCAL ) && !isPresent( a_pTemplate, a_ulCount, CKA_KEY_GEN_MECHANISM )
-                    && isPresent( a_pTemplate, a_ulCount, CKA_MODULUS ) && !isPresent( a_pTemplate, a_ulCount, CKA_MODULUS_BITS ) && isPresent(a_pTemplate, a_ulCount, CKA_PUBLIC_EXPONENT ) ) {
-
+                if(  isPresent( a_pTemplate, a_ulCount, CKA_CLASS ) 
+                    && isPresent( a_pTemplate, a_ulCount, CKA_KEY_TYPE ) 
+                    && !isPresent( a_pTemplate, a_ulCount, CKA_LOCAL ) 
+                    && !isPresent( a_pTemplate, a_ulCount, CKA_KEY_GEN_MECHANISM )
+                   )
+                {
+                    if (  ( CKK_RSA == getKeyType(a_pTemplate, a_ulCount))
+                        && isPresent( a_pTemplate, a_ulCount, CKA_MODULUS ) 
+                        && !isPresent( a_pTemplate, a_ulCount, CKA_MODULUS_BITS ) 
+                        && isPresent(a_pTemplate, a_ulCount, CKA_PUBLIC_EXPONENT ) ) 
+                    {
                         return;
+                    }
+
+                    if (  ( CKK_EC == getKeyType(a_pTemplate, a_ulCount))
+                        &&( isPresent(a_pTemplate, a_ulCount, CKA_EC_PARAMS))
+                        &&( isPresent(a_pTemplate, a_ulCount, CKA_EC_POINT))
+                       )
+                    {
+                        return;
+                    }
                 }
             }
             break;
@@ -260,13 +287,38 @@ void Template::checkTemplate( CK_ATTRIBUTE_PTR a_pTemplate, const CK_ULONG& a_ul
                     &&(!isPresent(a_pTemplate, a_ulCount, CKA_KEY_GEN_MECHANISM))
                     &&(!isPresent(a_pTemplate, a_ulCount, CKA_ALWAYS_SENSITIVE))
                     &&(!isPresent(a_pTemplate, a_ulCount, CKA_NEVER_EXTRACTABLE))
-                    &&( isPresent(a_pTemplate, a_ulCount, CKA_MODULUS))
-                    &&( isPresent(a_pTemplate, a_ulCount, CKA_PRIVATE_EXPONENT))
-                    &&( isPresent(a_pTemplate, a_ulCount, CKA_PRIME_1))
-                    &&( isPresent(a_pTemplate, a_ulCount, CKA_PRIME_2))
-                    &&( isPresent(a_pTemplate, a_ulCount, CKA_EXPONENT_1))
-                    &&( isPresent(a_pTemplate, a_ulCount, CKA_EXPONENT_2))
-                    &&( isPresent(a_pTemplate, a_ulCount, CKA_COEFFICIENT))
+                    )
+                {
+                    if (  ( CKK_RSA == getKeyType(a_pTemplate, a_ulCount))
+                        &&( isPresent(a_pTemplate, a_ulCount, CKA_MODULUS))
+                        &&( isPresent(a_pTemplate, a_ulCount, CKA_PRIVATE_EXPONENT))
+                        &&( isPresent(a_pTemplate, a_ulCount, CKA_PRIME_1))
+                        &&( isPresent(a_pTemplate, a_ulCount, CKA_PRIME_2))
+                        &&( isPresent(a_pTemplate, a_ulCount, CKA_EXPONENT_1))
+                        &&( isPresent(a_pTemplate, a_ulCount, CKA_EXPONENT_2))
+                        &&( isPresent(a_pTemplate, a_ulCount, CKA_COEFFICIENT))
+                       )
+                    {
+                        return;
+                    }
+                    if (  ( CKK_EC == getKeyType(a_pTemplate, a_ulCount))
+                        &&( isPresent(a_pTemplate, a_ulCount, CKA_EC_PARAMS))
+                        &&( isPresent(a_pTemplate, a_ulCount, CKA_VALUE))
+                       )
+                    {
+                        return;
+                    }
+                }
+            }
+            break;
+
+        case CKO_SECRET_KEY:
+            {
+                if (  ( isPresent(a_pTemplate, a_ulCount, CKA_CLASS))
+                    &&( isPresent(a_pTemplate, a_ulCount, CKA_KEY_TYPE))
+                    &&(!isPresent(a_pTemplate, a_ulCount, CKA_LOCAL))
+                    &&( isPresent(a_pTemplate, a_ulCount, CKA_VALUE))
+                    &&( !isPresent(a_pTemplate, a_ulCount, CKA_VALUE_LEN))
                     )
                 {
                     return;
@@ -286,8 +338,10 @@ void Template::checkTemplate( CK_ATTRIBUTE_PTR a_pTemplate, const CK_ULONG& a_ul
         if (  (!isPresent(a_pTemplate, a_ulCount, CKA_LOCAL))
             &&(!isPresent(a_pTemplate, a_ulCount, CKA_KEY_GEN_MECHANISM))
             &&(!isPresent(a_pTemplate, a_ulCount, CKA_MODULUS))
-            &&( isPresent(a_pTemplate, a_ulCount, CKA_MODULUS_BITS))
-            &&( isPresent(a_pTemplate, a_ulCount, CKA_PUBLIC_EXPONENT))
+            &&( 
+                  (isPresent(a_pTemplate, a_ulCount, CKA_MODULUS_BITS) && isPresent(a_pTemplate, a_ulCount, CKA_PUBLIC_EXPONENT))
+               || ( !isPresent(a_pTemplate, a_ulCount, CKA_EC_POINT) && isPresent(a_pTemplate, a_ulCount, CKA_EC_PARAMS))
+              )
             )
         {
             return;
@@ -309,7 +363,21 @@ void Template::checkTemplate( CK_ATTRIBUTE_PTR a_pTemplate, const CK_ULONG& a_ul
             &&(!isPresent(a_pTemplate, a_ulCount, CKA_EXPONENT_1))
             &&(!isPresent(a_pTemplate, a_ulCount, CKA_EXPONENT_2))
             &&(!isPresent(a_pTemplate, a_ulCount, CKA_COEFFICIENT))
+            &&(!isPresent(a_pTemplate, a_ulCount, CKA_EC_PARAMS))
+            &&(!isPresent(a_pTemplate, a_ulCount, CKA_VALUE))
             )
+        {
+            return;
+        }
+    }
+    else if (a_bMode == MODE_GENERATE_SECRET)
+    {
+        if (  (!isPresent(a_pTemplate, a_ulCount, CKA_LOCAL))
+            &&(!isPresent(a_pTemplate, a_ulCount, CKA_KEY_GEN_MECHANISM))
+            &&(!isPresent(a_pTemplate, a_ulCount, CKA_ALWAYS_SENSITIVE))
+            &&(!isPresent(a_pTemplate, a_ulCount, CKA_NEVER_EXTRACTABLE))
+            &&(!isPresent(a_pTemplate, a_ulCount, CKA_VALUE))
+           )
         {
             return;
         }

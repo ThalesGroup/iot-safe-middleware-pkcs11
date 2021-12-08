@@ -1,6 +1,7 @@
 /*
-*  PKCS#11 library for .Net smart cards
+*  PKCS#11 library for IoT Safe
 *  Copyright (C) 2007-2009 Gemalto <support@gemalto.com>
+*  Copyright (C) 2009-2021 Thales
 *
 *  This library is free software; you can redistribute it and/or
 *  modify it under the terms of the GNU Lesser General Public
@@ -17,16 +18,21 @@
 *  Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301  USA
 *
 */
+#ifdef WIN32
+#ifndef _WIN32_WINNT
+#define _WIN32_WINNT 0x0501
+#endif
+#include <Windows.h>
+#endif
 
-
-#include <boost/foreach.hpp>
+// #include <boost/foreach.hpp>
 #include <fstream>
 #include <memory>
 #include "MiniDriverFiles.hpp"
 #include "MiniDriverException.hpp"
 #include "Log.hpp"
 #include "util.h"
-#include "Array.hpp"
+#include "Array.h"
 #include<boost/tokenizer.hpp>
 #include "Timer.hpp"
 #include "Device.hpp"
@@ -39,7 +45,8 @@ const int MAX_RETRY = 2;
 
 /* Constructor
 */
-MiniDriverFiles::MiniDriverFiles( ) { 
+MiniDriverFiles::MiniDriverFiles(const MiniDriverAuthentication& authentication )  : m_Authentication(authentication), m_ContainerMapFile(authentication), m_bIsStaticProfile(false) 
+{ 
 
     m_ContainerMapFile.setMiniDriverFiles( this );
 
@@ -93,7 +100,7 @@ void MiniDriverFiles::hasChanged( MiniDriverCardCacheFile::ChangeType& a_Pins, M
 
 /* Write the incoming data into the incoming pointed path into the smartcard and then into the cache
 */
-void MiniDriverFiles::writeFile( const std::string& a_stDirectory, const std::string& a_stFile, Marshaller::u1Array* a_pData, const bool& a_bAddToCache, const bool& a_bUpdateContainerCounter ) {
+void MiniDriverFiles::writeFile( const std::string& a_stDirectory, const std::string& a_stFile, u1Array* a_pData, const bool& /*a_bAddToCache*/, const bool& a_bUpdateContainerCounter ) {
 
     Log::begin( "MiniDriverFiles::writeFile" );
     Log::log( "MiniDriverFiles::writeFile - Directory <%s> - File <%s>", a_stDirectory.c_str( ), a_stFile.c_str( ) );
@@ -124,9 +131,9 @@ void MiniDriverFiles::writeFile( const std::string& a_stDirectory, const std::st
 
             Log::error( "MiniDriverFiles::writeFile", "WriteFile failed" );
 
-            unsigned long ulError = x.getError( );
+            long lError = x.getError( );
 
-            if ( SCARD_E_NO_MEMORY == ulError ) {
+            if ( SCARD_E_NO_MEMORY == lError ) {
 
                 // V2+ cards may throw OutOfMemoryException from ReadFile, however it may recover from this by forcing the garbage collection to
                 // occur. In fact as a result of a ReadFile command that throws OutOfMemoryException, GC has already occured, so the command may
@@ -154,7 +161,7 @@ void MiniDriverFiles::writeFile( const std::string& a_stDirectory, const std::st
     } 
 
     // Prepare the binary file content
-    Marshaller::u1Array* f = new Marshaller::u1Array( a_pData->GetLength( ) );
+    u1Array* f = new u1Array( a_pData->GetLength( ) );
     
     f->SetBuffer( a_pData->GetBuffer( ) );
 
@@ -164,12 +171,14 @@ void MiniDriverFiles::writeFile( const std::string& a_stDirectory, const std::st
     
         // Add the new file to the cache
         std::string stFile = a_stFile;
-        m_BinaryFiles.insert( stFile, f );
+        u1ArraySerializable *sPtr = new u1ArraySerializable(f);
+        m_BinaryFiles.insert( stFile, sPtr );
     
     } else {
     
         // Update the new file to the cache
-        m_BinaryFiles[ a_stFile ] = *f;
+       u1ArraySerializable sPtr(f);
+        m_BinaryFiles[ a_stFile ] = sPtr;
     }
 
     m_CardCacheFile.notifyChange( MiniDriverCardCacheFile::FILES );
@@ -192,7 +201,9 @@ void MiniDriverFiles::writeFile( const std::string& a_stDirectory, const std::st
 */
 void MiniDriverFiles::cacheDisableWrite( void ) {
 
-    BOOST_FOREACH( const std::string& s, m_FilesToNotCache ) {
+    // BOOST_FOREACH( const std::string& s, m_FilesToNotCache ) {
+	for (std::vector<std::string>::iterator iter = m_FilesToNotCache.begin () ; iter != m_FilesToNotCache.end (); ++iter) {
+		std::string& s = (std::string&)*iter;
         
         m_BinaryFiles.erase( s );
     }
@@ -232,7 +243,7 @@ MiniDriverFiles::FILES_NAME & MiniDriverFiles::enumFiles( const std::string& a_s
 
                     throw MiniDriverException( SCARD_E_NO_SMARTCARD );
                 }
-                boost::shared_ptr< Marshaller::StringArray > f( m_CardModule->getFiles( (std::string*)&a_stDirectory ) );
+                boost::shared_ptr< StringArray > f( m_CardModule->getFiles( (std::string*)&a_stDirectory ) );
 
                 // Fill the cache with the list of the files of this directory
                 size_t l = f->GetLength( );
@@ -255,8 +266,8 @@ MiniDriverFiles::FILES_NAME & MiniDriverFiles::enumFiles( const std::string& a_s
 
                 Log::error( "MiniDriverFiles::enumFiles", "getFiles failed" );
 
-                unsigned long ulError = x.getError( );
-                if ( SCARD_E_NO_MEMORY == ulError ) {
+                long lError = x.getError( );
+                if ( SCARD_E_NO_MEMORY == lError ) {
 
                     // V2+ cards may throw OutOfMemoryException from ReadFile, however it may recover from this by forcing the garbage collection to
                     // occur. In fact as a result of a ReadFile command that throws OutOfMemoryException, GC has already occured, so the command may
@@ -352,7 +363,7 @@ void MiniDriverFiles::createDirectory( const std::string& a_stDirectoryParent, c
 
     if( i == m_Directories.end( ) ) {
 
-        Marshaller::u1Array ac( 3 );
+        u1Array ac( 3 );
 
         // Administrator access condition
         ac.GetBuffer( )[ 0 ] = CARD_PERMISSION_READ | CARD_PERMISSION_WRITE;
@@ -384,8 +395,8 @@ void MiniDriverFiles::createDirectory( const std::string& a_stDirectoryParent, c
 
                 Log::error( "MiniDriverFiles::createDirectory", "createDirectory failed" );
 
-                unsigned long ulError = x.getError( );
-                if ( SCARD_E_NO_MEMORY == ulError ) {
+                long lError = x.getError( );
+                if ( SCARD_E_NO_MEMORY == lError ) {
 
                     // V2+ cards may throw OutOfMemoryException from ReadFile, however it may recover from this by forcing the garbage collection to
                     // occur. In fact as a result of a ReadFile command that throws OutOfMemoryException, GC has already occured, so the command may
@@ -417,7 +428,7 @@ void MiniDriverFiles::createDirectory( const std::string& a_stDirectoryParent, c
 
 /*
 */
-void MiniDriverFiles::createFile( const std::string& a_stDirectory, const std::string& a_stFile, Marshaller::u1Array* a_pAccessConditions ) {
+void MiniDriverFiles::createFile( const std::string& a_stDirectory, const std::string& a_stFile, u1Array* a_pAccessConditions ) {
 
     Log::begin( "MiniDriverFiles::createFile" );
     Log::log( "MiniDriverFiles::createFile - Directory <%s> - File <%s>", a_stDirectory.c_str( ), a_stFile.c_str( ) );
@@ -449,9 +460,9 @@ void MiniDriverFiles::createFile( const std::string& a_stDirectory, const std::s
 
             Log::error( "MiniDriverFiles::createFile", "createFile failed" );
 
-            unsigned long ulError = x.getError( );
+            long lError = x.getError( );
 
-            if ( SCARD_E_NO_MEMORY == ulError ) {
+            if ( SCARD_E_NO_MEMORY == lError ) {
 
                 // V2+ cards may throw OutOfMemoryException from ReadFile, however it may recover from this by forcing the garbage collection to
                 // occur. In fact as a result of a ReadFile command that throws OutOfMemoryException, GC has already occured, so the command may
@@ -486,7 +497,7 @@ void MiniDriverFiles::createFile( const std::string& a_stDirectory, const std::s
     }
 
     // Prepare the binary file content
-    Marshaller::u1Array* f = new Marshaller::u1Array( 0 );
+    u1Array* f = new u1Array( 0 );
 
     FILES_BINARY::iterator filesIterator = m_BinaryFiles.find( a_stFile );
 
@@ -494,12 +505,14 @@ void MiniDriverFiles::createFile( const std::string& a_stDirectory, const std::s
     
         // Add the new file to the cache
         std::string stFile = a_stFile;
-        m_BinaryFiles.insert( stFile, f );
+        u1ArraySerializable* sPtr = new u1ArraySerializable(f);
+        m_BinaryFiles.insert( stFile, sPtr );
     
     } else {
     
         // Update the new file to the cache
-        m_BinaryFiles[ a_stFile ] = *f;
+       u1ArraySerializable sPtr(f);
+        m_BinaryFiles[ a_stFile ] = sPtr;
     }
 
     // Update the minidriver cache file
@@ -546,9 +559,9 @@ void  MiniDriverFiles::deleteFile( const std::string& a_stDirectory, const std::
 
             Log::error( "MiniDriverFiles::deleteFile", "deleteFile failed" );
 
-            unsigned long ulError = x.getError( );
+            long lError = x.getError( );
 
-            if ( SCARD_E_NO_MEMORY == ulError ) {
+            if ( SCARD_E_NO_MEMORY == lError ) {
 
                 // V2+ cards may throw OutOfMemoryException from ReadFile, however it may recover from this by forcing the garbage collection to
                 // occur. In fact as a result of a ReadFile command that throws OutOfMemoryException, GC has already occured, so the command may
@@ -595,6 +608,13 @@ void  MiniDriverFiles::deleteFile( const std::string& a_stDirectory, const std::
     Log::end( "MiniDriverFiles::deleteFile" );
 }
 
+/*
+*/
+
+bool MiniDriverFiles::containerReadOnly( const unsigned char& a_ucContainerIndex )
+{
+    return m_CardModule->IsReadOnly (a_ucContainerIndex);
+}
 
 /*
 */
@@ -624,7 +644,7 @@ void MiniDriverFiles::deleteFileStructure( void ) {
 
 /*
 */
-void MiniDriverFiles::certificateDelete( unsigned char& a_ucContainerIndex ) {
+void MiniDriverFiles::certificateDelete( unsigned char& a_ucContainerIndex, unsigned char& a_ucKeySpec ) {
 
     Log::begin( "MiniDriver::certificateDelete" );
     Timer t;
@@ -639,7 +659,8 @@ void MiniDriverFiles::certificateDelete( unsigned char& a_ucContainerIndex ) {
     }
 
     // Build the certificate name to associate it to the container 
-    std::string stCertificateName = ( c.getKeyExchangeSizeBits( ) ? std::string ( szUSER_KEYEXCHANGE_CERT_PREFIX ) : std::string( szUSER_SIGNATURE_CERT_PREFIX ) );
+	bool bIsExchange = (a_ucKeySpec == KEY_EXCHANGE) || (a_ucKeySpec == ECDHE_256) ||(a_ucKeySpec == ECDHE_384) ||(a_ucKeySpec == ECDHE_521);
+    std::string stCertificateName = ( bIsExchange ? std::string ( szUSER_KEYEXCHANGE_CERT_PREFIX ) : std::string( szUSER_SIGNATURE_CERT_PREFIX ) );
     Util::toStringHex( a_ucContainerIndex, stCertificateName );
 
     // Delete the file
@@ -652,15 +673,26 @@ void MiniDriverFiles::certificateDelete( unsigned char& a_ucContainerIndex ) {
 
 /*
 */
-bool MiniDriverFiles::containerGetMatching( unsigned char& a_ucContainerIndex, unsigned char& a_ucKeySpec, std::string& a_stFileName, const Marshaller::u1Array* a_pPublicKeyModulus ) {
+bool MiniDriverFiles::containerGetMatching( MiniDriverAuthentication::ROLES role, unsigned char& a_ucContainerIndex, unsigned char& a_ucKeySpec, std::string& a_stFileName, const u1Array* a_pPublicKeyModulus ) {
 
-    bool bRet = m_ContainerMapFile.containerGetMatching( a_ucContainerIndex, a_ucKeySpec, a_pPublicKeyModulus );
+    bool bRet = m_ContainerMapFile.containerGetMatching( role, a_ucContainerIndex, a_ucKeySpec, a_pPublicKeyModulus );
 
     // Build the public key name to associate it to the container 
     if( bRet ) {
 
         // Add the same as associated certificate prefix
-        a_stFileName = ( a_ucKeySpec ? std::string ( szUSER_KEYEXCHANGE_CERT_PREFIX ) : std::string( szUSER_SIGNATURE_CERT_PREFIX ) );
+        if (    (a_ucKeySpec == MiniDriverContainer::KEYSPEC_EXCHANGE)
+            ||  (a_ucKeySpec == MiniDriverContainer::KEYSPEC_ECDHE_256)
+            ||  (a_ucKeySpec == MiniDriverContainer::KEYSPEC_ECDHE_384)
+            ||  (a_ucKeySpec == MiniDriverContainer::KEYSPEC_ECDHE_521)
+           )
+        {
+            a_stFileName = std::string ( szUSER_KEYEXCHANGE_CERT_PREFIX );
+        }
+        else
+        {                
+            a_stFileName = std::string( szUSER_SIGNATURE_CERT_PREFIX );
+        }
 
         // Add the index
         Util::toStringHex( a_ucContainerIndex, a_stFileName );
@@ -675,10 +707,10 @@ bool MiniDriverFiles::containerGetMatching( unsigned char& a_ucContainerIndex, u
 void MiniDriverFiles::renameFile( const std::string& a_stOldFileDirectory, const std::string& a_stOldFileName, const std::string& a_stNewFileDirectory, const std::string& a_stNewFileName ) {
 
     // First read the old file
-    Marshaller::u1Array* p = readFile( a_stOldFileDirectory, a_stOldFileName );
+   std::unique_ptr<u1Array> p(readFile( a_stOldFileDirectory, a_stOldFileName ));
 
     // Compute the access conditions for the new file
-    Marshaller::u1Array ac( 3 );
+    u1Array ac( 3 );
 
     // Administrator access condition
     ac.GetBuffer( )[ 0 ] = CARD_PERMISSION_READ | CARD_PERMISSION_WRITE;
@@ -692,14 +724,25 @@ void MiniDriverFiles::renameFile( const std::string& a_stOldFileDirectory, const
     // Create the new file
     createFile( a_stNewFileDirectory, a_stNewFileName, &ac );
 
-    // Write the new file
-    writeFile( a_stNewFileDirectory, a_stNewFileName, p );
+	try
+	{
+		// Write the new file
+		writeFile( a_stNewFileDirectory, a_stNewFileName, p.get() );
+	}
+	catch(MiniDriverException& x)
+	{
+		deleteFile(a_stNewFileDirectory, a_stNewFileName);
+		throw x;
+	}
 
     // Delete the old file
   	deleteFile( a_stOldFileDirectory, a_stOldFileName );
 }
 
-
+/*** 
+	For debugging session only 
+**/
+/*
 void MiniDriverFiles::print( void ) {
 
     Log::begin( "MiniDriverFiles::print" );
@@ -710,7 +753,7 @@ void MiniDriverFiles::print( void ) {
     for( FILES_BINARY::const_iterator i = m_BinaryFiles.begin( ) ; i != m_BinaryFiles.end( ) ; ++i ) {
     
         stFileContent = "";
-        Log::toString( i->second->GetBuffer( ), i->second->GetLength( ), stFileContent );
+        Log::toString( i->second->GetArray()->GetBuffer( ), i->second->GetArray()->GetLength( ), stFileContent );
         Log::log( "Binary files <%s> <%s>", i->first.c_str( ), stFileContent.c_str( ) );
     }
 
@@ -735,7 +778,7 @@ void MiniDriverFiles::print( void ) {
 
     Log::end( "MiniDriverFiles::print" );
 }
-
+*/
 
 /*
 */
@@ -796,14 +839,14 @@ unsigned char MiniDriverFiles::computeIndex( const std::string& a_stFileName ) {
 
 /*
 */
-Marshaller::u1Array* MiniDriverFiles::readFileWithoutCheck( const std::string& a_stDirectory, const std::string& a_stFile ) {
+u1Array* MiniDriverFiles::readFileWithoutCheck( const std::string& a_stDirectory, const std::string& a_stFile ) {
 
     Log::begin( "MiniDriverFiles::readFileWithoutCheck" );
     Log::log( "MiniDriverFiles::readFileWithoutCheck - Directory <%s> - File <%s>", a_stDirectory.c_str( ), a_stFile.c_str( ) );
     Timer t;
     t.start( );
 
-    Marshaller::u1Array* f = NULL;
+    u1Array* f = NULL;
 
     int ntry = 0;
 
@@ -832,16 +875,16 @@ Marshaller::u1Array* MiniDriverFiles::readFileWithoutCheck( const std::string& a
 
             Log::error( "MiniDriverFiles::readFileWithoutCheck", "readFile failed" );
 
-            unsigned long ulError = x.getError( );
+            long lError = x.getError( );
 
-            if ( SCARD_E_COMM_DATA_LOST == ulError ) {
+            if ( SCARD_E_COMM_DATA_LOST == lError ) {
             
                 if( ntry >= MAX_RETRY ) {
 
                     throw MiniDriverException( SCARD_E_COMM_DATA_LOST );
                 }
 
-            } else if ( SCARD_E_NO_MEMORY == ulError ) {
+            } else if ( SCARD_E_NO_MEMORY == lError ) {
 
                 // V2+ cards may throw OutOfMemoryException from ReadFile, however it may recover from this by forcing the garbage collection to
                 // occur. In fact as a result of a ReadFile command that throws OutOfMemoryException, GC has already occured, so the command may
@@ -851,7 +894,7 @@ Marshaller::u1Array* MiniDriverFiles::readFileWithoutCheck( const std::string& a
                     throw MiniDriverException( SCARD_E_NO_MEMORY );
                 }
 
-            } else if( SCARD_E_FILE_NOT_FOUND == ulError ) {
+            } else if( SCARD_E_FILE_NOT_FOUND == lError ) {
 
                 // Delete the file from the directory cache
                 DIRECTORIES::const_iterator i = m_Directories.find( a_stDirectory );
@@ -900,7 +943,7 @@ Marshaller::u1Array* MiniDriverFiles::readFileWithoutCheck( const std::string& a
 
 /* ReadFile
 */
-Marshaller::u1Array* MiniDriverFiles::readFile( const std::string& a_stDirectory, const std::string& a_stFile ) {
+u1Array* MiniDriverFiles::readFile( const std::string& a_stDirectory, const std::string& a_stFile ) {
 
     Log::begin( "MiniDriverFiles::readFile" );
     Log::log( "MiniDriverFiles::readFile - Directory <%s> - File <%s>", a_stDirectory.c_str( ), a_stFile.c_str( ) );
@@ -931,7 +974,7 @@ Marshaller::u1Array* MiniDriverFiles::readFile( const std::string& a_stDirectory
 
                     throw MiniDriverException( SCARD_E_NO_SMARTCARD );
                 }
-               Marshaller::u1Array* f = m_CardModule->readFile( (std::string*)&stPath );
+               u1Array* f = m_CardModule->readFile( (std::string*)&stPath );
 
                 // Store the binary file content
                 FILES_BINARY::iterator filesIterator = m_BinaryFiles.find( a_stFile );
@@ -940,12 +983,14 @@ Marshaller::u1Array* MiniDriverFiles::readFile( const std::string& a_stDirectory
     
                     // Add the new file to the cache
                     std::string stFile = a_stFile;
-                    m_BinaryFiles.insert( stFile, f );
+                    u1ArraySerializable* sPtr = new u1ArraySerializable(f);
+                    m_BinaryFiles.insert( stFile, sPtr );
     
                 } else {
     
                     // Update the new file to the cache
-                    m_BinaryFiles[ a_stFile ] = *f;
+                   u1ArraySerializable sPtr(f);
+                    m_BinaryFiles[ a_stFile ] = sPtr;
                 }
 
                 break;
@@ -954,15 +999,15 @@ Marshaller::u1Array* MiniDriverFiles::readFile( const std::string& a_stDirectory
 
                 Log::error( "MiniDriverFiles::readFile", "readFile failed" );
 
-                unsigned long ulError = x.getError( );
-            if ( SCARD_E_COMM_DATA_LOST == ulError ) {
+                long lError = x.getError( );
+            if ( SCARD_E_COMM_DATA_LOST == lError ) {
             
                 if( ntry >= MAX_RETRY ) {
 
                     throw MiniDriverException( SCARD_E_COMM_DATA_LOST );
                 }
 
-            } else if ( SCARD_E_NO_MEMORY == ulError ) {
+            } else if ( SCARD_E_NO_MEMORY == lError ) {
 
                     // V2+ cards may throw OutOfMemoryException from ReadFile, however it may recover from this by forcing the garbage collection to
                     // occur. In fact as a result of a ReadFile command that throws OutOfMemoryException, GC has already occured, so the command may
@@ -974,7 +1019,7 @@ Marshaller::u1Array* MiniDriverFiles::readFile( const std::string& a_stDirectory
 
                 } else {
 
-                    if( SCARD_E_FILE_NOT_FOUND == ulError ) {
+                    if( SCARD_E_FILE_NOT_FOUND == lError ) {
                     
                         // Delete the file from the directory cache
                         DIRECTORIES::const_iterator i = m_Directories.find( a_stDirectory );
@@ -1007,12 +1052,18 @@ Marshaller::u1Array* MiniDriverFiles::readFile( const std::string& a_stDirectory
     }
 
     // Log
-    std::string s = "";
-    Log::toString( m_BinaryFiles[ a_stFile ].GetBuffer( ), m_BinaryFiles[ a_stFile ].GetLength( ), s );
-    Log::log( "MiniDriverFiles::readFile - path <%s> (Read from %s) - data <%s>", a_stFile.c_str( ), stFrom.c_str( ), s.c_str( ) );
+    if (Log::s_bEnableLog)
+    {
+        std::string s = "";
+        if (m_BinaryFiles[ a_stFile ].GetArray())
+        {
+            Log::toString( m_BinaryFiles[ a_stFile ].GetArray()->GetBuffer( ), m_BinaryFiles[ a_stFile ].GetArray()->GetLength( ), s );
+        }
+        Log::log( "MiniDriverFiles::readFile - path <%s> (Read from %s) - data <%s>", a_stFile.c_str( ), stFrom.c_str( ), s.c_str( ) );
+    }
 
     t.stop( "MiniDriverFiles::readFile" );
     Log::end( "MiniDriverFiles::readFile" );
 
-    return &m_BinaryFiles[ a_stFile ];
+    return m_BinaryFiles[ a_stFile ].CloneArray();
 }

@@ -1,6 +1,7 @@
 /*
-*  PKCS#11 library for .Net smart cards
+*  PKCS#11 library for IoT Safe
 *  Copyright (C) 2007-2009 Gemalto <support@gemalto.com>
+*  Copyright (C) 2009-2021 Thales
 *
 *  This library is free software; you can redistribute it and/or
 *  modify it under the terms of the GNU Lesser General Public
@@ -17,8 +18,6 @@
 *  Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301  USA
 *
 */
-
-
 #include "Log.hpp"
 #include "util.h"
 #include "Pkcs11ObjectCertificate.hpp"
@@ -49,8 +48,22 @@ bool CertificateObject::isEqual( StorageObject * that) const
     }
 
     const CertificateObject* thatCert = static_cast< const CertificateObject* >( that );
-
-    return ( ( m_ucContainerIndex == thatCert->m_ucContainerIndex ) && ( m_ucKeySpec == thatCert->m_ucKeySpec ) );
+    if (m_ucContainerIndex == 0xFF && thatCert->m_ucContainerIndex == 0xFF)
+    {
+       if (m_ucKeySpec == thatCert->m_ucKeySpec)
+       {
+          if (m_stCertificateName == "msroots")
+          {
+             return m_pLabel && thatCert->m_pLabel && m_pLabel->IsEqual(thatCert->m_pLabel.get());
+          }
+          else
+             return m_stCertificateName == thatCert->m_stCertificateName;
+       }
+       else
+          return false;
+    }
+    else
+      return ( ( m_ucContainerIndex == thatCert->m_ucContainerIndex ) && ( m_ucKeySpec == thatCert->m_ucKeySpec ) );
 }
 
 
@@ -99,8 +112,18 @@ void CertificateObject::setAttribute( const CK_ATTRIBUTE& a_Attribute, const boo
         switch( a_Attribute.type ) {
 
         case CKA_CERTIFICATE_TYPE:
-        case CKA_CERTIFICATE_CATEGORY:
+            if (a_Attribute.pValue && a_Attribute.ulValueLen != sizeof(CK_CERTIFICATE_TYPE))
+                throw PKCS11Exception( CKR_ATTRIBUTE_VALUE_INVALID );
             throw PKCS11Exception( CKR_ATTRIBUTE_READ_ONLY );
+        case CKA_CERTIFICATE_CATEGORY:
+            if (a_Attribute.pValue && a_Attribute.ulValueLen != sizeof(CK_ULONG))
+                throw PKCS11Exception( CKR_ATTRIBUTE_VALUE_INVALID );
+            throw PKCS11Exception( CKR_ATTRIBUTE_READ_ONLY );
+        case CKA_START_DATE:
+        case CKA_END_DATE:
+            if (a_Attribute.pValue && a_Attribute.ulValueLen != sizeof(CK_DATE))
+                throw PKCS11Exception( CKR_ATTRIBUTE_VALUE_INVALID );
+            break;
         }
     }
 

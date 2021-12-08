@@ -1,6 +1,7 @@
 /*
-*  PKCS#11 library for .Net smart cards
+*  PKCS#11 library for IoT Safe
 *  Copyright (C) 2007-2009 Gemalto <support@gemalto.com>
+*  Copyright (C) 2009-2021 Thales
 *
 *  This library is free software; you can redistribute it and/or
 *  modify it under the terms of the GNU Lesser General Public
@@ -17,8 +18,6 @@
 *  Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301  USA
 *
 */
-
-
 #ifndef __GEMALTO_PKCS11_OBJECT_STORAGE__
 #define __GEMALTO_PKCS11_OBJECT_STORAGE__
 
@@ -26,7 +25,7 @@
 #include <string>
 #include <memory>
 #include "cryptoki.h"
-#include "Array.hpp"
+#include "Array.h"
 #include <boost/shared_ptr.hpp>
 
 
@@ -69,9 +68,11 @@ public:
 
     virtual void print( void );
 
-	void putU1ArrayInAttribute( Marshaller::u1Array*, CK_ATTRIBUTE_PTR );
+	void putU1ArrayInAttribute( u1Array*, CK_ATTRIBUTE_PTR );
 
-	void putU4ArrayInAttribute( Marshaller::u4Array*, CK_ATTRIBUTE_PTR );
+    void putBytearrayInAttribute( CK_BYTE*, CK_ULONG, CK_ATTRIBUTE_PTR );
+
+	void putU4ArrayInAttribute( u4Array*, CK_ATTRIBUTE_PTR );
 
 	void putULongInAttribute( const CK_ULONG&, CK_ATTRIBUTE_PTR );
 
@@ -81,9 +82,9 @@ public:
 
 	CK_ULONG readULongFromAttribute( const CK_ATTRIBUTE& );
 
-	Marshaller::u1Array* readU1ArrayFromAttribute( const CK_ATTRIBUTE& );
+	u1Array* readU1ArrayFromAttribute( const CK_ATTRIBUTE& );
 
-	Marshaller::u1Array* readDateFromAttribute( const CK_ATTRIBUTE& );
+	u1Array* readDateFromAttribute( const CK_ATTRIBUTE& );
 
 	int m_iVersion;
 	
@@ -95,7 +96,7 @@ public:
 
 	CK_BBOOL m_Modifiable;
 
-	boost::shared_ptr< Marshaller::u1Array > m_pLabel;
+	boost::shared_ptr< u1Array > m_pLabel;
 
     u8 _uniqueId;
 

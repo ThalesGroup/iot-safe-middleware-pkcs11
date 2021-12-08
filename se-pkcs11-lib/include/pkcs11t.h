@@ -1,6 +1,3 @@
-/* pkcs11t.h include file for PKCS #11. */
-/* $Revision: 1.1 $ */
-
 /* License to copy and use this software is granted provided that it is
  * identified as "RSA Security Inc. PKCS #11 Cryptographic Token Interface
  * (Cryptoki)" in all material mentioning or referencing this software.
@@ -19,6 +16,9 @@
 /* See top of pkcs11.h for information about the macros that
  * must be defined and the structure-packing conventions that
  * must be set before including this file. */
+ 
+/* pkcs11t.h include file for PKCS #11. */
+/* $Revision: 1.3 $ */
 
 #ifndef _PKCS11T_H_
 #define _PKCS11T_H_ 1
@@ -843,6 +843,9 @@ typedef CK_ULONG          CK_MECHANISM_TYPE;
 
 #define CKM_ECDSA                      0x00001041
 #define CKM_ECDSA_SHA1                 0x00001042
+#define CKM_ECDSA_SHA256               0x00001044
+#define CKM_ECDSA_SHA384               0x00001045
+#define CKM_ECDSA_SHA512               0x00001046
 
 /* CKM_ECDH1_DERIVE, CKM_ECDH1_COFACTOR_DERIVE, and CKM_ECMQV_DERIVE
  * are new for v2.11 */
@@ -889,6 +892,10 @@ typedef CK_ULONG          CK_MECHANISM_TYPE;
 #define CKM_X9_42_DH_PARAMETER_GEN     0x00002002
 
 #define CKM_VENDOR_DEFINED             0x80000000
+
+/* new for v2.40 */
+#define CKM_AES_CMAC_GENERAL           0x00001089UL
+#define CKM_AES_CMAC                   0x0000108AUL
 
 typedef CK_MECHANISM_TYPE CK_PTR CK_MECHANISM_TYPE_PTR;
 

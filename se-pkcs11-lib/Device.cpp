@@ -1,6 +1,7 @@
 /*
-*  PKCS#11 library for .Net smart cards
+*  PKCS#11 library for IoT Safe
 *  Copyright (C) 2007-2009 Gemalto <support@gemalto.com>
+*  Copyright (C) 2009-2021 Thales
 *
 *  This library is free software; you can redistribute it and/or
 *  modify it under the terms of the GNU Lesser General Public
@@ -17,43 +18,43 @@
 *  Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301  USA
 *
 */
-
+#ifdef WIN32
+#ifndef _WIN32_WINNT
+#define _WIN32_WINNT 0x0501
+#endif
+#include <Windows.h>
+#endif
 
 #include <memory>
 #include "Device.hpp"
+#include "Application.hpp"
 
+extern Application g_Application;
 
-bool Device::s_bEnableCache = true;
+bool Device::s_bEnableDiskCache = true;
+
+std::vector<CardDesc> Device::s_vAdditionalAtrs;
 
 #define TIMEOUT_CHANGE 2.0
 
 #define TIMEOUT_AUTH 0.2
 
-const BYTE g_DotNetSmartCardAtr[ ] = { 0x3b, 0x16, 0x96, 0x41, 0x73, 0x74, 0x72, 0x69, 0x64 };
-
-
 /*
 */
-Device::Device( const SCARD_READERSTATE& a_State, const unsigned char& a_ID ) {
-
-    m_bIsLastAuth = false;
+Device::Device (const DEVICEINFO& a_DeviceInfo, const unsigned char& a_ID ) {
 
     m_ucDeviceID = a_ID;
 
-    clear( );
+    clear ();
 
     try {
+        set (a_DeviceInfo);
     
-        set( a_State );
+    } catch (...) {
     
-    } catch( ... ) {
-    
-        // A reader is available but the smart card is not a .NET smart card
     }
-
-    m_TimerLastChange.start( );
-    
-    m_TimerLastAuth.start( );
+   
+    m_TimerLastChange.start( );    
 }
 
 
@@ -69,30 +70,29 @@ Device::~Device( ) {
 */
 void Device::clear( void ) {
 
-    memset( &m_DeviceState, 0, sizeof( SCARD_READERSTATE ) );
+    memset (&m_stDeviceInfo, 0, sizeof (DEVICEINFO));
 
-    m_MiniDriver.reset( );
+    m_MiniDriver.reset ();
 
-    m_SmartCardReader.reset( );
+    clearPinCache ();
 }
 
 
 /*
 */
-void Device::set( const SCARD_READERSTATE& scr ) {
+void Device::set (const DEVICEINFO& p_stDevInfo) {
 
-    m_SmartCardReader.reset( new SmartCardReader( scr.szReader ) );
+    Log::begin ("Device::set");
 
-    m_DeviceState.szReader = m_SmartCardReader->getReaderName( ).c_str( );
-    memcpy( m_DeviceState.rgbAtr, scr.rgbAtr, scr.cbAtr );
-    m_DeviceState.cbAtr = scr.cbAtr;
-    m_DeviceState.dwCurrentState = scr.dwCurrentState;
-    m_DeviceState.dwEventState = scr.dwEventState;
+	// Get a copy of the device information
+	m_stDeviceInfo = p_stDevInfo;
 
-    if( isSmartCardPresent( ) && ! isSmartCardMute( ) ) {
+    // clear PIN cache
+    clearPinCache ();
 
-        addMiniDriver( );
-    }
+	addMiniDriver ();
+
+	Log::end ("Device::set");
 }
 
 
@@ -100,31 +100,41 @@ void Device::set( const SCARD_READERSTATE& scr ) {
 */
 void Device::addMiniDriver( void ) {
 
-    if( 0 != memcmp( g_DotNetSmartCardAtr, m_DeviceState.rgbAtr, m_DeviceState.cbAtr ) ) {
-    
-        throw MiniDriverException( SCARD_E_UNKNOWN_CARD ); 
-    }
+    Log::begin ("Device::addMiniDriver");
 
+    bool bTransactionTaken = false;
     try {
     
         // Create a card module service
         m_MiniDriver.reset( new MiniDriver( ) );
 
-        m_MiniDriver->setSmartCardReader( m_SmartCardReader.get( ) );
+        m_MiniDriver->setSmartCardReader( m_stDeviceInfo.szDeviceName, m_stDeviceInfo.rgbAtr, m_stDeviceInfo.cbAtr );
+        bTransactionTaken = beginTransaction( );
 
-        beginTransaction( );
+        m_MiniDriver->CheckSmartCardType();
 
-        m_MiniDriver->read( s_bEnableCache );
+        m_MiniDriver->read( s_bEnableDiskCache );
 
-        m_SmartCardReader->setCardHandle( m_MiniDriver->getCardHandle( ) );
+		m_AuthRoles.clear();
 
-        m_bIsLastAuth = m_MiniDriver->isAuthenticated( ); 
+        for (int i = 0; i < 6; i++)
+        {
+            MiniDriverAuthentication::ROLES role = MiniDriverAuthentication::getRoleFromIndex(i);
+            if ( m_MiniDriver->isAuthenticated( role ) )
+            {
+                m_AuthRoles[role] = true;
+                break;
+            }
+        }
     
     } catch( ... ) {
     
     }
 
-    endTransaction( );
+    if (bTransactionTaken)
+        endTransaction( );
+
+	Log::end ("Device::addMiniDriver");
 }
 
 
@@ -134,28 +144,41 @@ void Device::removeMiniDriver( void ) {
 
     // Remove the card module service
     m_MiniDriver.reset( );
+    clearPinCache();
 }
 
 
 /*
 */
+/*
 void Device::update( const SCARD_READERSTATE& scr ) {
 
-    m_DeviceState.dwCurrentState = scr.dwCurrentState;
-    m_DeviceState.dwEventState = scr.dwEventState;
-}
+    memcpy( m_DeviceInfo.rgbAtr, scr.rgbAtr, scr.cbAtr );
+    m_DeviceInfo.cbAtr = scr.cbAtr;
+    m_DeviceInfo.dwCurrentState = scr.dwCurrentState;
+    m_DeviceInfo.dwEventState = scr.dwEventState;
 
+    if( !isSmartCardPresent( ) || isSmartCardMute( ) )
+        clearPinCache();
+}
+*/
 
 /*
 */
+/*
 void Device::put( SCARD_READERSTATE& scr ) {
 
     memset( &scr, 0, sizeof( SCARD_READERSTATE ) );
-    scr.szReader = m_SmartCardReader->getReaderName( ).c_str( );
-    scr.dwCurrentState = m_DeviceState.dwCurrentState;
-    scr.dwEventState = m_DeviceState.dwEventState;
-}
+    scr.szReader = m_sSMCReader.c_str( );
+    scr.dwCurrentState = m_DeviceInfo.dwCurrentState;
+    scr.dwEventState = m_DeviceInfo.dwEventState;
+    memcpy( scr.rgbAtr, m_DeviceInfo.rgbAtr, m_DeviceInfo.cbAtr );
+    scr.cbAtr = m_DeviceInfo.cbAtr;
 
+    if( !isSmartCardPresent( ) || isSmartCardMute( ) )
+        clearPinCache();
+}
+*/
 
 /*
 */
@@ -179,11 +202,12 @@ void Device::hasChanged( MiniDriverCardCacheFile::ChangeType& a_Pins, MiniDriver
 
 /*
 */
-bool Device::isAuthenticated( void ) {
+bool Device::isAuthenticated( MiniDriverAuthentication::ROLES role ) {
 
-    if( m_TimerLastAuth.getCurrentDuration( ) < (double)TIMEOUT_AUTH ) {
+	if(		(m_TimerLastAuth.find(role) != m_TimerLastAuth.end())
+		&&	(m_TimerLastAuth[role].getCurrentDuration( ) < (double)TIMEOUT_AUTH) ) {
      
-        return m_bIsLastAuth;
+        return (m_AuthRoles[role]);
     }
 
     if( !m_MiniDriver ) {
@@ -191,51 +215,72 @@ bool Device::isAuthenticated( void ) {
         throw MiniDriverException( SCARD_E_NO_SMARTCARD ); 
     }
 
-    m_bIsLastAuth = m_MiniDriver->isAuthenticated( ); 
+    if (m_MiniDriver->isAuthenticated( role ))
+        m_AuthRoles[role] = true;
+    else
+        m_AuthRoles[role] = false;
     
-    m_TimerLastAuth.start( );
+    m_TimerLastAuth[role].start( );
 
-    return m_bIsLastAuth;
+    return (m_AuthRoles[role]);
+}
+
+void Device::changePin( MiniDriverAuthentication::ROLES role, u1Array* a_pOldPIN, u1Array* a_pNewPIN )
+{ 
+    if( m_MiniDriver.get( ) ) 
+    { 
+        m_MiniDriver->changePin( role, a_pOldPIN, a_pNewPIN );
+        m_securedPin[MiniDriverAuthentication::getRoleIndex(role)].CopyFrom(a_pNewPIN->GetBuffer(), a_pNewPIN->GetLength());
+    } 
+    else 
+        throw MiniDriverException( SCARD_E_NO_SMARTCARD ); 
 }
 
 
 /*
 */
-void Device::verifyPin( Marshaller::u1Array* a_Pin ) {
+void Device::verifyPin( MiniDriverAuthentication::ROLES role, u1Array* a_Pin ) {
 
     if( !m_MiniDriver ) {
         
         throw MiniDriverException( SCARD_E_NO_SMARTCARD ); 
     }
 
-    m_MiniDriver->verifyPin( a_Pin ); 
+    m_MiniDriver->verifyPin( role,  a_Pin); 
 
-    m_bIsLastAuth = true;
+    m_AuthRoles[role] = true;
 
-    m_TimerLastAuth.start( );
+    m_TimerLastAuth[role].start( );
+
+    m_securedPin[MiniDriverAuthentication::getRoleIndex(role)].CopyFrom(a_Pin->GetBuffer(), a_Pin->GetLength());
 }
 
 
 /*
 */
-void Device::logOut( void ) {
+void Device::logOut( MiniDriverAuthentication::ROLES role, bool bClearCache ) {
 
     if( !m_MiniDriver ) {
 
         throw MiniDriverException( SCARD_E_NO_SMARTCARD ); 
     }
 
-    m_MiniDriver->logOut( ); 
+    m_MiniDriver->logOut( role ); 
 
-    m_TimerLastAuth.start( );
+    if (bClearCache)
+    {
+        clearPinCache(role);
+    }
 
-    m_bIsLastAuth = false;
+    m_TimerLastAuth[role].start( );
+
+    m_AuthRoles[role] = false;
 }
 
 
 /*
 */
-Marshaller::u1Array* Device::getCardProperty( const unsigned char& a_ucProperty, const unsigned char& a_ucFlags ) {
+u1Array* Device::getCardProperty( const unsigned char& a_ucProperty, const unsigned char& a_ucFlags ) {
 
     if( !m_MiniDriver ) {
         
@@ -248,7 +293,7 @@ Marshaller::u1Array* Device::getCardProperty( const unsigned char& a_ucProperty,
 
 /*
 */
-void Device::setCardProperty( const unsigned char& a_ucProperty, Marshaller::u1Array* a_Data, const unsigned char& a_ucFlags ) {
+void Device::setCardProperty( const unsigned char& a_ucProperty, u1Array* a_Data, const unsigned char& a_ucFlags ) {
 
     if( !m_MiniDriver ) {
         
@@ -256,4 +301,24 @@ void Device::setCardProperty( const unsigned char& a_ucProperty, Marshaller::u1A
     }
 
     m_MiniDriver->setCardProperty( a_ucProperty, a_Data, a_ucFlags );
+}
+
+
+bool Device::beginTransaction() 
+{ 
+	bool bCardReset = false, bCardRemoved = false, bTaken = false;
+	if( m_MiniDriver.get( ) ) 
+	{ 
+		bTaken = m_MiniDriver->beginTransaction( bCardReset, bCardRemoved );
+		if (bCardReset)
+        {
+			g_Application.handleResetOnDevice(this);
+            if (bCardRemoved)
+            {
+                g_Application.handleRemovalOnDevice(this);
+            }
+        }
+	} 
+
+	return bTaken;
 }

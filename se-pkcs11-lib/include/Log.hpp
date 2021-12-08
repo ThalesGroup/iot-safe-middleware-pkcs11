@@ -1,6 +1,7 @@
 /*
-*  PKCS#11 library for .Net smart cards
+*  PKCS#11 library for IoT Safe
 *  Copyright (C) 2007-2009 Gemalto <support@gemalto.com>
+*  Copyright (C) 2009-2021 Thales
 *
 *  This library is free software; you can redistribute it and/or
 *  modify it under the terms of the GNU Lesser General Public
@@ -17,10 +18,8 @@
 *  Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301  USA
 *
 */
-
-
-#ifndef __GEMALTO_LOG__
-#define __GEMALTO_LOG__
+#ifndef __GEMALTO_LOG_H_
+#define __GEMALTO_LOG_H_
 
 
 #include <string>
@@ -44,13 +43,13 @@
 class Log {
 
 public:
-
+#if (!defined NO_FILESYSTEM || !defined LOGGER_DISABLE)
 #ifdef WIN32
 	static clock_t m_clockStart;
 #else
 	static timeval m_clockStart;
 #endif
-
+#endif
 	static void log( const char * format, ... );
 
 	static void error( const char*, const char* );
@@ -96,8 +95,8 @@ public:
 	static void CK_MECHANISM_INFOToString( CK_MECHANISM_INFO_PTR pInfo, std::string &result );
 	static void CK_SESSION_INFOToString( CK_SESSION_INFO_PTR, std::string& );
 	static void CK_USER_TYPEToString( const CK_USER_TYPE&, std::string & );
-	static void CK_ATTRIBUTEToString( const CK_ATTRIBUTE_PTR, std::string & );
-	static void CK_ATTRIBUTE_TYPEToString( const CK_ATTRIBUTE_TYPE& , std::string &, int& );
+	static void CK_ATTRIBUTEToString( const CK_ATTRIBUTE_PTR, bool, std::string & );
+	static void CK_ATTRIBUTE_TYPEToString( const CK_ATTRIBUTE_TYPE& , bool, std::string &, int& );
 
 	static void toString( std::string &result, const char * format, ... );
 	static void toString( const unsigned char* buffer, std::size_t size, std::string &result );
@@ -109,12 +108,16 @@ public:
 
 	static bool s_bEnableLog;
 
-	static char s_LogFilePath[ 512 ];
+#if (!defined NO_FILESYSTEM || !defined LOGGER_DISABLE)
+	static char s_LogFilePath[512];
+#endif
 
 private:
 
+#if (!defined NO_FILESYSTEM || !defined LOGGER_DISABLE)
     static struct timeval s_StartTimeVal;
+#endif
 };
 
 
-#endif // __GEMALTO_LOG__
+#endif			// __GEMALTO_LOG_H_

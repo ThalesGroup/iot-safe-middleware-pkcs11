@@ -1,6 +1,7 @@
 /*
-*  PKCS#11 library for .Net smart cards
+*  PKCS#11 library for IoT Safe
 *  Copyright (C) 2007-2009 Gemalto <support@gemalto.com>
+*  Copyright (C) 2009-2021 Thales
 *
 *  This library is free software; you can redistribute it and/or
 *  modify it under the terms of the GNU Lesser General Public
@@ -17,8 +18,6 @@
 *  Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301  USA
 *
 */
-
-
 #ifndef __GEMALTO_OBJECT_KEY_PRIVATE_RSA__
 #define __GEMALTO_OBJECT_KEY_PRIVATE_RSA__
 
@@ -32,28 +31,28 @@ class RSAPrivateKeyObject : public PrivateKeyObject {
 public:
 
     // Attribute CKA_PUBLIC_EXPONENT (CRT public exponent e)
-	boost::shared_ptr< Marshaller::u1Array > m_pPublicExponent;
+	boost::shared_ptr< u1Array > m_pPublicExponent;
 	
     // Attribute CKA_MODULUS (CRT modulus n)
-    boost::shared_ptr< Marshaller::u1Array > m_pModulus;
+    boost::shared_ptr< u1Array > m_pModulus;
     
 	// Attribute CKA_PRIVATE_EXPONENT (CRT private exponent d)
-    boost::shared_ptr< Marshaller::u1Array > m_pPrivateExponent;
+    boost::shared_ptr< u1Array > m_pPrivateExponent;
 	
     // Attribute CKA_PRIME_1 (CRT prime p)
-    boost::shared_ptr< Marshaller::u1Array > m_pPrime1;
+    boost::shared_ptr< u1Array > m_pPrime1;
 	
     // Attribute CKA_PRIME_2 (CRT prime q)
-    boost::shared_ptr< Marshaller::u1Array > m_pPrime2;
+    boost::shared_ptr< u1Array > m_pPrime2;
 	
     // Attribute CKA_EXPONENT_1 (CRT private exponent d modulo p-1)
-    boost::shared_ptr< Marshaller::u1Array > m_pExponent1;
+    boost::shared_ptr< u1Array > m_pExponent1;
 	
     // Attribute CKA_EXPONENT_2 (CRT private exponent d modulo q-1)
-    boost::shared_ptr< Marshaller::u1Array > m_pExponent2;
+    boost::shared_ptr< u1Array > m_pExponent2;
 	
     // Attribute CKA_COEFFICIENT (CRT coefficient q-1)
-    boost::shared_ptr< Marshaller::u1Array > m_pCoefficient;
+    boost::shared_ptr< u1Array > m_pCoefficient;
 
 	RSAPrivateKeyObject( );
 
@@ -72,6 +71,11 @@ public:
 	virtual void deserialize( std::vector< u1 >&, CK_ULONG_PTR );
 
     virtual void print( void );
+
+    // helper functions for RSA padding
+    static u1Array* PadRSAPKCS1v15( u1Array*, const CK_ULONG& );
+    static u1Array* PadRSAX509( u1Array*, const CK_ULONG& );
+    static u1Array* EncodeHashForSigning( u1Array*, const CK_ULONG&, const CK_ULONG& );
 
 };
 

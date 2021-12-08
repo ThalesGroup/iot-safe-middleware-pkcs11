@@ -26,19 +26,16 @@
 #pragma warning(disable:4201)
 // Disable error C4201 in public header
 //  nonstandard extension used : nameless struct/union
-#include <winscard.h>
 #pragma warning(pop)
 #include <specstrings.h>
 #include <bcrypt.h>
 #else
-#ifdef __APPLE__
-#include <PCSC/winscard.h>
-#include <PCSC/wintypes.h>
-#else
-#include <winscard.h>
 #include <stdint.h>
 typedef const wchar_t* LPCWSTR;
-#endif
+#include <strings.h>
+
+#include "wintypes.h"
+
 typedef ULONG * ULONG_PTR;
 typedef BYTE * PBYTE;
 typedef int ALG_ID;

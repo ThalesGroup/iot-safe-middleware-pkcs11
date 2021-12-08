@@ -1,6 +1,7 @@
 /*
-*  PKCS#11 library for .Net smart cards
-*  Copyright (C) 2007-2009 Gemalto <support@gemalto->com>
+*  PKCS#11 library for IoT Safe
+*  Copyright (C) 2007-2009 Gemalto <support@gemalto.com>
+*  Copyright (C) 2009-2021 Thales
 *
 *  This library is free software; you can redistribute it and/or
 *  modify it under the terms of the GNU Lesser General Public
@@ -17,30 +18,29 @@
 *  Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301  USA
 *
 */
+#ifdef WIN32
+#ifndef _WIN32_WINNT
+#define _WIN32_WINNT 0x0501
+#endif
+#include <Windows.h>
+#endif
 
-
-#include <cstdio>
-#include <boost/foreach.hpp>
-#include <memory>
 #include "MiniDriverContainerMapFile.hpp"
 #include "MiniDriverFiles.hpp"
+#include <cstdio>
+#include <memory>
+#include "cardmod.h"
+#include "Log.hpp"
 #include "Timer.hpp"
 #include "MiniDriverException.hpp"
-#include "sha1.h"
-/*
- #ifdef __APPLE__
-#include "PCSC/winscard.h"
-#else
-#include "winscard.h"
-#endif
-*/
-
+#include "digest.h"
 #include "PCSCMissing.h"
 
 const int g_iContainerSize = 0x56; //sizeof( CONTAINER_MAP_RECORD );
 unsigned char MiniDriverContainerMapFile::CONTAINER_INDEX_INVALID = 0xFF;
 const int CARD_PROPERTY_CONTAINER_TYPE = 0x80;
 const int CARD_PROPERTY_PIN_IDENTIFIER = 0x01;
+const int CARD_PROPERTY_PIN_IDENTIFIER_EX = 0x91;
 
 
 /*
@@ -57,7 +57,7 @@ void MiniDriverContainerMapFile::containerRead( void ) {
         return;
     }
 
-    CardModuleService* m = m_MiniDriverFiles->getCardModuleService( );
+    MiniDriverModuleService* m = m_MiniDriverFiles->getCardModuleService( );
 
     if( !m ) {
          
@@ -67,22 +67,24 @@ void MiniDriverContainerMapFile::containerRead( void ) {
     }
 
     // Reset the stored containers table
-    BOOST_FOREACH( MiniDriverContainer& c, m_Containers ) {
-
-        c.clear( );
+	for (int nI = 0 ; nI < g_MaxContainer; ++nI) {
+		MiniDriverContainer& c = m_Containers[nI];
+        c.clear( 0 );
     }
 
     // Read the CMap file
-    m_ContainerMapFileBinary.reset( m_MiniDriverFiles->readFile( std::string( szBASE_CSP_DIR ), std::string( szCONTAINER_MAP_FILE ) ) );
+   m_ContainerMapFileBinary.reset( m_MiniDriverFiles->readFile( std::string( szBASE_CSP_DIR ), std::string( szCONTAINER_MAP_FILE ) ) );
 
     // Populate the container Map records
     unsigned int uiLen = m_ContainerMapFileBinary.GetLength( );
 
     bool bContainerPresent = false;
+    unsigned char iContainersCount = 0;
+    unsigned char* b = NULL;
 
     for( unsigned int i = 0 ; i < uiLen ; ++i ) {
     
-        if( m_ContainerMapFileBinary.ReadU1At( i ) ) {
+        if( m_ContainerMapFileBinary.GetArray()->ReadU1At( i ) ) {
 
             bContainerPresent = true;
 
@@ -92,32 +94,45 @@ void MiniDriverContainerMapFile::containerRead( void ) {
 
     if( uiLen && bContainerPresent ) {
 
-        unsigned char iContainersCount = ( unsigned char )( uiLen / g_iContainerSize );
+        iContainersCount = ( unsigned char )( uiLen / g_iContainerSize );
+        b = m_ContainerMapFileBinary.GetArray()->GetBuffer( );
+    }
 
-        unsigned char* b = m_ContainerMapFileBinary.GetBuffer( );
+    // Clear all containers
+    for( unsigned char i = 0; i < g_MaxContainer; ++i )
+        m_Containers[ i ].clear( 0 );
 
-        for( unsigned char i = 0; i < iContainersCount; ++i ) {
+    // int pinProperty = CARD_PROPERTY_PIN_IDENTIFIER_EX;
+    for( unsigned char i = 0; i < g_MaxContainer; ++i ) {
         
-            try {
-
+        try {
+            try
+            {
                 // Populate the container info (throws if the container is empty)
-                boost::shared_ptr< Marshaller::u1Array > ci( m->getContainer( i ) );
+                boost::shared_ptr< u1Array > ci( m->getContainer( i ) );
 
                 std::string stContainer;
                 Log::toString( ci->GetBuffer( ), ci->GetLength( ), stContainer );
                 Log::log( "MiniDriverContainerMapFile::containerRead - index <%d> - container <%s>", i, stContainer.c_str( ) );
 
                 m_Containers[ i ].setContainerInformation( ci );
+            }
+            catch(MiniDriverException&) {}
 
+            if (bContainerPresent && (i < iContainersCount))
+            {
                 // Populate the container map record
                 m_Containers[ i ].setContainerMapRecord( (CONTAINER_MAP_RECORD*)( b + ( i * g_iContainerSize ) ) );
+            }
 
-                CardModuleService* cms = m_MiniDriverFiles->getCardModuleService( );
-                if( cms ) {
+            MiniDriverModuleService* cms = m_MiniDriverFiles->getCardModuleService( );
+            if( cms ) {
 
-                    unsigned char f = 0;
+                unsigned char f = 0;
                     
-                    std::auto_ptr< Marshaller::u1Array > containerType( cms->getContainerProperty( i, CARD_PROPERTY_CONTAINER_TYPE, f ) );
+                if (!m_Containers[ i ].empty())
+                {
+                    std::unique_ptr< u1Array > containerType( cms->getContainerProperty( i, CARD_PROPERTY_CONTAINER_TYPE, f ) );
                     
                     if( containerType.get( ) ) {
 
@@ -128,7 +143,7 @@ void MiniDriverContainerMapFile::containerRead( void ) {
 
                     f = 0;
 
-                    std::auto_ptr< Marshaller::u1Array > containerPinIdentifier( cms->getContainerProperty( i, CARD_PROPERTY_PIN_IDENTIFIER, f ) );
+                    std::unique_ptr< u1Array > containerPinIdentifier( cms->getContainerProperty( i, CARD_PROPERTY_PIN_IDENTIFIER, f ) );
                     
                     if( containerPinIdentifier.get( ) ) {
                     
@@ -136,24 +151,38 @@ void MiniDriverContainerMapFile::containerRead( void ) {
                     
                         m_Containers[ i ].setPinIdentifier( r );
                     }
+                    else if (cms->IsV2())
+                    {
+                        if (Log::s_bEnableLog)
+                            Log::log("MiniDriverContainerMapFile::containerRead - V2 card, setting manually PIN_USER in container");
+                        // V2 card. Set manually to PIN_USER
+                        m_Containers[ i ].setPinIdentifier( MiniDriverAuthentication::PIN_USER );
+                    }
                 }
+                else
+                    m_Containers[ i ].clear( 0 );
+            }
 
-            } catch( MiniDriverException& x ) {
+        } catch( MiniDriverException& x ) {
 
-                // The container is empty
-                Log::error( "MiniDriverContainerMapFile::containerRead", "Unable to read the container" );
+            // The container is empty
+            if (Log::s_bEnableLog)
+            {
+                char szMsg[64];
+                sprintf(szMsg, "Unable to read the container at index %d", i);
+                Log::error( "MiniDriverContainerMapFile::containerRead", szMsg );
+            }
                 
-                switch( x.getError( ) ) {
+            switch( x.getError( ) ) {
                 
-                case SCARD_E_INVALID_PARAMETER:
-                    // The container does not exist
-                    m_Containers[ i ].clear( );
-                    break;
+            case SCARD_E_INVALID_PARAMETER:
+                // The container does not exist
+                m_Containers[ i ].clear( 0 );
+                break;
 
-                default:
-                    // The container cannot be read
-                    throw;
-                }
+            default:
+                // The container cannot be read
+                throw;
             }
         }
     }
@@ -163,6 +192,127 @@ void MiniDriverContainerMapFile::containerRead( void ) {
     Log::end( "MiniDriverContainerMapFile::containerRead" );
 }
 
+void MiniDriverContainerMapFile::containerUpdatePinInfo( void ) {
+
+    Log::begin( "MiniDriverContainerMapFile::containerUpdatePinInfo" );
+    Timer t;
+    t.start( );
+
+    if( !m_MiniDriverFiles ) {
+    
+        Log::error( "MiniDriverContainerMapFile::containerUpdatePinInfo", "Invalid file system object" );
+        return;
+    }
+
+    MiniDriverModuleService* cms = m_MiniDriverFiles->getCardModuleService( );
+
+    if( !cms ) {
+         
+        Log::error( "MiniDriverContainerMapFile::containerUpdatePinInfo", "Invalid card module service object" );
+
+        return;
+    }
+
+    bool bIsStaticProfile = m_MiniDriverFiles->isStaticProfile();
+    int pinProperty = CARD_PROPERTY_PIN_IDENTIFIER_EX;
+    for( unsigned char i = 0; i < g_MaxContainer; ++i ) {
+        
+        if (Log::s_bEnableLog) Log::log("container %d", i);
+
+        try {
+            if (!m_Containers[ i ].empty())
+            {
+                unsigned char f = 0;    
+
+				Log::log ("containeInfo: KeyExchSize=<%d>, KeySignSize=<%d>, ExchPubExp=<%p>, ExchPubMod=<%p>, SignPubExp=<%p>, SignPubMod=<%p>",
+					m_Containers[i].getKeyExchangeSizeBits(),
+					m_Containers[i].getKeySignatureSizeBits(),
+					m_Containers[i].getExchangePublicKeyExponent().get(),
+					m_Containers[i].getExchangePublicKeyModulus().get(),
+					m_Containers[i].getSignaturePublicKeyExponent().get(),
+					m_Containers[i].getSignaturePublicKeyModulus().get());
+
+                std::unique_ptr< u1Array > containerPinIdentifier( cms->getContainerProperty( i, pinProperty, f ) );
+                    
+                if( containerPinIdentifier.get( ) ) {
+                    
+                    if (Log::s_bEnableLog)
+                    {
+                        std::string s = "";
+                        Log::toString(containerPinIdentifier->GetBuffer(), containerPinIdentifier->GetLength(), s);
+                        Log::log("containerPinIdentifier = %s", s.c_str());
+                    }
+                    MiniDriverAuthentication::ROLES r = (MiniDriverAuthentication::ROLES)containerPinIdentifier->ReadU1At( 0 );
+                    
+                    m_Containers[ i ].setPinIdentifier( r );
+                }
+                else
+                {
+                    if (Log::s_bEnableLog)
+                        Log::log("Query PinProperty (0x%.2X) returned NULL", pinProperty);
+                    if (cms->IsV2())
+                    {
+                        if (Log::s_bEnableLog)
+                            Log::log("V2 card: Setting manually container role to PIN_USER", pinProperty);
+                         m_Containers[ i ].setPinIdentifier( MiniDriverAuthentication::PIN_USER );
+                    }
+                }
+            }
+            else if (Log::s_bEnableLog)
+                Log::log("bIsStaticProfile = %s, m_Containers[ i ].empty() = %s", (bIsStaticProfile)? "true":"false", 
+                m_Containers[ i ].empty()? "true":"false");
+
+        } catch( MiniDriverException& x ) {
+
+            // CARD_PROPERTY_PIN_IDENTIFIER_EX is not supported or caintainer empty
+            if (Log::s_bEnableLog)
+            {
+                char szMsg[64];
+                sprintf(szMsg, "Unable to read PIN information of container at index %d.", i);
+                Log::error( "MiniDriverContainerMapFile::containerUpdatePinInfo", szMsg );
+            }
+                
+            switch( x.getError( ) ) {
+                
+            case SCARD_E_INVALID_PARAMETER:
+                // ignore this error
+                if (pinProperty == CARD_PROPERTY_PIN_IDENTIFIER_EX)
+                {
+                    if (cms->GetCardModel() == JAVA_STUB)
+                    {
+                        // CARD_PROPERTY_PIN_IDENTIFIER_EX is supported on Java V4. 
+                        // So, the only explanation is that no more containers are available
+                        // quitting
+                        i = g_MaxContainer;
+                        if (Log::s_bEnableLog)
+                        {
+                            Log::error( "MiniDriverContainerMapFile::containerUpdatePinInfo", "the card contains less than 15 containers available" );
+                        }
+                    }
+                    else
+                    {
+                        pinProperty = CARD_PROPERTY_PIN_IDENTIFIER;
+                        i--; // decrement index to recall getContainerProperty on this container  
+                        if (Log::s_bEnableLog)
+                        {
+                            Log::error( "MiniDriverContainerMapFile::containerUpdatePinInfo", "Retrying with CARD_PROPERTY_PIN_IDENTIFIER" );
+                        }
+                    }
+                }
+                break;
+
+            default:
+                if (Log::s_bEnableLog) Log::log("MiniDriverContainerMapFile::containerUpdatePinInfo - unexpected exception (0x%.8X)", x.getError( ));
+                // The container cannot be read
+                throw;
+            }
+        }
+    }
+
+    // print( );
+    t.stop( "MiniDriverContainerMapFile::containerUpdatePinInfo" );
+    Log::end( "MiniDriverContainerMapFile::containerUpdatePinInfo" );
+}
 
 /*
 */
@@ -178,15 +328,15 @@ void MiniDriverContainerMapFile::write( void ) {
         return;
     }
 
-    //print( );
+    // print( );
 
     // Create a new CMap file
-    Marshaller::u1Array* p = new Marshaller::u1Array( );
+    u1Array* p = new u1Array( 0 );
 
     // Populate the new CMap file
     int iOffset = 0;
 
-    unsigned int sz = (unsigned int)m_Containers.size( );
+    unsigned int sz = (unsigned int)g_MaxContainer;
 
     int i = 0;
 
@@ -194,21 +344,22 @@ void MiniDriverContainerMapFile::write( void ) {
 
     CONTAINER_MAP_RECORD cmr;
 
-    BOOST_FOREACH( MiniDriverContainer& c, m_Containers ) {
+	for (int nI = 0 ; nI < g_MaxContainer; ++nI) {
+		MiniDriverContainer& c = m_Containers[nI];
 
         // Try to locate a record to write after the current one
         bMoreRecordToWrite = false;
 
         for( unsigned int j = i + 1 ; j < sz; ++j ) {
 
-            if( !m_Containers.at( j ).empty( ) ) {
+            if( !m_Containers[ j ].empty( ) ) {
 
                 bMoreRecordToWrite = true;
                 break;
             }
         }
 
-        Marshaller::u1Array b( g_iContainerSize );
+        u1Array b( g_iContainerSize );
 
         if( c.empty( ) ) {
             
@@ -245,16 +396,19 @@ void MiniDriverContainerMapFile::write( void ) {
     if( !p->GetLength( ) ) {
     
         // Add an empty record to get a valid CMapFile
-        Marshaller::u1Array b( g_iContainerSize );
+        u1Array b( g_iContainerSize );
         *p += b;
     }
 
     // Store the new CMap file
     m_ContainerMapFileBinary.reset( p );
 
-    std::string s;
-    Log::toString( p->GetBuffer( ), p->GetLength( ), s );
-    Log::log( " CMapfile <%s>", s.c_str( ) );
+    if (Log::s_bEnableLog)
+    {
+        std::string s;
+        Log::toString( p->GetBuffer( ), p->GetLength( ), s );
+        Log::log( " CMapfile <%s>", s.c_str( ) );
+    }
 
     // Check the CMapFile exists
     std::string stCMapFile( szCONTAINER_MAP_FILE );
@@ -269,7 +423,7 @@ void MiniDriverContainerMapFile::write( void ) {
     
         // The CMapFile does not exist. It must be create before to write the content
         // Create the access conditions for the CMapFile
-         Marshaller::u1Array ac( 3 );
+         u1Array ac( 3 );
 
         // Administrator access condition
         ac.GetBuffer( )[ 0 ] = MiniDriverFiles::CARD_PERMISSION_READ | MiniDriverFiles::CARD_PERMISSION_WRITE;
@@ -286,7 +440,7 @@ void MiniDriverContainerMapFile::write( void ) {
     // Write the new CMap file
     m_MiniDriverFiles->writeFile( stMscpDirectory, stCMapFile, p, true, true );
 
-    //print( );
+    // print( );
     t.stop( "MiniDriverContainerMapFile::write" );
     Log::end( "MiniDriverContainerMapFile::write" );
 }
@@ -294,13 +448,13 @@ void MiniDriverContainerMapFile::write( void ) {
 
 /*
 */
-void MiniDriverContainerMapFile::containerDelete( const unsigned char& a_ucContainerIndex ) {
+void MiniDriverContainerMapFile::containerDelete( const unsigned char& a_ucContainerIndex, const unsigned char& a_ucKeySpec ) {
 
     Log::begin( "MiniDriverContainerMapFile::containerDelete" );
     Timer t;
     t.start( );
 
-    if( a_ucContainerIndex >= m_Containers.size( ) ) {
+    if( a_ucContainerIndex >= g_MaxContainer ) {
 
         Log::error( "MiniDriverContainerMapFile::containerDelete", "Invalid container index" );
 
@@ -314,7 +468,7 @@ void MiniDriverContainerMapFile::containerDelete( const unsigned char& a_ucConta
         return;
     }
 
-    CardModuleService * p = m_MiniDriverFiles->getCardModuleService( );
+    MiniDriverModuleService * p = m_MiniDriverFiles->getCardModuleService( );
     
     if( !p ) {
     
@@ -325,12 +479,13 @@ void MiniDriverContainerMapFile::containerDelete( const unsigned char& a_ucConta
 
     // Check the flag of this record to know if the default certificate is going to be removed
     unsigned char ucFlags = m_Containers[ a_ucContainerIndex ].getFlags( );
+    // MiniDriverAuthentication::ROLES originalRole = m_Containers[ a_ucContainerIndex ].getPinIdentifier();
 
     // Clear the record
-    m_Containers[ a_ucContainerIndex ].clear( );
+    m_Containers[ a_ucContainerIndex ].clear( a_ucKeySpec );
 
     // Delete the oncard container  
-    p->deleteContainer( a_ucContainerIndex );
+	p->deleteContainer( a_ucContainerIndex, a_ucKeySpec);
 
     // Set a new default container
     if( MiniDriverContainer::CMAPFILE_FLAG_VALID_AND_DEFAULT == ucFlags ) {
@@ -341,7 +496,7 @@ void MiniDriverContainerMapFile::containerDelete( const unsigned char& a_ucConta
     // write the new cmap file
     write( );
 
-    //print( );
+    // print( );
     t.stop( "MiniDriverContainerMapFile::containerDelete" );
     Log::end( "MiniDriverContainerMapFile::containerDelete" );
 }
@@ -349,7 +504,7 @@ void MiniDriverContainerMapFile::containerDelete( const unsigned char& a_ucConta
 
 /*
 */
-void MiniDriverContainerMapFile::containerCreate( unsigned char& a_ucContainerIndex, const bool& a_bKeyImport, unsigned char& a_ucKeySpec, Marshaller::u1Array* a_pKeyModulus, const int& a_KeySize, Marshaller::u1Array* a_pKeyValue ) {
+void MiniDriverContainerMapFile::containerCreate( MiniDriverAuthentication::ROLES role, unsigned char& a_ucContainerIndex, const bool& a_bKeyImport, unsigned char& a_ucKeySpec, u1Array* /*a_pKeyModulus*/, const int& a_KeySize, u1Array* a_pKeyValue ) {
 
     Log::begin( "MiniDriverContainerMapFile::containerCreate" );
     Timer t;
@@ -364,7 +519,7 @@ void MiniDriverContainerMapFile::containerCreate( unsigned char& a_ucContainerIn
         //return;
     }
 
-    CardModuleService * p = m_MiniDriverFiles->getCardModuleService( );
+    MiniDriverModuleService * p = m_MiniDriverFiles->getCardModuleService( );
     
     if( !p ) {
     
@@ -389,7 +544,9 @@ void MiniDriverContainerMapFile::containerCreate( unsigned char& a_ucContainerIn
 */
 
     // Search for a free container
-    containerSearch( a_ucContainerIndex );
+    MiniDriverAuthentication::ROLES containerOriginalRole;
+    if (MiniDriverContainerMapFile::CONTAINER_INDEX_INVALID == a_ucContainerIndex)
+        containerSearch( role, a_ucContainerIndex, containerOriginalRole);
 
     if( MiniDriverContainerMapFile::CONTAINER_INDEX_INVALID == a_ucContainerIndex ) {
 
@@ -399,15 +556,33 @@ void MiniDriverContainerMapFile::containerCreate( unsigned char& a_ucContainerIn
     }
 
     // Create the key pair container into the smart card to import or generate the private key
-    p->createContainer( a_ucContainerIndex, a_bKeyImport, a_ucKeySpec, a_KeySize, a_pKeyValue );
+    p->createContainer( a_ucContainerIndex, a_bKeyImport, a_ucKeySpec, a_KeySize, a_pKeyValue, (u1) role );
 
     // Populate the container info
+    if (containerOriginalRole == MiniDriverAuthentication::PIN_NONE)
+    {
+        u1Array containerRole(1);
+        containerRole.SetU1At(0, (u1) role);
+		try
+		{
+			p->setContainerProperty( a_ucContainerIndex, CARD_PROPERTY_PIN_IDENTIFIER, &containerRole, 0);
+		}
+		catch( MiniDriverException& )
+		{
+			Log::log( "MiniDriverContainerMapFile::containerCreate - CARD_PROPERTY_PIN_IDENTIFIER not supported by the card");
+		}
+    }
     
     MiniDriverContainer& c = m_Containers[ a_ucContainerIndex ];
 
     c.setFlags( MiniDriverContainer::CMAPFILE_FLAG_VALID );
+    c.setPinIdentifier( role );
 
-    if( MiniDriverContainer::KEYSPEC_EXCHANGE == a_ucKeySpec ) {
+    if(     MiniDriverContainer::KEYSPEC_EXCHANGE == a_ucKeySpec
+        ||  MiniDriverContainer::KEYSPEC_ECDHE_256 == a_ucKeySpec
+        ||  MiniDriverContainer::KEYSPEC_ECDHE_384 == a_ucKeySpec
+        ||  MiniDriverContainer::KEYSPEC_ECDHE_521 == a_ucKeySpec
+      ) {
 
         c.setKeyExchangeSizeBits( (WORD)a_KeySize );
 
@@ -421,7 +596,7 @@ void MiniDriverContainerMapFile::containerCreate( unsigned char& a_ucContainerIn
     }
 
     // Load the information from the smart card
-    boost::shared_ptr< Marshaller::u1Array > ci( p->getContainer( a_ucContainerIndex ) );
+    boost::shared_ptr< u1Array > ci( p->getContainer( a_ucContainerIndex ) );
 
     std::string stContainer;
     Log::toString( ci->GetBuffer( ), ci->GetLength( ), stContainer );
@@ -430,14 +605,24 @@ void MiniDriverContainerMapFile::containerCreate( unsigned char& a_ucContainerIn
     c.setContainerInformation( ci );
 
     std::string stContainerName;
-    
-    if( MiniDriverContainer::KEYSPEC_EXCHANGE == a_ucKeySpec ) {
-
-        stContainerName = computeContainerName( c.getExchangePublicKeyModulus( )->GetBuffer( ), c.getExchangePublicKeyModulus( )->GetLength( ) );
-    
-    } else {
-    
-        stContainerName = computeContainerName( c.getSignaturePublicKeyModulus( )->GetBuffer( ), c.getSignaturePublicKeyModulus( )->GetLength( ) );    
+    switch(a_ucKeySpec)
+    {
+        case MiniDriverContainer::KEYSPEC_EXCHANGE:
+            stContainerName = computeContainerName( c.getExchangePublicKeyModulus( )->GetBuffer( ), c.getExchangePublicKeyModulus( )->GetLength( ) );
+            break;
+        case MiniDriverContainer::KEYSPEC_SIGNATURE:
+            stContainerName = computeContainerName( c.getSignaturePublicKeyModulus( )->GetBuffer( ), c.getSignaturePublicKeyModulus( )->GetLength( ) );    
+            break;
+        case MiniDriverContainer::KEYSPEC_ECDHE_256:
+        case MiniDriverContainer::KEYSPEC_ECDHE_384:
+        case MiniDriverContainer::KEYSPEC_ECDHE_521:
+            stContainerName = computeContainerName( c.getEcdhePointDER()->GetBuffer(), c.getEcdhePointDER()->GetLength( ) );
+            break;
+        case MiniDriverContainer::KEYSPEC_ECDSA_256:
+        case MiniDriverContainer::KEYSPEC_ECDSA_384:
+        case MiniDriverContainer::KEYSPEC_ECDSA_521:
+            stContainerName = computeContainerName( c.getEcdsaPointDER()->GetBuffer( ), c.getEcdsaPointDER()->GetLength( ) );
+            break;
     }
 
     c.setGUID( stContainerName );
@@ -445,7 +630,7 @@ void MiniDriverContainerMapFile::containerCreate( unsigned char& a_ucContainerIn
     // write the new cmap file
     write( );
 
-    //print( );
+    // print( );
     t.stop( "MiniDriverContainerMapFile::containerCreate" );
     Log::end( "MiniDriverContainerMapFile::containerCreate" );
 }
@@ -453,36 +638,54 @@ void MiniDriverContainerMapFile::containerCreate( unsigned char& a_ucContainerIn
 
 /*
 */
-void MiniDriverContainerMapFile::containerSearch( unsigned char& a_ucContainerIndex ) {
+void MiniDriverContainerMapFile::containerSearch( MiniDriverAuthentication::ROLES role, unsigned char& a_ucContainerIndex, MiniDriverAuthentication::ROLES& originalRole ) {
 
     Log::begin( "MiniDriverContainerMapFile::containerSearch" );
     Timer t;
     t.start( );
 
+    Log::log( "input role = %d", (int) role );
+
     // The index is false. A new index has to be found.
     a_ucContainerIndex = 0;
 
+    originalRole = MiniDriverAuthentication::PIN_NONE;
+
     // Find an empty container
-    BOOST_FOREACH( MiniDriverContainer& c, m_Containers ) {
+	for (int nI = 0 ; nI < g_MaxContainer; ++nI) {
+		MiniDriverContainer& c = m_Containers[nI];
 
         if( c.empty( ) ) {
 
             Log::log( "container <%d> is empty", a_ucContainerIndex );
 
-            return;
+            if (    (c.getPinIdentifier() == MiniDriverAuthentication::PIN_NONE)
+                ||  (c.getPinIdentifier() == role)
+                ||  (m_Authentication.isNoPin(c.getPinIdentifier()) && m_Authentication.isNoPin(role))
+                )
+            {
+                originalRole = c.getPinIdentifier();
+                return;
+            }
         }
         Log::log( "container <%d> <%#02x>", a_ucContainerIndex, c.getFlags( ) );
 
         ++a_ucContainerIndex;
     }
 
-    if( a_ucContainerIndex >= m_Containers.size( ) ) {
+    if( a_ucContainerIndex >= g_MaxContainer ) {
 
         a_ucContainerIndex = MiniDriverContainerMapFile::CONTAINER_INDEX_INVALID;
     }
 
     t.stop( "MiniDriverContainerMapFile::containerSearch" );
     Log::end( "MiniDriverContainerMapFile::containerSearch" );
+}
+
+void MiniDriverContainerMapFile::containerSearch( MiniDriverAuthentication::ROLES role, unsigned char& a_ucContainerIndex ) {
+    
+    MiniDriverAuthentication::ROLES originalRole;
+    containerSearch(role, a_ucContainerIndex, originalRole);
 }
 
 
@@ -494,7 +697,7 @@ void MiniDriverContainerMapFile::containerSetDefault( const unsigned char& a_ucI
     Timer t;
     t.start( );
 
-    //print( );
+    // print( );
 
     bool bJobDone = false;
 
@@ -504,7 +707,8 @@ void MiniDriverContainerMapFile::containerSetDefault( const unsigned char& a_ucI
     if( a_IsSmartCardLogon && ( MiniDriverContainerMapFile::CONTAINER_INDEX_INVALID != a_ucIndex ) ) {
 
         // Does a default container exist ? In this case put it to a valid state
-        BOOST_FOREACH( MiniDriverContainer& c, m_Containers ) {
+		for (int nI = 0 ; nI < g_MaxContainer; ++nI) {
+			MiniDriverContainer& c = m_Containers[nI];
 
             if( MiniDriverContainer::CMAPFILE_FLAG_VALID_AND_DEFAULT == c.getFlags( ) ) {
 
@@ -531,7 +735,8 @@ void MiniDriverContainerMapFile::containerSetDefault( const unsigned char& a_ucI
     if( !bJobDone ) {
 
         // Does a default container exist ?
-        BOOST_FOREACH( MiniDriverContainer& c, m_Containers ) {
+		for (int nI = 0 ; nI < g_MaxContainer; ++nI) {
+			MiniDriverContainer& c = m_Containers[nI];
 
             if( MiniDriverContainer::CMAPFILE_FLAG_VALID_AND_DEFAULT == c.getFlags( ) ) {
 
@@ -548,7 +753,8 @@ void MiniDriverContainerMapFile::containerSetDefault( const unsigned char& a_ucI
     if( !bJobDone ) {
 
         // Does a container associated to a certificate with Smart Card Logon OID exists ?
-        BOOST_FOREACH( MiniDriverContainer& c, m_Containers ) {
+		for (int nI = 0 ; nI < g_MaxContainer; ++nI) {
+			MiniDriverContainer& c = m_Containers[nI];
 
             //Log::log( "MiniDriverContainerMapFile::UpdateCMap - Certificate - Name <%s> - Container index <%ld> - Smart card logon <%ld>", c->_certName.c_str( ), s4CMapFileIndex, bIsSmartCardLogon );
             if( c.getFlagSmartCardLogon( ) ) {
@@ -570,7 +776,8 @@ void MiniDriverContainerMapFile::containerSetDefault( const unsigned char& a_ucI
     if( !bJobDone ) {
 
         // Does a default container exist ?
-        BOOST_FOREACH( MiniDriverContainer& c, m_Containers ) {
+		for (int nI = 0 ; nI < g_MaxContainer; ++nI) {
+			MiniDriverContainer& c = m_Containers[nI];
 
             if( MiniDriverContainer::CMAPFILE_FLAG_VALID == c.getFlags( ) ) {
 
@@ -596,7 +803,7 @@ void MiniDriverContainerMapFile::containerSetDefault( const unsigned char& a_ucI
         write( );
     }
 
-    //print( );
+    // print( );
     t.stop( "MiniDriverContainerMapFile::containerSetDefault" );
     Log::end( "MiniDriverContainerMapFile::containerSetDefault" );
 }
@@ -606,23 +813,26 @@ void MiniDriverContainerMapFile::containerSetDefault( const unsigned char& a_ucI
 */
 void MiniDriverContainerMapFile::clear( void ) { 
 
-    m_ContainerMapFileBinary.reset( ); 
+   m_ContainerMapFileBinary.reset( );
 
-    BOOST_FOREACH( MiniDriverContainer& c, m_Containers ) {
-
-        c.clear( ); 
-    }
+   for (int nI = 0 ; nI < g_MaxContainer; ++nI) {
+	   MiniDriverContainer& c = m_Containers[nI];
+       c.clear( 0 ); 
+   }
 }
 
 
+/*** 
+	For debugging session only 
+**/
 /*
-*/
 void MiniDriverContainerMapFile::print( void ) {
 
     Log::begin( "MiniDriverContainerMapFile" );
 
     int i = 0;
-    BOOST_FOREACH( MiniDriverContainer c, m_Containers ){
+   for (int nI = 0 ; nI < g_MaxContainer; ++nI) {
+	   MiniDriverContainer& c = m_Containers[nI];
 
         unsigned char ucFlags = c.getFlags( );
 
@@ -640,11 +850,11 @@ void MiniDriverContainerMapFile::print( void ) {
 
     Log::end( "MiniDriverContainerMapFile" );
 }
-
+*/
 
 /*
 */
-bool MiniDriverContainerMapFile::containerGetMatching( unsigned char& a_ucContainerIndex, unsigned char& a_ucKeySpec, const Marshaller::u1Array* a_pPublicKeyModulus ) {
+bool MiniDriverContainerMapFile::containerGetMatching( MiniDriverAuthentication::ROLES role, unsigned char& a_ucContainerIndex, unsigned char& a_ucKeySpec, const u1Array* a_pPublicKeyModulus ) {
 
     Log::begin( "MiniDriverContainerMapFile::containerGetMatching" );
     Timer t;
@@ -661,9 +871,9 @@ bool MiniDriverContainerMapFile::containerGetMatching( unsigned char& a_ucContai
 
     unsigned char i = 0;
 
-    unsigned char* p = (unsigned char*)a_pPublicKeyModulus->GetBuffer( );
+    unsigned char* p = (unsigned char*)((u1Array*)a_pPublicKeyModulus)->GetBuffer( );
 
-    unsigned int l = a_pPublicKeyModulus->GetLength( );
+    unsigned int l = ((u1Array*)a_pPublicKeyModulus)->GetLength( );
     
     std::string stIncomingExchangePublicKeyModulus;
     Log::toString( p, l, stIncomingExchangePublicKeyModulus );
@@ -677,12 +887,19 @@ bool MiniDriverContainerMapFile::containerGetMatching( unsigned char& a_ucContai
 
     char szCertS[ 10 ];
 
-    BOOST_FOREACH( MiniDriverContainer c, m_Containers ) {
+	for (int nI = 0 ; nI < g_MaxContainer; ++nI) {
+		MiniDriverContainer& c = m_Containers[nI];
 
         if( MiniDriverContainer::CMAPFILE_FLAG_EMPTY == c.getFlags( ) ) {
-
             ++i;		
+            continue;
+        }
 
+        if (    (c.getPinIdentifier() != role)
+            &&  (!m_Authentication.isNoPin(c.getPinIdentifier()) || !m_Authentication.isNoPin(role))
+            )
+        {
+            ++i;
             continue;
         }
 
@@ -712,36 +929,88 @@ bool MiniDriverContainerMapFile::containerGetMatching( unsigned char& a_ucContai
         
         if( c.getKeyExchangeSizeBits( ) ) {
 
-            std::string stContainerExchangePublicKeyModulus;
-            Log::toString( c.getExchangePublicKeyModulus( )->GetBuffer( ), c.getExchangePublicKeyModulus( )->GetLength( ), stContainerExchangePublicKeyModulus );
-            Log::log( "MiniDriverContainerMapFile::containerGetMatching - container <%s>", stContainerExchangePublicKeyModulus.c_str( ) );
+            if (c.getExchangePublicKeyModulus().get())
+            {
+                std::string stContainerExchangePublicKeyModulus;
+                Log::toString( c.getExchangePublicKeyModulus( )->GetBuffer( ), c.getExchangePublicKeyModulus( )->GetLength( ), stContainerExchangePublicKeyModulus );
+                Log::log( "MiniDriverContainerMapFile::containerGetMatching - Exchange RSA container <%s>", stContainerExchangePublicKeyModulus.c_str( ) );
  
-            if( 0 == memcmp( p, c.getExchangePublicKeyModulus( )->GetBuffer( ), l ) ) {
+                if(     (c.getExchangePublicKeyModulus( )->GetLength() == l)
+                    &&  (0 == memcmp( p, c.getExchangePublicKeyModulus( )->GetBuffer( ), l ) )
+                  )
+                {
 
-                bRet = true;
+                    bRet = true;
 
-                a_ucContainerIndex = i;
+                    a_ucContainerIndex = i;
 
-                a_ucKeySpec = MiniDriverContainer::KEYSPEC_EXCHANGE;
+                    a_ucKeySpec = MiniDriverContainer::KEYSPEC_EXCHANGE;
 
-                break;
+                    break;
+                }
+            }
+            else
+            {
+                std::string stContainerExchangePublicKey;
+                Log::toString( c.getEcdhePointDER()->GetBuffer( ), c.getEcdhePointDER( )->GetLength( ), stContainerExchangePublicKey );
+                Log::log( "MiniDriverContainerMapFile::containerGetMatching - ECDHE container <%s>", stContainerExchangePublicKey.c_str( ) );
+ 
+                if(     (c.getEcdhePointDER( )->GetLength() == l)
+                    &&  (0 == memcmp( p, c.getEcdhePointDER( )->GetBuffer( ), l ) )
+                  )
+                {
+
+                    bRet = true;
+
+                    a_ucContainerIndex = i;
+
+                    a_ucKeySpec = c.getEcdheKeySpec();
+
+                    break;
+                }
             }
 
         } else if( c.getKeySignatureSizeBits( ) ) {
 
-            std::string stContainerSignaturePublicKeyModulus;
-            Log::toString( c.getSignaturePublicKeyModulus( )->GetBuffer( ), c.getSignaturePublicKeyModulus( )->GetLength( ), stContainerSignaturePublicKeyModulus );
-            Log::log( "MiniDriverContainerMapFile::containerGetMatching - container <%s>", stContainerSignaturePublicKeyModulus.c_str( ) );
+            if (c.getSignaturePublicKeyModulus().get())
+            {
+                std::string stContainerSignaturePublicKeyModulus;
+                Log::toString( c.getSignaturePublicKeyModulus( )->GetBuffer( ), c.getSignaturePublicKeyModulus( )->GetLength( ), stContainerSignaturePublicKeyModulus );
+                Log::log( "MiniDriverContainerMapFile::containerGetMatching - Signature RSA container <%s>", stContainerSignaturePublicKeyModulus.c_str( ) );
 
-            if( 0 == memcmp( p, c.getSignaturePublicKeyModulus( )->GetBuffer( ), l ) ) {
+                if(     (c.getSignaturePublicKeyModulus( )->GetLength() == l)
+                    &&  (0 == memcmp( p, c.getSignaturePublicKeyModulus( )->GetBuffer( ), l ) )
+                  )
+                {
 
-                bRet = true;
+                    bRet = true;
 
-                a_ucContainerIndex = i;
+                    a_ucContainerIndex = i;
 
-                a_ucKeySpec = MiniDriverContainer::KEYSPEC_SIGNATURE;
+                    a_ucKeySpec = MiniDriverContainer::KEYSPEC_SIGNATURE;
 
-                break;            
+                    break;            
+                }
+            }
+            else
+            {
+                std::string stContainerSignaturePublic;
+                Log::toString( c.getEcdsaPointDER()->GetBuffer( ), c.getEcdsaPointDER( )->GetLength( ), stContainerSignaturePublic );
+                Log::log( "MiniDriverContainerMapFile::containerGetMatching - ECDSA container <%s>", stContainerSignaturePublic.c_str( ) );
+ 
+                if(     (c.getEcdsaPointDER( )->GetLength() == l)
+                    &&  (0 == memcmp( p, c.getEcdsaPointDER( )->GetBuffer( ), l ) )
+                  )
+                {
+
+                    bRet = true;
+
+                    a_ucContainerIndex = i;
+
+                    a_ucKeySpec = c.getEcdsaKeySpec();
+
+                    break;
+                }
             }
         }
 
@@ -764,11 +1033,13 @@ std::string MiniDriverContainerMapFile::computeContainerName( const unsigned cha
 
     memset( &hash[ 0 ], 0, sizeof( hash ) ) ;
     
-    CSHA1 sha1;
+    CDigest* sha1 = CDigest::getInstance(CDigest::SHA1);
     
-    sha1.hashCore( const_cast< CK_BYTE_PTR >( a_pBuffer ), 0, static_cast< CK_LONG >( a_BufferLength ) );
+    sha1->hashUpdate( const_cast< CK_BYTE_PTR >( a_pBuffer ), 0, static_cast< CK_LONG >( a_BufferLength ) );
     
-    sha1.hashFinal( hash );
+    sha1->hashFinal( hash );
+
+    delete sha1;
 
 
     // Format a string from the hash
@@ -853,10 +1124,10 @@ unsigned char MiniDriverContainerMapFile::containerGetFree( void ) {
     
     bool bFound = false;
 
-    BOOST_FOREACH( MiniDriverContainer c, m_Containers ) {
+	for (int nI = 0 ; nI < g_MaxContainer; ++nI) {
+		MiniDriverContainer& c = m_Containers[nI];
 
         if( MiniDriverContainer::CMAPFILE_FLAG_EMPTY == c.getFlags( ) ) {
-         
             bFound = true;
             break;
         }

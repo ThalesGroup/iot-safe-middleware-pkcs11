@@ -1,6 +1,7 @@
 /*
-*  PKCS#11 library for .Net smart cards
+*  PKCS#11 library for IoT Safe
 *  Copyright (C) 2007-2009 Gemalto <support@gemalto.com>
+*  Copyright (C) 2009-2021 Thales
 *
 *  This library is free software; you can redistribute it and/or
 *  modify it under the terms of the GNU Lesser General Public
@@ -17,22 +18,15 @@
 *  Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301  USA
 *
 */
-
-
 #include <string.h>
 #include <stdio.h>
 
 #include "Log.hpp"
 
 
-#ifdef WIN32
-#include <Windows.h>
-clock_t Log::m_clockStart;
-#else
-timeval Log::m_clockStart;
-#endif
-
 bool Log::s_bEnableLog = false;
+
+#if (!defined NO_FILESYSTEM || !defined LOGGER_DISABLE)
 
 const unsigned char T_BOOL = 0;
 #define T_BYTES 1
@@ -42,22 +36,23 @@ const unsigned char T_BOOL = 0;
 #define T_CLASS 5
 #define T_DATE 6
 #define T_KEY_GEN_MECHANISM 7
-#define T_UNKNOWN 8
+#define T_SENSITIVE	8
+#define T_UNKNOWN 9
 
 
+#ifdef WIN32
+#include <Windows.h>
+clock_t Log::m_clockStart;
+#else
+timeval Log::m_clockStart;
+#endif
 
-//std::string Log::s_stLogFilePath = "/tmp";
-//std::string Log::s_stLogFile = "/tmp/Gemalto.NET.PKCS11.log";
+char Log::s_LogFilePath[512] = "";
 
 
-char Log::s_LogFilePath[ 512 ] = "";
+void Log::setLogPath ( const std::string& stPath ) { 
 
-
-
-
-void Log::setLogPath( const std::string& stPath ) { 
-
-    std::string s = stPath + std::string( "/Gemalto.NET.PKCS11.log" );
+	std::string s = stPath + std::string( "/Gemalto.PKCS11.log" );  
 
 #ifdef _WIN32
     char szExePath[512] = {0};
@@ -73,7 +68,7 @@ void Log::setLogPath( const std::string& stPath ) {
 	if (ptr != &szExePath[0])
 	{
 		ptr++;
-        s = stPath + std::string( "/Gemalto.NET.PKCS11." ) + ptr;
+        s = stPath + std::string( "/Gemalto.PKCS11." ) + ptr;
 
         // Add process ID
         sprintf(szExePath, "-%d.log", GetCurrentProcessId());
@@ -81,7 +76,7 @@ void Log::setLogPath( const std::string& stPath ) {
 	}
 
 #endif
-    
+
     memset( s_LogFilePath, 0, sizeof( s_LogFilePath ) ); 
     
     if( s.length( ) < sizeof( s_LogFilePath ) ) { 
@@ -90,7 +85,7 @@ void Log::setLogPath( const std::string& stPath ) {
     
     } else { 
         
-        char szDefaultPath[ ] = "/tmp/Gemalto.NET.PKCS11.log";
+        char szDefaultPath[ ] = "/tmp/Gemalto.PKCS11.log";
         
         memcpy( s_LogFilePath, szDefaultPath, sizeof( szDefaultPath ) );  
     }
@@ -133,7 +128,7 @@ void Log::log( const char * format, ... )
 	    vfprintf( stderr, format, args );
 	    va_end( args );
 	    fprintf( stderr, "\n");
-    #else
+#else
 	    // Get the size of the buffer necessary to write the message
 	    // The size must be extended to include the '\n' and the '\0' characters.
 	    va_start( args, format );
@@ -155,7 +150,7 @@ void Log::log( const char * format, ... )
 
 	    // Release the buffer
 	    delete[] buffer;
-    #endif
+#endif
 
 	    va_end( args );
 
@@ -167,8 +162,8 @@ void Log::log( const char * format, ... )
 */
 void Log::begin( const char* a_pMethod )
 {
-#ifdef _WIN32
     char szDateTimeUTC[260];
+#ifdef _WIN32
     SYSTEMTIME stNow;
 
     GetSystemTime(&stNow);
@@ -177,7 +172,11 @@ void Log::begin( const char* a_pMethod )
 
 	log( "%s - <BEGIN> [TID=0x%.8X] [%s]", a_pMethod, GetCurrentThreadId(), szDateTimeUTC);
 #else
-    log( "%s - <BEGIN>", a_pMethod);
+    time_t now = time (NULL);
+    struct tm tnow = *(gmtime(&now));
+	sprintf(szDateTimeUTC,"%04d-%02d-%02d %02d:%02d:%02d(UTC)",
+            tnow.tm_year + 1900,tnow.tm_mon + 1,tnow.tm_mday,tnow.tm_hour,tnow.tm_min,tnow.tm_sec);
+	log( "%s - <BEGIN> [PID=0x%.8X, TID=%p] [%s]", a_pMethod, getpid(), pthread_self(), szDateTimeUTC);
 #endif
 }
 
@@ -186,8 +185,8 @@ void Log::begin( const char* a_pMethod )
 */
 void Log::end( const char* a_pMethod )
 {
-#ifdef _WIN32
     char szDateTimeUTC[260];
+#ifdef _WIN32
     SYSTEMTIME stNow;
 
     GetSystemTime(&stNow);
@@ -196,7 +195,12 @@ void Log::end( const char* a_pMethod )
 
 	log( "%s - <END>   [TID=0x%.8X] [%s]\n", a_pMethod, GetCurrentThreadId(), szDateTimeUTC);
 #else
-    log( "%s - <END>\n", a_pMethod);
+    time_t now = time (NULL);
+    struct tm tnow = *(gmtime(&now));
+	sprintf(szDateTimeUTC,"%04d-%02d-%02d %02d:%02d:%02d(UTC)",
+            tnow.tm_year + 1900,tnow.tm_mon + 1,tnow.tm_mday,tnow.tm_hour,tnow.tm_min,tnow.tm_sec);
+
+	log( "%s - <END> [PID=0x%.8X, TID=%p] [%s]\n", a_pMethod, getpid(), pthread_self(), szDateTimeUTC);
 #endif
 }
 
@@ -572,11 +576,34 @@ void Log::logCK_ATTRIBUTE_PTR( const char* a_pMethod, CK_ATTRIBUTE_PTR pTemplate
     log( "%s - pTemplate <%#02x> - ulCount <%ld>", a_pMethod, pTemplate, ulCount );
 	if( pTemplate )
 	{
-		for( size_t i = 0; i < (size_t)ulCount; i++ )
+		bool bIsSensitiveKey = false;
+		size_t i;
+		for( i = 0; i < (size_t)ulCount; i++ )
+		{
+			// check if we are dumpring attribute of a sensitive key in order to not log CKA_VALUE in this case
+			if (	(pTemplate[i].type == CKA_CLASS) 
+				&&	(pTemplate[i].pValue)
+				&&  (pTemplate[i].ulValueLen == sizeof(CK_OBJECT_CLASS))
+			   )
+			{
+				CK_OBJECT_CLASS objClass = *((CK_OBJECT_CLASS*) pTemplate[i].pValue);
+				switch(objClass)
+				{
+					case CKO_PRIVATE_KEY:
+					case CKO_SECRET_KEY:
+						bIsSensitiveKey = true;
+						break;
+				}
+
+				break;
+			}
+		}
+
+		for( i = 0; i < (size_t)ulCount; i++ )
 		{
 			CK_ATTRIBUTE a = pTemplate[ i ];
 			std::string attribute = "";
-			CK_ATTRIBUTEToString( &a, attribute );
+			CK_ATTRIBUTEToString( &a, bIsSensitiveKey, attribute );
 
 			log( "%s	- Attribute #%d - %s", a_pMethod, i, attribute.c_str( ) );
 		}
@@ -601,8 +628,12 @@ void Log::CK_MECHANISMToString( CK_MECHANISM_PTR m, std::string &result )
 	CK_MECHANISM_TYPE t = m->mechanism;
 	CK_MECHANISM_TYPEToString( t, mechanismType );
 
+    if (t != CKM_ECDH1_DERIVE || !m->pParameter || (m->ulParameterLen != 20))
+    {
 	std::string mechanismParam = "";
-	toString( (const unsigned char*)m->pParameter, m->ulParameterLen, mechanismParam );
+	if (m->pParameter && m->ulParameterLen != 0 && m->ulParameterLen != CK_UNAVAILABLE_INFORMATION
+	&&	m->ulParameterLen <= 256)
+		toString( (const unsigned char*)m->pParameter, m->ulParameterLen, mechanismParam );
 
 	toString( result,
 		"Type <%s> - Parameter <%s> - ParameterLen <%#02x>",
@@ -610,11 +641,39 @@ void Log::CK_MECHANISMToString( CK_MECHANISM_PTR m, std::string &result )
 		mechanismParam.c_str( ),
 		m->ulParameterLen );
 }
+    else
+    {
+        CK_ECDH1_DERIVE_PARAMS_PTR pParams = (CK_ECDH1_DERIVE_PARAMS_PTR) m->pParameter;
+        std::string kd;
+        std::string sharedData;
+        std::string publicData;
+
+        if (pParams->kdf == CKD_NULL)
+            kd = "NULL";
+        else if (pParams->kdf == CKD_SHA1_KDF)
+            kd = "SHA1";
+        else
+        toString(kd, "0x%.8X", pParams->kdf);
+        toString( (const unsigned char*)pParams->pSharedData, pParams->ulSharedDataLen, sharedData );
+        toString( (const unsigned char*)pParams->pPublicData, pParams->ulPublicDataLen, publicData );
+
+	    toString( result,
+		    "Type <%s> - ParameterLen <%#02x> - CK_ECDH1_DERIVE_PARAMS_PTR : KDF <%s>, SharedData (%d bytes) <%s>, PublicData (%d bytes) <%s>",
+		    mechanismType.c_str( ),
+            m->ulParameterLen,
+            kd.c_str(),
+            pParams->ulSharedDataLen,
+            sharedData.c_str(),
+            pParams->ulPublicDataLen,
+            publicData.c_str()
+		     );
+    }
+}
 
 
 /*
 */
-void Log::CK_ATTRIBUTEToString( const CK_ATTRIBUTE_PTR a, std::string &result )
+void Log::CK_ATTRIBUTEToString( const CK_ATTRIBUTE_PTR a, bool bIsSensitiveKey, std::string &result )
 {
 	if( !s_bEnableLog ) {
 		return;
@@ -627,7 +686,7 @@ void Log::CK_ATTRIBUTEToString( const CK_ATTRIBUTE_PTR a, std::string &result )
 
 	std::string t = "";
 	int type = T_UNKNOWN;
-	CK_ATTRIBUTE_TYPEToString( a->type, t, type );
+	CK_ATTRIBUTE_TYPEToString( a->type, bIsSensitiveKey, t, type );
 
 	if( ( (CK_ULONG)(-1) ) == a->ulValueLen )
 	{
@@ -675,7 +734,9 @@ void Log::CK_ATTRIBUTEToString( const CK_ATTRIBUTE_PTR a, std::string &result )
 		case T_KEY_GEN_MECHANISM:
 			CK_MECHANISM_TYPEToString( ((CK_MECHANISM_TYPE *)a->pValue)[0], v );
 			break;
-
+		case T_SENSITIVE:
+			v = "Sensitive";
+			break;
 		default:
 			v = "UNPREDICTABLE VALUE";
 		}
@@ -687,7 +748,7 @@ void Log::CK_ATTRIBUTEToString( const CK_ATTRIBUTE_PTR a, std::string &result )
 
 /*
 */
-void Log::CK_ATTRIBUTE_TYPEToString( const CK_ATTRIBUTE_TYPE& a, std::string &t, int& type )
+void Log::CK_ATTRIBUTE_TYPEToString( const CK_ATTRIBUTE_TYPE& a, bool bIsSensitiveKey, std::string &t, int& type )
 {
 	if( !s_bEnableLog ) {
 		return;
@@ -722,7 +783,10 @@ void Log::CK_ATTRIBUTE_TYPEToString( const CK_ATTRIBUTE_TYPE& a, std::string &t,
 
 	case CKA_VALUE:
 		t = "CKA_VALUE";
-		type = T_BYTES;
+		if (bIsSensitiveKey)
+			type = T_SENSITIVE;
+		else
+			type = T_BYTES;
 		break;
 
 	case CKA_CERTIFICATE_TYPE:
@@ -832,42 +896,42 @@ void Log::CK_ATTRIBUTE_TYPEToString( const CK_ATTRIBUTE_TYPE& a, std::string &t,
 
 	case CKA_PRIVATE_EXPONENT:
 		t = "CKA_PRIVATE_EXPONENT";
-		type = T_BYTES;
+		type = T_SENSITIVE;
 		break;
 
 	case CKA_PRIME_1:
 		t = "CKA_PRIME_1";
-		type = T_BYTES;
+		type = T_SENSITIVE;
 		break;
 
 	case CKA_PRIME_2:
 		t = "CKA_PRIME_2";
-		type = T_BYTES;
+		type = T_SENSITIVE;
 		break;
 
 	case CKA_EXPONENT_1:
 		t = "CKA_EXPONENT_1";
-		type = T_BYTES;
+		type = T_SENSITIVE;
 		break;
 
 	case CKA_EXPONENT_2:
 		t = "CKA_EXPONENT_2";
-		type = T_BYTES;
+		type = T_SENSITIVE;
 		break;
 
 	case CKA_COEFFICIENT:
 		t = "CKA_COEFFICIENT";
-		type = T_BYTES;
+		type = T_SENSITIVE;
 		break;
 
 	case CKA_PRIME:
 		t = "CKA_PRIME";
-		type = T_BYTES;
+		type = T_SENSITIVE;
 		break;
 
 	case CKA_SUBPRIME:
 		t = "CKA_SUBPRIME";
-		type = T_BYTES;
+		type = T_SENSITIVE;
 		break;
 
 	case CKA_BASE:
@@ -1491,7 +1555,7 @@ void Log::toString( const unsigned char* buffer, std::size_t size, std::string &
 		return;
 	}
 
-    if( ( NULL == buffer ) || ( size <= 0 ) )
+    if( ( NULL == buffer ) || ( size == 0 ) || ( size == CK_UNAVAILABLE_INFORMATION))
 	{
 		//result.assign( "null" );
 		return;
@@ -2050,12 +2114,27 @@ void Log::CK_MECHANISM_TYPEToString( const CK_MECHANISM_TYPE &t, std::string &re
 	case CKM_BATON_WRAP:
 		result = "CKM_RSA_9796";
 		break;
+    case CKM_ECDSA_KEY_PAIR_GEN:
+        result = "CKM_ECDSA_KEY_PAIR_GEN";
+        break;
 	case CKM_ECDSA:
 		result = "CKM_ECDSA";
 		break;
 	case CKM_ECDSA_SHA1:
 		result = "CKM_ECDSA_SHA1";
 		break;
+	case CKM_ECDSA_SHA256:
+		result = "CKM_ECDSA_SHA256";
+		break;
+	case CKM_ECDSA_SHA384:
+		result = "CKM_ECDSA_SHA384";
+		break;
+	case CKM_ECDSA_SHA512:
+		result = "CKM_ECDSA_SHA512";
+		break;
+    case CKM_ECDH1_DERIVE:
+        result = "CKM_ECDH1_DERIVE";
+        break;
 	case CKM_JUNIPER_KEY_GEN:
 		result = "CKM_JUNIPER_KEY_GEN";
 		break;
@@ -2400,3 +2479,64 @@ void Log::stop( const char* a_pMethod ) {
         Log::log( "%s - Elapsed time <%f> seconds [LONG DURATION]\n", a_pMethod, duration );
     }
 }
+
+#else
+
+	void Log::log( const char * format, ... ){};
+
+	void Log::error( const char*, const char* ){};
+	void Log::in( const char* a_pMethod ){};
+	void Log::out( const char* a_pMethod ){};
+	void Log::begin( const char* a_pMethod ){};
+	void Log::end( const char* a_pMethod ){};
+
+	void Log::start( void ){};
+	void Log::stop( const char* a_pMethod ){};
+
+	void Log::logCK_SLOT_ID_PTR( const char*, CK_SLOT_ID_PTR, CK_ULONG_PTR ){};
+	void Log::logCK_SLOT_INFO_PTR( const char*, CK_SLOT_INFO_PTR ){};
+	void Log::logCK_C_INITIALIZE_ARGS_PTR( const char*, CK_C_INITIALIZE_ARGS_PTR ){};
+	void Log::logCK_INFO( const char*, const CK_INFO_PTR ){};
+	void Log::logCK_RV( const char*, const CK_RV & ){};
+	void Log::logCK_UTF8CHAR_PTR( const char*, const unsigned char*, const std::size_t& ){};
+	void Log::logCK_TOKEN_INFO_PTR( const char*, CK_TOKEN_INFO_PTR ){};
+	void Log::logCK_MECHANISM_TYPE( const char*, CK_MECHANISM_TYPE_PTR, CK_ULONG_PTR ){};
+	void Log::logCK_MECHANISM_TYPE( const char*, CK_MECHANISM_TYPE & ){};
+	void Log::logCK_SESSION_INFO_PTR( const char*, CK_SESSION_INFO_PTR ){};
+    
+	void Log::logCK_USER_TYPE( const char*, CK_USER_TYPE & ){};
+	void Log::logCK_ATTRIBUTE_PTR( const char*, CK_ATTRIBUTE_PTR, CK_ULONG & ){};
+	void Log::logSessionFlags( const char*, CK_FLAGS & ){};
+	void Log::logCK_MECHANISM_INFO_PTR( const char*, CK_MECHANISM_INFO_PTR ){};
+	void Log::logCK_MECHANISM_PTR( const char*, CK_MECHANISM_PTR ){};
+
+	void Log::CK_STATEToString( const CK_STATE&, std::string& ){};
+    void Log::CK_MECHANISMToString( CK_MECHANISM_PTR, std::string & ){};
+	void Log::CK_CERTIFICATE_TYPEToString( const CK_CERTIFICATE_TYPE &, std::string & ){};
+	void Log::CK_KEY_TYPEToString( const CK_KEY_TYPE&, std::string & ){};
+	void Log::CK_OBJECT_CLASSToString( const CK_OBJECT_CLASS&, std::string & ){};
+	void Log::CK_DATEToString( const CK_DATE*, std::string & ){};
+	void Log::CK_INFOToString( CK_INFO_PTR pInfo, std::string &result ){};
+	void Log::slotFlagsToString( const CK_FLAGS& f, std::string &result ){};
+	void Log::mechanismFlagsToString( const CK_FLAGS &, std::string & ){};
+	void Log::sessionFlagsToString( const CK_FLAGS & , std::string & ){};
+	void Log::CK_VERSIONToString( CK_VERSION_PTR pVersion, std::string& result ){};
+	void Log::CK_RVToString( const CK_RV& rv, std::string &result ){};
+	void Log::CK_MECHANISM_TYPEToString( CK_MECHANISM_TYPE_PTR pMechanismList, CK_ULONG mechanismListLen, std::string &result ){};
+	void Log::CK_MECHANISM_TYPEToString( const CK_MECHANISM_TYPE &, std::string & ){};
+	void Log::CK_MECHANISM_INFOToString( CK_MECHANISM_INFO_PTR pInfo, std::string &result ){};
+	void Log::CK_SESSION_INFOToString( CK_SESSION_INFO_PTR, std::string& ){};
+	void Log::CK_USER_TYPEToString( const CK_USER_TYPE&, std::string & ){};
+	void Log::CK_ATTRIBUTEToString( const CK_ATTRIBUTE_PTR, bool, std::string & ){};
+	void Log::CK_ATTRIBUTE_TYPEToString( const CK_ATTRIBUTE_TYPE& , bool, std::string &, int& ){};
+
+	void Log::toString( std::string &result, const char * format, ... ){};
+	void Log::toString( const unsigned char* buffer, std::size_t size, std::string &result ){};
+	void Log::toString( const unsigned long &l, std::string &result ){};
+
+	template<typename T> void Log::classtoString( const T & value, std::string &result ){};
+
+    void Log::setLogPath( const std::string& stPath ){};
+
+#endif
+

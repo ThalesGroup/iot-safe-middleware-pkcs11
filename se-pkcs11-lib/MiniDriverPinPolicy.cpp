@@ -1,6 +1,7 @@
 /*
-*  PKCS#11 library for .Net smart cards
+*  PKCS#11 library for IoT Safe
 *  Copyright (C) 2007-2009 Gemalto <support@gemalto.com>
+*  Copyright (C) 2009-2021 Thales
 *
 *  This library is free software; you can redistribute it and/or
 *  modify it under the terms of the GNU Lesser General Public
@@ -17,11 +18,17 @@
 *  Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301  USA
 *
 */
-
+#ifdef WIN32
+#ifndef _WIN32_WINNT
+#define _WIN32_WINNT 0x0501
+#endif
+#include <Windows.h>
+#endif
 
 #include <memory>
 #include "MiniDriverPinPolicy.hpp"
 #include "MiniDriverException.hpp"
+#include "MiniDriverAuthentication.hpp"
 #include "Log.hpp"
 
 
@@ -32,13 +39,13 @@ const unsigned char CP_CARD_PIN_POLICY = 0x80;
 */
 void MiniDriverPinPolicy::write( void ) { 
     
-    Marshaller::u1Array b( g_PolicyLenght );
+    u1Array b( g_PolicyLength );
 
-    b.SetBuffer( m_ucaPinPolicy.c_array( ) );
+    b.SetBuffer( m_ucaPinPolicy );
 
     try {
 
-        m_CardModule->setCardProperty( CP_CARD_PIN_POLICY, &b, m_ucRole );
+        m_CardModule->setCardProperty( CP_CARD_PIN_POLICY, &b, MiniDriverAuthentication::PIN_USER );
     
     } catch( MiniDriverException& ) {
     
@@ -52,25 +59,33 @@ void MiniDriverPinPolicy::write( void ) {
     
 /*
 */
-void MiniDriverPinPolicy::read( void ) { 
+void MiniDriverPinPolicy::read( unsigned char a_ucRole ) { 
     
-    std::auto_ptr< Marshaller::u1Array > b;
+    std::unique_ptr< u1Array > b;
 
     try {
 
-        b.reset( m_CardModule->getCardProperty( CP_CARD_PIN_POLICY, m_ucRole ) );
+        b.reset( m_CardModule->getCardProperty( CP_CARD_PIN_POLICY, a_ucRole ) );
     
         if( b.get( ) ) {
 
-            memcpy( m_ucaPinPolicy.c_array( ), b->GetBuffer( ), m_ucaPinPolicy.size( ) );
+            memcpy( m_ucaPinPolicy, b->GetBuffer( ), g_PolicyLength );
         }
-
+        else
+        {
+            // we set default values for min/max pin length
+            set(PARAMETER_KEY_MIN_LENGTH, PARAMETER_VALUE_MIN_LENGTH);
+            set(PARAMETER_KEY_MAX_LENGTH, PARAMETER_VALUE_MAX_LENGTH);
+        }
     } catch( MiniDriverException& ) {
 
         Log::error( "MiniDriverPinPolicy::read", "getCardProperty 0x80 failed" );
 
         // PIN policy not supported
         reset( );
+        // we set default values for min/max pin length
+        set(PARAMETER_KEY_MIN_LENGTH, PARAMETER_VALUE_MIN_LENGTH);
+        set(PARAMETER_KEY_MAX_LENGTH, PARAMETER_VALUE_MAX_LENGTH);
     }
 }
 

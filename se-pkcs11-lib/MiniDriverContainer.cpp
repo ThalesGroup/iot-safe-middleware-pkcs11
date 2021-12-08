@@ -1,6 +1,7 @@
 /*
-*  PKCS#11 library for .Net smart cards
+*  PKCS#11 library for IoT Safe
 *  Copyright (C) 2007-2009 Gemalto <support@gemalto.com>
+*  Copyright (C) 2009-2021 Thales
 *
 *  This library is free software; you can redistribute it and/or
 *  modify it under the terms of the GNU Lesser General Public
@@ -17,7 +18,12 @@
 *  Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301  USA
 *
 */
-
+#ifdef WIN32
+#ifndef _WIN32_WINNT
+#define _WIN32_WINNT 0x0501
+#endif
+#include <Windows.h>
+#endif
 
 #include "MiniDriverContainer.hpp"
 #include <boost/foreach.hpp>
@@ -34,23 +40,34 @@ const unsigned char g_ucPublicKeyModulusLen = 4;
 */
 MiniDriverContainer::MiniDriverContainer( ) {
 
-    clear( );
+    clear( 0 );
 }
 
 
 /*
 */
-void MiniDriverContainer::clear( void ) {
+void MiniDriverContainer::clear( const unsigned char& a_ucKeySpec ) {
 
-    memset( &m_ContainerMapRecord, 0, sizeof( CONTAINER_MAP_RECORD ) );
+	if (a_ucKeySpec == 0 || a_ucKeySpec == KEYSPEC_EXCHANGE || a_ucKeySpec == KEYSPEC_ECDHE_256 || a_ucKeySpec == KEYSPEC_ECDHE_384 || a_ucKeySpec == KEYSPEC_ECDHE_521)
+	{
+		m_ContainerMapRecord.wKeyExchangeKeySizeBits = 0;
+		m_ucExchangeContainerType = 0;
+		m_ucEcdheKeySpec = 0;
+		m_bIsSmartCardLogon = false;
+	}
+	if (a_ucKeySpec == 0 || a_ucKeySpec == KEYSPEC_SIGNATURE || a_ucKeySpec == KEYSPEC_ECDSA_256 || a_ucKeySpec == KEYSPEC_ECDSA_384 || a_ucKeySpec == KEYSPEC_ECDSA_521)
+	{
+		m_ContainerMapRecord.wSigKeySizeBits = 0;
+		m_ucSignatureContainerType = 0;
+		m_ucEcdsaKeySpec = 0;
+	}
 
-    m_bIsSmartCardLogon = false;
-
-    m_ucSignatureContainerType = 0;
-
-    m_ucExchangeContainerType = 0;
-
-    m_PinIdentifier = MiniDriverAuthentication::PIN_USER;
+	if (m_ContainerMapRecord.wKeyExchangeKeySizeBits == 0 && m_ContainerMapRecord.wSigKeySizeBits == 0)
+	{
+		memset( &m_ContainerMapRecord, 0, sizeof( CONTAINER_MAP_RECORD ) );
+		m_PinIdentifier = MiniDriverAuthentication::PIN_NONE;
+		m_bIsSmartCardLogon = false;
+	}    
 }
 
 
@@ -60,8 +77,14 @@ void MiniDriverContainer::setContainerMapRecord( CONTAINER_MAP_RECORD* a_pContai
 
     Log::begin( "MiniDriverContainer::setContainerMapRecord" );
 
-    if( a_pContainerMapRecord->wSigKeySizeBits || a_pContainerMapRecord->wKeyExchangeKeySizeBits ) {
-
+    if (    ((a_pContainerMapRecord->bFlags & 0xFC) != 0) // only the two lowest bits can be set
+        ||  ((a_pContainerMapRecord->wKeyExchangeKeySizeBits != 0) && (a_pContainerMapRecord->wKeyExchangeKeySizeBits < 256 || a_pContainerMapRecord->wKeyExchangeKeySizeBits > 4096))
+        ||  ((a_pContainerMapRecord->wSigKeySizeBits != 0) && (a_pContainerMapRecord->wSigKeySizeBits < 256 || a_pContainerMapRecord->wSigKeySizeBits > 4096))
+        )
+    {
+        memset( m_ContainerMapRecord.wszGuid, 0, CONTAINER_MAP_RECORD_GUID_SIZE );
+    }
+    else {       
         m_ContainerMapRecord.bFlags = a_pContainerMapRecord->bFlags;
 
         m_ContainerMapRecord.wKeyExchangeKeySizeBits = a_pContainerMapRecord->wKeyExchangeKeySizeBits;
@@ -85,7 +108,7 @@ void MiniDriverContainer::setContainerMapRecord( CONTAINER_MAP_RECORD* a_pContai
 
 /*
 */
-void MiniDriverContainer::setContainerInformation( const boost::shared_ptr< Marshaller::u1Array >& a_pContainerInformation ) {
+void MiniDriverContainer::setContainerInformation( const boost::shared_ptr< u1Array >& a_pContainerInformation ) {
 
     Log::begin( "MiniDriverContainer::setContainerInformation" );
     std::string s;
@@ -98,117 +121,154 @@ void MiniDriverContainer::setContainerInformation( const boost::shared_ptr< Mars
     
     //T_Key_Type = 0x03 
     //L_Key_Type = 0x01 
-    //V_Key_Type = 0x01 for Exchange_Pub_Key or 0x02 for Signature_Pub_Key 
+    //V_Key_Type = 0x01 for Exchange_Pub_Key, 0x02 for Signature_Pub_Key and following values for EC keys
     
-    //T_Key_Pub_Exp = 0x01 
-    //L_Key_Pub_Exp = 0x04 
-    //V_Key_Pub_Exp = Value of Public key Exponent on 4 bytes. 
+    //T_Key_Pub_Exp = 0x01                                              T_KEY_X = 0x04
+    //L_Key_Pub_Exp = 0x04                                              L_KEY_X = Length of the X coordinate
+    //V_Key_Pub_Exp = Value of Public key Exponent on 4 bytes.          V_KEY_X = value of the X coordinate
     
-    //T_Key_Modulus = 0x02 
-    //L_Key_Modulus = Key_Size_Bytes >> 4 (1 byte !) 
-    //V_Key_Modulus = Value of Public key Modulus on Key_Size_Bytes bytes.
+    //T_Key_Modulus = 0x02                                                  T_KEY_Y = 0x05
+    //L_Key_Modulus = Key_Size_Bytes >> 4 (1 byte !)                        L_KEY_Y = Length of the Y coordinate
+    //V_Key_Modulus = Value of Public key Modulus on Key_Size_Bytes bytes.  V_KEY_Y = value of the Y coordinate
 
     // Get the first public key  type
-    unsigned int iOffset = 2;
-    unsigned char ucFirstPublicKeyType = a_pContainerInformation->ReadU1At( iOffset );
+    unsigned int iOffset = 0;
+    unsigned char ucKeyType;
 
-    // Read the first public key exponent value
-    iOffset += 2;
-    unsigned int uiFirstPublicKeyExponentLength = a_pContainerInformation->ReadU1At( iOffset );
+	// clear all internal pointers before parsing the container data
+	m_pExchangePublicKeyExponent.reset( );
+	m_exchExpSerializable.reset();
+	m_pExchangePublicKeyModulus.reset();
+	m_exchModSerializable.reset();
 
-    // Read the first public key exponent value
-    iOffset += 1;
-    Marshaller::u1Array* pFirstPublicKeyExponent = new Marshaller::u1Array( g_ucPublicKeyExponentLen );
-    
-    // The exponent must be a 4 bytes buffer.
-    if( uiFirstPublicKeyExponentLength < g_ucPublicKeyExponentLen ) {
-    
-        // Add zero at the head of the buffer
-        memset( pFirstPublicKeyExponent->GetBuffer( ), 0, g_ucPublicKeyExponentLen );
-    
-        int iPaddingLength = g_ucPublicKeyExponentLen - uiFirstPublicKeyExponentLength;
+	m_pSignaturePublicKeyExponent.reset( );
+	m_sigExpSerializable.reset();
+	m_pSignaturePublicKeyModulus.reset();   
+	m_sigModSerializable.reset();
 
-        memcpy( pFirstPublicKeyExponent->GetBuffer( ) + iPaddingLength, a_pContainerInformation->GetBuffer( ) + iOffset, uiFirstPublicKeyExponentLength );
+	m_pEcdheX.reset( );
+	m_pEcdheXSerializable.reset();
+	m_pEcdheY.reset( );
+	m_pEcdheYSerializable.reset();
+	m_pEcdhePointDER.reset();
 
-    } else {
-    
-        memcpy( pFirstPublicKeyExponent->GetBuffer( ), a_pContainerInformation->GetBuffer( ) + iOffset, g_ucPublicKeyExponentLen );
-    }
+	m_pEcdsaX.reset();
+	m_pEcdsaXSerializable.reset();
+	m_pEcdsaY.reset();   
+	m_pEcdsaYSerializable.reset();
+	m_pEcdsaPointDER.reset();
 
-    // Read the first public key modulus len.
-    // Keep in mind that the signature public key modulus len is stored as a 4 rigth-shifted byte (>>4) to pass the modulus length on 1 byte ofr values 64 to 256 (512 to 2048bits)
-    iOffset += uiFirstPublicKeyExponentLength + 1;
-    int ucPublicKeyModulusLen = a_pContainerInformation->ReadU1At( iOffset ) << 4;
-
-    // Read the first public key modulus value
-    iOffset += 1;
-    Marshaller::u1Array* pFirstPublicKeyModulus = new Marshaller::u1Array( ucPublicKeyModulusLen );
-    memcpy( pFirstPublicKeyModulus->GetBuffer( ), a_pContainerInformation->GetBuffer( ) + iOffset, ucPublicKeyModulusLen );
-
-    if( KEYSPEC_EXCHANGE == ucFirstPublicKeyType ) {
-
-        m_pExchangePublicKeyExponent.reset( pFirstPublicKeyExponent );
-
-        m_pExchangePublicKeyModulus.reset( pFirstPublicKeyModulus );
-
-    } else {
-
-        m_pSignaturePublicKeyExponent.reset( pFirstPublicKeyExponent );
-
-        m_pSignaturePublicKeyModulus.reset( pFirstPublicKeyModulus );   
-    }
-
-    // Check if the second key information is present into the container information
-    iOffset += ucPublicKeyModulusLen + 1;
-    if( iOffset < a_pContainerInformation->GetLength( ) ) {
-
-        // Read the second public key type
+    while (iOffset < a_pContainerInformation->GetLength())
+    {    
         iOffset += 2;
-        unsigned char ucSecondPublicKeyType = a_pContainerInformation->ReadU1At( iOffset );
-
-        // Read the second public key exponent value
+        ucKeyType = a_pContainerInformation->ReadU1At( iOffset );
         iOffset += 2;
-        unsigned int uiSecondPublicKeyExponentLength = a_pContainerInformation->ReadU1At( iOffset );
 
-        // The exponent must be a 4 bytes buffer.
-        Marshaller::u1Array* pSecondPublicKeyExponent = new Marshaller::u1Array( g_ucPublicKeyExponentLen );
+        if (ucKeyType <= KEYSPEC_SIGNATURE)
+        {
+            // Read the first public key exponent value
+            unsigned int uiPublicKeyExponentLength = a_pContainerInformation->ReadU1At( iOffset );
 
-        if( uiSecondPublicKeyExponentLength < g_ucPublicKeyExponentLen ) {
+            // Read the first public key exponent value
+            iOffset += 1;
+            u1Array* pPublicKeyExponent = new u1Array( g_ucPublicKeyExponentLen );
     
-            // Add zero at the head of the buffer
-            memset( pSecondPublicKeyExponent->GetBuffer( ), 0, g_ucPublicKeyExponentLen );
+            // The exponent must be a 4 bytes buffer.
+            if( uiPublicKeyExponentLength < g_ucPublicKeyExponentLen ) {
     
-            int iPaddingLength = g_ucPublicKeyExponentLen - uiSecondPublicKeyExponentLength;
-
-            memcpy( pSecondPublicKeyExponent->GetBuffer( ) + iPaddingLength, a_pContainerInformation->GetBuffer( ) + iOffset, uiSecondPublicKeyExponentLength );
-
-        } else {
+                // Add zero at the head of the buffer
+                memset( pPublicKeyExponent->GetBuffer( ), 0, g_ucPublicKeyExponentLen );
     
-            memcpy( pSecondPublicKeyExponent->GetBuffer( ), a_pContainerInformation->GetBuffer( ) + iOffset, g_ucPublicKeyExponentLen );
+                int iPaddingLength = g_ucPublicKeyExponentLen - uiPublicKeyExponentLength;
+
+                memcpy( pPublicKeyExponent->GetBuffer( ) + iPaddingLength, a_pContainerInformation->GetBuffer( ) + iOffset, uiPublicKeyExponentLength );
+
+            } else {
+    
+                memcpy( pPublicKeyExponent->GetBuffer( ), a_pContainerInformation->GetBuffer( ) + iOffset, g_ucPublicKeyExponentLen );
+            }
+
+            // Read the first public key modulus len.
+            // Keep in mind that the signature public key modulus len is stored as a 4 rigth-shifted byte (>>4) to pass the modulus length on 1 byte ofr values 64 to 256 (512 to 2048bits)
+            iOffset += uiPublicKeyExponentLength + 1;
+            int ucPublicKeyModulusLen = a_pContainerInformation->ReadU1At( iOffset ) << 4;
+
+            // Read the first public key modulus value
+            iOffset += 1;
+            u1Array* pPublicKeyModulus = new u1Array( ucPublicKeyModulusLen );
+            memcpy( pPublicKeyModulus->GetBuffer( ), a_pContainerInformation->GetBuffer( ) + iOffset, ucPublicKeyModulusLen );
+
+            if( KEYSPEC_EXCHANGE == ucKeyType ) {
+
+                m_pExchangePublicKeyExponent.reset( pPublicKeyExponent );
+                m_exchExpSerializable.reset(new u1ArraySerializable(*pPublicKeyExponent));
+
+                m_pExchangePublicKeyModulus.reset( pPublicKeyModulus );
+                m_exchModSerializable.reset(new u1ArraySerializable(*pPublicKeyModulus));
+
+            } else {
+
+                m_pSignaturePublicKeyExponent.reset( pPublicKeyExponent );
+                m_sigExpSerializable.reset(new u1ArraySerializable(*pPublicKeyExponent));
+
+                m_pSignaturePublicKeyModulus.reset( pPublicKeyModulus );   
+                m_sigModSerializable.reset(new u1ArraySerializable(*pPublicKeyModulus));
+            }
+
+            // Check if the second key information is present into the container information
+            iOffset += ucPublicKeyModulusLen;
+
+            m_ucEcdheKeySpec = ucKeyType;
         }
+        else
+        {
+            // Read the X coordinate length
+            unsigned int xLength = a_pContainerInformation->ReadU1At( iOffset );
 
-        // Read the second public key modulus len.
-        // Keep in mind that the signature public key modulus len is stored as a 4 rigth-shifted byte (>>4) to pass the modulus length on 1 byte ofr values 64 to 256 (512 to 2048bits)
-        iOffset += uiSecondPublicKeyExponentLength + 1;
+            // Read the X coordinate value
+            iOffset += 1;
+            u1Array* pX = new u1Array( xLength );   
+    
+            memcpy( pX->GetBuffer( ), a_pContainerInformation->GetBuffer( ) + iOffset, xLength );
 
-        ucPublicKeyModulusLen = a_pContainerInformation->ReadU1At( iOffset ) << 4;
+            // Read the Y coordinate length
+            iOffset += xLength + 1;
+            int yLength = a_pContainerInformation->ReadU1At( iOffset ) ;
 
-        // Read the second public key modulus value
-        ++iOffset;
-        Marshaller::u1Array* pSecondPublicKeyModulus = new Marshaller::u1Array( ucPublicKeyModulusLen );
-        memcpy( pSecondPublicKeyModulus->GetBuffer( ), a_pContainerInformation->GetBuffer( ) + iOffset, ucPublicKeyModulusLen );
+            // Read the first public key modulus value
+            iOffset += 1;
+            u1Array* pY = new u1Array( yLength );
+            memcpy( pY->GetBuffer( ), a_pContainerInformation->GetBuffer( ) + iOffset, yLength );
 
-        if( KEYSPEC_EXCHANGE == ucSecondPublicKeyType ) {
+            if(     KEYSPEC_ECDHE_256 == ucKeyType 
+                ||  KEYSPEC_ECDHE_384 == ucKeyType
+                ||  KEYSPEC_ECDHE_521 == ucKeyType
+              ) {
 
-            m_pExchangePublicKeyExponent.reset( pSecondPublicKeyExponent );
+                m_pEcdheX.reset( pX );
+                m_pEcdheXSerializable.reset(new u1ArraySerializable(*pX));
 
-            m_pExchangePublicKeyModulus.reset( pSecondPublicKeyModulus );
+                m_pEcdheY.reset( pY );
+                m_pEcdheYSerializable.reset(new u1ArraySerializable(*pY));
 
-        } else {
+                m_pEcdhePointDER.reset(computeUncompressedEcPointDER(m_pEcdheX.get(), m_pEcdheY.get()));
 
-            m_pSignaturePublicKeyExponent.reset( pSecondPublicKeyExponent );
+                m_ucEcdheKeySpec = ucKeyType;
+            } else {
 
-            m_pSignaturePublicKeyModulus.reset( pSecondPublicKeyModulus );   
+                m_pEcdsaX.reset( pX );
+                m_pEcdsaXSerializable.reset(new u1ArraySerializable(*pX));
+
+                m_pEcdsaY.reset( pY );   
+                m_pEcdsaYSerializable.reset(new u1ArraySerializable(*pY));
+
+                m_pEcdsaPointDER.reset(computeUncompressedEcPointDER(m_pEcdsaX.get(), m_pEcdsaY.get()));
+
+                m_ucEcdsaKeySpec = ucKeyType;
+            }
+
+            // Check if the second key information is present into the container information
+            iOffset += yLength;
         }
     }
 
@@ -299,4 +359,54 @@ void MiniDriverContainer::setGUID( const std::string& a_stGUID ) {
    //   // Convert to wchar, little endian.
    //   m_ContainerMapRecord.wszGuid[ 2*i ]  = a_stGUID[ i ]; 
    //}
+}
+
+u1Array* MiniDriverContainer::computeUncompressedEcPointDER(u1Array* x, u1Array* y)
+{
+    int xLen = x->GetLength();
+    int yLen = y->GetLength();
+    int encodingLen = 1 + xLen + yLen;
+    u1Array* pointDer = NULL;
+    if (encodingLen <= 127)
+    {
+        pointDer = new u1Array(1 + 1 + encodingLen);
+        pointDer->SetU1At(0, 0x04);
+        pointDer->SetU1At(1, (u1) encodingLen);
+        pointDer->SetU1At(2, 0x04);
+        memcpy(pointDer->GetBuffer() + 3, x->GetBuffer(), xLen);
+        memcpy(pointDer->GetBuffer() + 3 + xLen, y->GetBuffer(), yLen);
+    }
+    else
+    {
+        pointDer = new u1Array(1 + 2 + encodingLen);
+        pointDer->SetU1At(0, 0x04);
+        pointDer->SetU1At(1, 0x81);
+        pointDer->SetU1At(2, (u1) encodingLen);
+        pointDer->SetU1At(3, 0x04);
+        memcpy(pointDer->GetBuffer() + 4, x->GetBuffer(), xLen);
+        memcpy(pointDer->GetBuffer() + 4 + xLen, y->GetBuffer(), yLen);
+    }
+
+    return pointDer;
+}
+
+bool MiniDriverContainer::Validate()
+{
+	WORD uiKeySize = getKeyExchangeSizeBits( );
+
+	boost::shared_ptr< u1Array > pPublicKeyExponent = getExchangePublicKeyExponent( );
+	boost::shared_ptr< u1Array > pPublicKeyModulus = getExchangePublicKeyModulus( );
+	boost::shared_ptr< u1Array > pEccPublicKey = getEcdhePointDER();
+
+	if( !uiKeySize )
+	{
+		pPublicKeyExponent = getSignaturePublicKeyExponent( );
+		pPublicKeyModulus = getSignaturePublicKeyModulus( );
+		pEccPublicKey = getEcdsaPointDER();
+	}
+
+	if (!pEccPublicKey.get() && (!pPublicKeyExponent.get() || !pPublicKeyModulus.get()))
+		return false;
+	else
+		return true;
 }

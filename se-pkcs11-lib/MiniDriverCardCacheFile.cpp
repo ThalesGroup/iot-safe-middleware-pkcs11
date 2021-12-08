@@ -1,6 +1,7 @@
 /*
-*  PKCS#11 library for .Net smart cards
+*  PKCS#11 library for IoT Safe
 *  Copyright (C) 2007-2009 Gemalto <support@gemalto.com>
+*  Copyright (C) 2009-2021 Thales
 *
 *  This library is free software; you can redistribute it and/or
 *  modify it under the terms of the GNU Lesser General Public
@@ -17,14 +18,19 @@
 *  Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301  USA
 *
 */
-
+#ifdef WIN32
+#ifndef _WIN32_WINNT
+#define _WIN32_WINNT 0x0501
+#endif
+#include <Windows.h>
+#endif
 
 #include "util.h"
 #include "MiniDriver.hpp"
 #include "MiniDriverCardCacheFile.hpp"
 #include "Log.hpp"
 #include "MiniDriverException.hpp"
-
+#include "Timer.hpp"
 
 const unsigned char MAX_RETRY = 2;
 
@@ -33,8 +39,46 @@ const unsigned char MAX_RETRY = 2;
 */
 void MiniDriverCardCacheFile::write( void ) {
 
-    // Create a buffer to write the file oncard
-    std::auto_ptr< Marshaller::u1Array > f( new Marshaller::u1Array( 6 ) );
+   u4 cardcfSize = 6;
+   std::string g_stPathCardCF( szCACHE_FILE );
+   try
+   {
+      // Get the file from the smart card in order to keep its size the same
+      std::unique_ptr<u1Array> ba(m_pCardModuleService->getFileProperties(&g_stPathCardCF));
+
+      u4 b0 = ba->ReadU1At(3);
+      u4 b1 = ba->ReadU1At(4);
+      u4 b2 = ba->ReadU1At(5);
+      u4 b3 = ba->ReadU1At(6);
+
+      cardcfSize =  b3 << 24;
+      cardcfSize |= (b2 << 16);
+      cardcfSize |= (b1 << 8);
+      cardcfSize |= b0;           
+    }
+    catch(...)
+    {}
+	
+   std::unique_ptr<u1Array> f;
+
+   if (cardcfSize != 6)
+   {
+      try
+      {
+         f.reset(m_pCardModuleService->readFileWithoutMemoryCheck( &g_stPathCardCF ));
+      }
+      catch (...) {}
+
+      if (!f.get())
+      {
+          // Create a buffer to write the file oncard
+          f.reset( new u1Array( 6 ) );
+      }
+      else if (f->GetLength() < 6)
+         f->Resize(6);
+   }
+   else
+      f.reset( new u1Array( 6 ) );
 
     // Set the version flag
     f->SetU1At( 0, m_ucVersion );
@@ -49,7 +93,6 @@ void MiniDriverCardCacheFile::write( void ) {
     IntToLittleEndian< unsigned short >( m_wFilesFreshness, f->GetBuffer( ), 4 );
 
     // Write cache file back
-	std::string g_stPathCardCF( szCACHE_FILE );
     m_pCardModuleService->writeFile( &g_stPathCardCF, f.get( ) );
 }
 
@@ -104,9 +147,9 @@ void MiniDriverCardCacheFile::hasChanged( ChangeType& a_Pins, ChangeType& a_Cont
 
     // Get the file from the smart card
 	std::string g_stPathCardCF( szCACHE_FILE );
-    Marshaller::u1Array* f = m_pCardModuleService->readFileWithoutMemoryCheck( &g_stPathCardCF );
+   std::unique_ptr<u1Array> f(m_pCardModuleService->readFileWithoutMemoryCheck( &g_stPathCardCF ));
 
-    if( f ) {
+    if( f.get() ) {
 
         std::string s;
         Log::toString( f->GetBuffer( ), f->GetLength( ), s );
@@ -116,7 +159,7 @@ void MiniDriverCardCacheFile::hasChanged( ChangeType& a_Pins, ChangeType& a_Cont
         unsigned char ucVersion = f->ReadU1At( 0 );
         Log::log( "MiniDriverCardCacheFile::hasChanged - Read Version <0x%#02x>", ucVersion );
         
-        if( ucVersion != m_ucVersion ) {
+        if( !m_bInitialized || (ucVersion != m_ucVersion )) {
         
             m_ucVersion = ucVersion;
         }
@@ -125,7 +168,7 @@ void MiniDriverCardCacheFile::hasChanged( ChangeType& a_Pins, ChangeType& a_Cont
         unsigned char bPinsFreshness = f->ReadU1At( 1 );
         Log::log( "MiniDriverCardCacheFile::hasChanged - Read PIN freshness counter <%#02x>", bPinsFreshness );
 
-        if( m_ucPinsFreshness != bPinsFreshness ) {
+        if( !m_bInitialized || (m_ucPinsFreshness != bPinsFreshness) ) {
 
             Log::log( "MiniDriverCardCacheFile::hasChanged - $$$$$ PIN freshness counter changed $$$$$" );
             m_ucPinsFreshness = bPinsFreshness;
@@ -136,7 +179,7 @@ void MiniDriverCardCacheFile::hasChanged( ChangeType& a_Pins, ChangeType& a_Cont
         unsigned short wContainersFreshness = LittleEndianToInt< unsigned short >( f->GetBuffer( ), 2 );
         Log::log( "MiniDriverCardCacheFile::hasChanged - Read Containers freshness counter <%#02x>", wContainersFreshness );
 
-        if( m_wContainersFreshness != wContainersFreshness ) {
+        if( !m_bInitialized || (m_wContainersFreshness != wContainersFreshness) ) {
 
             Log::log( "MiniDriverCardCacheFile::hasChanged - $$$$$ CONTAINER freshness counter changed $$$$$" );
             m_wContainersFreshness = wContainersFreshness;
@@ -147,12 +190,14 @@ void MiniDriverCardCacheFile::hasChanged( ChangeType& a_Pins, ChangeType& a_Cont
         unsigned short wFilesFreshness = LittleEndianToInt< unsigned short >( f->GetBuffer( ), 4 );
         Log::log( "MiniDriverCardCacheFile::hasChanged - Read Files freshness counter <%#02x>", wFilesFreshness );
 
-        if( m_wFilesFreshness != wFilesFreshness ) {
+        if( !m_bInitialized || (m_wFilesFreshness != wFilesFreshness) ) {
 
             Log::log( "MiniDriverCardCacheFile::hasChanged - $$$$$ FILE freshness counter changed $$$$$" );
             m_wFilesFreshness = wFilesFreshness;
             a_Files = FILES;
         }
+
+		m_bInitialized = true;
     }
 
     t.stop( "MiniDriverCardCacheFile::read" );
@@ -160,19 +205,17 @@ void MiniDriverCardCacheFile::hasChanged( ChangeType& a_Pins, ChangeType& a_Cont
 }
 
 
+/*** 
+	For debugging session only 
+**/
 /*
-*/
 void MiniDriverCardCacheFile::print( void ) {
     
     Log::begin( "MiniDriverCardCacheFile::print" );
-
     Log::log( "Version <%ld>", m_ucVersion );
-
     Log::log( "m_ucPinsFreshness <%ld>", m_ucPinsFreshness );
-
     Log::log( "m_wContainersFreshness <%ld>", m_wContainersFreshness );
-
     Log::log( "m_wFilesFreshness <%ld>", m_wFilesFreshness );
-
     Log::end( "MiniDriverCardCacheFile::print" );
 }
+*/

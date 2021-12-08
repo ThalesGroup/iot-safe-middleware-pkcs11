@@ -1,6 +1,7 @@
 /*
-*  PKCS#11 library for .Net smart cards
+*  PKCS#11 library for IoT Safe
 *  Copyright (C) 2007-2009 Gemalto <support@gemalto.com>
+*  Copyright (C) 2009-2021 Thales
 *
 *  This library is free software; you can redistribute it and/or
 *  modify it under the terms of the GNU Lesser General Public
@@ -17,8 +18,6 @@
 *  Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301  USA
 *
 */
-
-
 #include "Log.hpp"
 #include "util.h"
 #include "Pkcs11ObjectKey.hpp"
@@ -40,6 +39,8 @@ KeyObject::KeyObject( ) : StorageObject( ) {
     m_ucContainerIndex = 0xFF;
 
     m_ucKeySpec = 0;
+
+    m_role = 0;
 }
 
 
@@ -57,11 +58,13 @@ KeyObject::KeyObject( const KeyObject* p ) : StorageObject( *p ) {
 
         m_ucKeySpec = p->m_ucKeySpec;
 
+        m_role = p->m_role;
+
         _derive = p->_derive;
 
         if( p->m_pID.get( ) ) {
 
-            Marshaller::u1Array* a = new Marshaller::u1Array( *( p->m_pID.get( ) ) );
+            u1Array* a = new u1Array( *( p->m_pID.get( ) ) );
 
             m_pID.reset( a );
 
@@ -72,7 +75,7 @@ KeyObject::KeyObject( const KeyObject* p ) : StorageObject( *p ) {
 
         if( p->m_pStartDate.get( ) ) {
 
-            Marshaller::u1Array* a = new Marshaller::u1Array( *( p->m_pStartDate.get( ) ) );
+            u1Array* a = new u1Array( *( p->m_pStartDate.get( ) ) );
 
             m_pStartDate.reset( a );
 
@@ -83,7 +86,7 @@ KeyObject::KeyObject( const KeyObject* p ) : StorageObject( *p ) {
 
         if( p->m_pEndDate.get( ) ) {
 
-            Marshaller::u1Array* a = new Marshaller::u1Array( *( p->m_pEndDate.get( ) ) );
+            u1Array* a = new u1Array( *( p->m_pEndDate.get( ) ) );
 
             m_pEndDate.reset( a );
 
@@ -94,7 +97,7 @@ KeyObject::KeyObject( const KeyObject* p ) : StorageObject( *p ) {
 
         if( p->m_pAllowedMechanism.get( ) ) {
 
-            Marshaller::u4Array* a = new Marshaller::u4Array( *( p->m_pAllowedMechanism.get( ) ) );
+            u4Array* a = new u4Array( *( p->m_pAllowedMechanism.get( ) ) );
 
             m_pAllowedMechanism.reset( a );
 
@@ -114,6 +117,7 @@ KeyObject::KeyObject( const KeyObject* p ) : StorageObject( *p ) {
     m_ucContainerIndex = 0xFF;
 
     m_ucKeySpec = 0;
+    m_role = 0;
         _derive = CK_FALSE;
 
         m_pID.reset( );
@@ -172,8 +176,16 @@ void KeyObject::setAttribute( const CK_ATTRIBUTE& a_Attribute, const bool& objCr
         switch(a_Attribute.type){
 
         case CKA_KEY_TYPE:
+            if (a_Attribute.pValue && a_Attribute.ulValueLen != sizeof(CK_KEY_TYPE))
+                throw PKCS11Exception( CKR_ATTRIBUTE_VALUE_INVALID );
+            throw PKCS11Exception( CKR_ATTRIBUTE_READ_ONLY );
         case CKA_LOCAL:
+            if (a_Attribute.pValue && a_Attribute.ulValueLen != sizeof(CK_BBOOL))
+                throw PKCS11Exception( CKR_ATTRIBUTE_VALUE_INVALID );
+            throw PKCS11Exception( CKR_ATTRIBUTE_READ_ONLY );
         case CKA_MECHANISM_TYPE:
+            if (a_Attribute.pValue && a_Attribute.ulValueLen != sizeof(CK_MECHANISM_PTR))
+                throw PKCS11Exception( CKR_ATTRIBUTE_VALUE_INVALID );
             throw PKCS11Exception( CKR_ATTRIBUTE_READ_ONLY );
         }
     }
@@ -209,7 +221,7 @@ void KeyObject::setAttribute( const CK_ATTRIBUTE& a_Attribute, const bool& objCr
         break;
 
     case CKA_ALLOWED_MECHANISMS:
-        m_pAllowedMechanism.reset( new Marshaller::u4Array( a_Attribute.ulValueLen / 4 ) );
+        m_pAllowedMechanism.reset( new u4Array( a_Attribute.ulValueLen / 4 ) );
         memcpy( (unsigned char*)m_pAllowedMechanism->GetBuffer( ), (CK_BYTE_PTR)a_Attribute.pValue, a_Attribute.ulValueLen );
         break;
 

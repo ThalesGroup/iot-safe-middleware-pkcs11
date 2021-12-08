@@ -1,6 +1,7 @@
 /*
-*  PKCS#11 library for .Net smart cards
+*  PKCS#11 library for IoT Safe
 *  Copyright (C) 2007-2009 Gemalto <support@gemalto.com>
+*  Copyright (C) 2009-2021 Thales
 *
 *  This library is free software; you can redistribute it and/or
 *  modify it under the terms of the GNU Lesser General Public
@@ -17,8 +18,6 @@
 *  Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301  USA
 *
 */
-
-
 #ifndef __GEMALTO__OBJECT_KEY_PUBLICK_RSA__
 #define __GEMALTO__OBJECT_KEY_PUBLICK_RSA__
 
@@ -32,11 +31,11 @@ class Pkcs11ObjectKeyPublicRSA : public Pkcs11ObjectKeyPublic
 
 public:
 
-	boost::shared_ptr< Marshaller::u1Array > m_pModulus;
+	boost::shared_ptr< u1Array > m_pModulus;
 	
 	CK_ULONG m_ulModulusBits;
 
-	boost::shared_ptr< Marshaller::u1Array > m_pPublicExponent;
+	boost::shared_ptr< u1Array > m_pPublicExponent;
 
 
 	Pkcs11ObjectKeyPublicRSA( );
@@ -45,6 +44,7 @@ public:
 
     virtual ~Pkcs11ObjectKeyPublicRSA( ) { }
 
+	virtual bool isEqual( StorageObject * that) const;
 
 	virtual bool compare( const CK_ATTRIBUTE& );
 
@@ -57,6 +57,10 @@ public:
 	virtual void deserialize( std::vector< u1 >&, CK_ULONG_PTR );
 
     virtual void print( void );
+
+    static void verifyRSAPKCS1v15( u1Array*, u1Array*, const unsigned int& );
+    static void verifyRSAX509( u1Array*, u1Array*, const unsigned int& );
+    static void verifyHash( u1Array*, u1Array*, const unsigned int&, const CK_ULONG& );
 
 };
 

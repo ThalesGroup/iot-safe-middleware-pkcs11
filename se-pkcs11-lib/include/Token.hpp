@@ -1,6 +1,7 @@
 /*
-*  PKCS#11 library for .Net smart cards
+*  PKCS#11 library for IoT Safe
 *  Copyright (C) 2007-2009 Gemalto <support@gemalto.com>
+*  Copyright (C) 2009-2021 Thales
 *
 *  This library is free software; you can redistribute it and/or
 *  modify it under the terms of the GNU Lesser General Public
@@ -17,8 +18,6 @@
 *  Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301  USA
 *
 */
-
-
 #ifndef __GEMALTO_TOKEN__
 #define __GEMALTO_TOKEN__
 
@@ -30,6 +29,7 @@
 #include <boost/random.hpp>
 #include <string>
 #include <vector>
+#include <list>
 #include "MiniDriver.hpp"
 #include "Device.hpp"
 #include "Session.hpp"
@@ -48,36 +48,81 @@ class Token {
 
 public:
 
+	class CAtomicLogin
+	{
+	public:
+		Token* m_pToken;
+        bool m_bIsForWriteOperation;
+		std::vector<MiniDriverAuthentication::ROLES> m_vecAuthenticatedRoles;
+
+		CAtomicLogin(Token* pToken, MiniDriverAuthentication::ROLES unblockRole );
+        CAtomicLogin(Token* pToken, bool bIsForWriteOperation = false, CK_BYTE specificRole = 0 );
+
+		bool authenticateRole(MiniDriverAuthentication::ROLES role);
+
+		~CAtomicLogin()
+		{
+			try
+			{
+				if (m_pToken->m_Device)
+				{
+					for (std::vector<MiniDriverAuthentication::ROLES>::iterator It = m_vecAuthenticatedRoles.begin();
+						It != m_vecAuthenticatedRoles.end(); It++)
+					{
+						m_pToken->m_Device->logOut( *It, false);
+						if ( m_pToken->IsPinCacheDisabled (*It) )
+						{
+							m_pToken->m_Device->clearPinCache(*It);
+						}
+					}
+
+				}
+			}
+			catch(...) {}
+		}
+	};
+
     typedef boost::ptr_map< CK_OBJECT_HANDLE, StorageObject > TOKEN_OBJECTS;
 
     static const unsigned long FLAG_OBJECT_TOKEN = 0x00000000;
 
     static const unsigned long MASK_OBJECT_TOKEN = 0x00FF0000;
 
+    static bool s_bForcePinUser;
+
     Token( Slot*, Device* );
 
     inline virtual ~Token( ) { clear( ); }
 
 
-    void login( const CK_ULONG&, Marshaller::u1Array* );
+    void login( const CK_ULONG&, u1Array* );
 
     void logout( void );
+
+	bool IsPinCacheDisabled(MiniDriverAuthentication::ROLES role)
+	{
+		if (!m_Device)
+			return false;
+		else
+			return (m_Device->getPinCacheType(role) == MiniDriverAuthentication::PIN_CACHE_NONE)
+				  ||(m_Device->getPinCacheType(role) == MiniDriverAuthentication::PIN_CACHE_ALWAYS_PROMPT);
+	}
 
     void generateRandom( CK_BYTE_PTR, const CK_ULONG& );
 
     void addObject( StorageObject*, CK_OBJECT_HANDLE_PTR, const bool& a_bRegisterObject = true );
 
-    void addObjectPrivateKey( RSAPrivateKeyObject*, CK_OBJECT_HANDLE_PTR );
+    void addObjectPrivateKey( PrivateKeyObject*, CK_OBJECT_HANDLE_PTR );
 
     void addObjectCertificate( X509PubKeyCertObject*, CK_OBJECT_HANDLE_PTR );
 
-    void addObjectPublicKey( Pkcs11ObjectKeyPublicRSA*, CK_OBJECT_HANDLE_PTR );
+    void addObjectPublicKey( Pkcs11ObjectKeyPublic*, CK_OBJECT_HANDLE_PTR );
 
     void deleteObject( const CK_OBJECT_HANDLE& );
 
     // === TEST
     //inline void findObjectsInit( void ) { m_TokenObjectsReturnedInSearch.clear( ); synchronizeIfSmartCardContentHasChanged( ); }
-    inline void findObjectsInit( void ) { m_TokenObjectsReturnedInSearch.clear( ); try{ synchronizeIfSmartCardContentHasChanged( ); } catch( ... ){} }
+    inline void findObjectsInit( Session* a_pSession ) { a_pSession->m_TokenObjectsReturnedInSearch.clear( ); try{ synchronizeIfSmartCardContentHasChanged( ); } catch( ... ){} }
 
     void findObjects( Session*, CK_OBJECT_HANDLE_PTR, const CK_ULONG&, CK_ULONG_PTR );
 
@@ -85,23 +130,25 @@ public:
 
     void setAttributeValue( const CK_OBJECT_HANDLE&, CK_ATTRIBUTE_PTR, const CK_ULONG& );
 
-    void generateKeyPair( Pkcs11ObjectKeyPublicRSA*, RSAPrivateKeyObject*, CK_OBJECT_HANDLE_PTR , CK_OBJECT_HANDLE_PTR );
+    void generateKeyPair( Pkcs11ObjectKeyPublic*, PrivateKeyObject*, CK_OBJECT_HANDLE_PTR , CK_OBJECT_HANDLE_PTR );
+
+    void deriveKey( PrivateKeyObject*, CK_ECDH1_DERIVE_PARAMS_PTR, SecretKeyObject*, CK_OBJECT_HANDLE_PTR );
 
     StorageObject* getObject( const CK_OBJECT_HANDLE& );
 
-    void sign( const RSAPrivateKeyObject*, Marshaller::u1Array*, const CK_ULONG&, CK_BYTE_PTR );
+    void sign( const KeyObject*, u1Array*, u1Array*, u1Array* , const CK_ULONG&, CK_BYTE_PTR );
 
-    void decrypt( const StorageObject*, Marshaller::u1Array*, const CK_ULONG&, CK_BYTE_PTR , CK_ULONG_PTR );
+    void decrypt( const StorageObject*, u1Array*, const CK_ULONG&, unsigned char, CK_BYTE_PTR , CK_ULONG_PTR );
 
-    void verify( const StorageObject*, Marshaller::u1Array*, const CK_ULONG&, Marshaller::u1Array* );
+    void verify( const StorageObject*, u1Array*, const CK_ULONG&, u1Array* );
 
-    void encrypt( const StorageObject*, Marshaller::u1Array*, const CK_ULONG&,CK_BYTE_PTR );
+    void encrypt( const StorageObject*, u1Array*, const CK_ULONG&, CK_VOID_PTR, CK_BYTE_PTR );
 
-    void initToken( Marshaller::u1Array*, Marshaller::u1Array* );
+    void initToken( u1Array*, u1Array* );
 
-    void initPIN( Marshaller::u1Array*, Marshaller::u1Array* );
+    void initPIN( u1Array*, u1Array* );
 
-    void setPIN( Marshaller::u1Array*, Marshaller::u1Array* );
+    void setPIN( u1Array*, u1Array* );
 
     inline const CK_ULONG& getLoggedRole( void ) { return m_RoleLogged; }
 
@@ -112,9 +159,14 @@ public:
     inline bool isToken( const CK_OBJECT_HANDLE& a_hObject ) { return ( ( a_hObject & MASK_OBJECT_TOKEN ) == FLAG_OBJECT_TOKEN ); }
 
     bool synchronizeIfSmartCardContentHasChanged( void );
+
+	inline void forceSynchronizePrivateObjects(void) { m_bSynchronizeObjectsPrivate = true; synchronizePrivateObjects(); }
         
     static CK_RV checkException( MiniDriverException& );
 
+    MiniDriverAuthentication::ROLES getUserRole() const;
+
+    void updatePinFlags();
 
 private:
 
@@ -129,6 +181,8 @@ private:
     std::string g_stPrefixKeyPublic;
 
     std::string g_stPrefixKeyPrivate;
+
+    std::string g_stPrefixKeySecret;
 
     std::string g_stPrefixPublicObject;
 
@@ -155,23 +209,11 @@ private:
 
     CK_OBJECT_HANDLE computeObjectHandle( const CK_OBJECT_CLASS&, const bool& );
 
-    inline void clear( void ) { m_Objects.clear( ); }
+    inline void clear( void ) { m_Objects.clear( ); if (m_Device && m_pSlot) m_Device->clearPinCache(getUserRole()); }
 
-    void authenticateUser( Marshaller::u1Array* );
+    void authenticateUser( u1Array* );
 
-    void authenticateAdmin( Marshaller::u1Array* );
-
-    Marshaller::u1Array* PadRSAPKCS1v15( Marshaller::u1Array*, const CK_ULONG& );
-
-    Marshaller::u1Array* PadRSAX509( Marshaller::u1Array*, const CK_ULONG& );
-
-    Marshaller::u1Array* EncodeHashForSigning( Marshaller::u1Array*, const CK_ULONG&, const CK_ULONG& );
-
-    void verifyRSAPKCS1v15( Marshaller::u1Array*, Marshaller::u1Array*, const unsigned int& );
-
-    void verifyRSAX509( Marshaller::u1Array*, Marshaller::u1Array*, const unsigned int& );
-
-    void verifyHash( Marshaller::u1Array*, Marshaller::u1Array*, const unsigned int&, const CK_ULONG& );
+    void authenticateAdmin( u1Array* );
 
     void deleteObjectFromCard( StorageObject* );
 
@@ -179,9 +221,11 @@ private:
 
     void writeObject( StorageObject* );
 
-    CK_OBJECT_HANDLE registerStorageObject( StorageObject* );
+    CK_OBJECT_HANDLE registerStorageObject( StorageObject* , bool bCheckExistence = true);
 
     void unregisterStorageObject( const CK_OBJECT_HANDLE& );
+
+	bool CheckStorageObjectExisting( StorageObject* );
 
     CK_OBJECT_HANDLE computeObjectHandle( void );
 
@@ -203,29 +247,33 @@ private:
 
     void synchronizePrivateKeyObjects( void );
 
+    void synchronizeSecretKeyObjects( void );
+
     void synchronizeRootCertificateObjects( void );
 
     void synchronizeEmptyContainers( void );
 
-    void createCertificateFromMiniDriverFile( const std::string&, const unsigned char&, const unsigned char& );
+    void createCertificateFromMiniDriverFile( const std::string&, const unsigned char&, const unsigned char&, boost::shared_ptr<u1Array>& );
 
-    void createCertificateFromPKCS11ObjectFile( const std::string&, const std::string& );
+    void createRootCertificateFromValue( unsigned char* , unsigned int , const unsigned char& );
+
+    bool createCertificateFromPKCS11ObjectFile( const std::string&, const std::string& );
 
     void createPublicKeyFromPKCS11ObjectFile( const std::string& );
 
-    void createPublicKeyFromMiniDriverFile( const std::string&, const unsigned char& a_ucIndex, const unsigned int& a_ucKeySpec, Marshaller::u1Array*, Marshaller::u1Array* );
+    void createPublicKeyFromMiniDriverFile( const std::string&, const unsigned char& a_ucIndex, const unsigned int& a_ucKeySpec, u1Array*, u1Array*, boost::shared_ptr<u1Array> );
 
     void createPrivateKeyFromPKCS11ObjectFile( const std::string& );
 
-    void createPrivateKeyFromMiniDriverFile( const std::string&, const unsigned char&, const unsigned int&, Marshaller::u1Array*, Marshaller::u1Array* );
+    void createPrivateKeyFromMiniDriverFile( const std::string&, const unsigned char&, const unsigned int&, u1Array*, u1Array* );
+
+    void createSecretKeyFromPKCS11ObjectFile( const std::string&, u1 );
 
     bool isPrivate( const CK_OBJECT_HANDLE& a_ObjectHandle ) { return ( ( ( a_ObjectHandle >> 8 ) & 0x000000FF ) >= 0x00000010 ); }
 
     void checkAuthenticationStatus( CK_ULONG, MiniDriverException& );
 
     void printObject( StorageObject* );
-
-    Marshaller::u1Array* computeSHA1( const unsigned char* a_pData, const size_t& a_uiLength );
 
     boost::mt19937 m_RandomNumberGenerator;
 
@@ -253,43 +301,41 @@ private:
 
     bool m_bSynchronizeObjectsPrivate;
 
-    std::set< CK_OBJECT_HANDLE > m_TokenObjectsReturnedInSearch;
-
     Slot* m_pSlot;
 
     unsigned char computeIndex( const std::string& );
 
     void generateDefaultAttributesCertificate( X509PubKeyCertObject* );
 
-    void generateDefaultAttributesKeyPublic( Pkcs11ObjectKeyPublicRSA* );
+    void generateDefaultAttributesKeyPublic( Pkcs11ObjectKeyPublic* );
 
-    void generateDefaultAttributesKeyPrivate( RSAPrivateKeyObject* );
+    void generateDefaultAttributesKeyPrivate( PrivateKeyObject* );
 
-    void generateLabel( boost::shared_ptr< Marshaller::u1Array>&, boost::shared_ptr< Marshaller::u1Array>& );
+    void generateLabel( boost::shared_ptr< u1Array>&, boost::shared_ptr< u1Array>& );
 
-    void generateID(boost::shared_ptr< Marshaller::u1Array>&, boost::shared_ptr< Marshaller::u1Array>& );
+    void generateID(boost::shared_ptr< u1Array>&, boost::shared_ptr< u1Array>& );
 
-    void generateSubject( boost::shared_ptr< Marshaller::u1Array>&, boost::shared_ptr< Marshaller::u1Array>& );
+    void generateSubject( boost::shared_ptr< u1Array>&, boost::shared_ptr< u1Array>& );
 
-    void generateSerialNumber( boost::shared_ptr< Marshaller::u1Array>&, boost::shared_ptr< Marshaller::u1Array>& );
+    void generateSerialNumber( boost::shared_ptr< u1Array>&, boost::shared_ptr< u1Array>& );
 
-    void generateIssuer( boost::shared_ptr< Marshaller::u1Array>&, boost::shared_ptr< Marshaller::u1Array>& );
+    void generateIssuer( boost::shared_ptr< u1Array>&, boost::shared_ptr< u1Array>& );
 
-    void generatePublicKeyModulus( boost::shared_ptr< Marshaller::u1Array>&, boost::shared_ptr< Marshaller::u1Array>&, u8& );
+    void generatePublicKeyValue( boost::shared_ptr< u1Array>&, boost::shared_ptr< u1Array>&, bool&, unsigned char &,u8& , boost::shared_ptr<u1Array>&);
 
-    void generateRootAndSmartCardLogonFlags( boost::shared_ptr< Marshaller::u1Array>&, bool&, unsigned long&, bool& );
+    void generateRootAndSmartCardLogonFlags( boost::shared_ptr< u1Array>&, bool&, unsigned long&, bool& );
 
-    void searchContainerIndex( boost::shared_ptr< Marshaller::u1Array>&, unsigned char&, unsigned char& );
+    void searchContainerIndex( boost::shared_ptr< u1Array>&, unsigned char&, unsigned char& );
 
     void setDefaultAttributesCertificate( X509PubKeyCertObject* );
 
-    void setDefaultAttributesKeyPublic( Pkcs11ObjectKeyPublicRSA* );
+    void setDefaultAttributesKeyPublic( Pkcs11ObjectKeyPublic* );
 
-    void setDefaultAttributesKeyPrivate( RSAPrivateKeyObject* );
+    void setDefaultAttributesKeyPrivate( PrivateKeyObject* );
 
-    void setContainerIndexToCertificate( boost::shared_ptr< Marshaller::u1Array>&, const unsigned char&, const unsigned char& );
+    void setContainerIndexToCertificate( boost::shared_ptr< u1Array>&, const unsigned char&, const unsigned char& );
 
-    void setContainerIndexToKeyPublic( boost::shared_ptr< Marshaller::u1Array>&, const unsigned char&, const unsigned char& );
+    void setContainerIndexToKeyPublic( boost::shared_ptr< u1Array>&, const unsigned char&, const unsigned char& );
 
     void computeObjectNameData( std::string&, /*const*/ StorageObject* );
 
@@ -303,7 +349,8 @@ private:
 
     bool isObjectNameValid( const std::string&, const MiniDriverFiles::FILES_NAME& );
 
-};
+	bool isRoleUsingProtectedAuthenticationPath(MiniDriverAuthentication::ROLES role);
+ };
 
 
 #endif // __GEMALTO_TOKEN__

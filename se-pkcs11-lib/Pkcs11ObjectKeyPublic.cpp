@@ -1,6 +1,7 @@
 /*
-*  PKCS#11 library for .Net smart cards
+*  PKCS#11 library for IoT Safe
 *  Copyright (C) 2007-2009 Gemalto <support@gemalto.com>
+*  Copyright (C) 2009-2021 Thales
 *
 *  This library is free software; you can redistribute it and/or
 *  modify it under the terms of the GNU Lesser General Public
@@ -17,8 +18,6 @@
 *  Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301  USA
 *
 */
-
-
 #include "Log.hpp"
 #include "util.h"
 #include "Pkcs11ObjectKeyPublic.hpp"
@@ -53,7 +52,7 @@ Pkcs11ObjectKeyPublic::Pkcs11ObjectKeyPublic( const Pkcs11ObjectKeyPublic* p ) :
 
         if( p->m_pSubject.get( ) ) {
 
-            Marshaller::u1Array* pLabel = new Marshaller::u1Array( *(p->m_pSubject.get( )) );
+            u1Array* pLabel = new u1Array( *(p->m_pSubject.get( )) );
 
             m_pSubject.reset( pLabel );
 
@@ -142,15 +141,20 @@ void Pkcs11ObjectKeyPublic::setAttribute( const CK_ATTRIBUTE& a_Attribute, const
     //    return;
     //}
 
-    if(objCreation == CK_FALSE){
+    if(!objCreation){
         switch(a_Attribute.type){
         case CKA_ENCRYPT:
         case CKA_TRUSTED:
         case CKA_VERIFY:
         case CKA_VERIFY_RECOVER:
         case CKA_WRAP:
-            if(*(CK_BBOOL*)a_Attribute.pValue == CK_TRUE){
-                throw PKCS11Exception( CKR_ATTRIBUTE_READ_ONLY );
+            if (a_Attribute.pValue)
+            {
+                if (a_Attribute.ulValueLen != sizeof(CK_BBOOL))
+                    throw PKCS11Exception( CKR_ATTRIBUTE_VALUE_INVALID );
+                if(*(CK_BBOOL*)a_Attribute.pValue == CK_TRUE){
+                    throw PKCS11Exception( CKR_ATTRIBUTE_READ_ONLY );
+                }
             }
             break;
         }

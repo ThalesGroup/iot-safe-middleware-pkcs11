@@ -36,8 +36,11 @@ The current SE hardware interfaces supported for this PKCS#11 provider implement
 git submodule init
 git submodule update
 ```
-
-
+# Build the modem library
+```
+cd se-access-lib\cinterion-modem\build
+make && make install
+```
 
 # Building and Installing
 

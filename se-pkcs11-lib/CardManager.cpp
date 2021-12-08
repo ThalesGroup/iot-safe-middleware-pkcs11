@@ -54,7 +54,7 @@ extern "C"
 // #define STR_PCSCTESTREADER_NAME 	"Gemalto Virtual Card Simulator Reader 0"
 // #define STR_PCSCTESTREADER_NAME 	"Gemalto MULTIFF SE Reader ISO 0"
 // #define STR_PCSCTESTREADER_NAME 	"Gemalto MULTIFF SE Reader SPI0 0"
-#define STR_CINTERION_MODEM_NAME "/dev/ttyUSB0"
+#define STR_CINTERION_MODEM_NAME "/dev/ttyACM0"
 #define CARD_ATR_TEST_T0			("\x3B\x7F\x96\x00\x00\x80\x31\x80\x65\xB0\x84\x41\x3D\xF6\x12\x0F\xFE\x82\x90\x00")
 #define CARD_ATR_TEST_LEN			20
 
@@ -243,12 +243,12 @@ void CardManager::exchangeData (u1Array &dataIn, u1Array &dataout, BOOL isSensit
 			// T = 1 -> Add LE to ISO Case 3
 			if ((dataIn.GetLength () == (5 + (u4)dataIn.GetBuffer ()[4])) && (dataIn.GetBuffer ()[4] != 0))
 			{
-				//dwLen++;
+				dwLen++;
 			}
 			// T = 1 -> Add LE to ISO Case 1
 			if (dataIn.GetLength () == 4)
 			{
-				//dwLen++;
+				dwLen++;
 			}
 		}
 
@@ -432,12 +432,12 @@ REPLAY:
 			// T = 1 -> Add LE to ISO Case 3
             if ((dataIn.GetLength () == (5 + (u4)dataIn.GetBuffer ()[4])) && (dataIn.GetBuffer ()[4] != 0))
             {
-                //dwLen++;
+                dwLen++;
             }
 			// T = 1 -> Add LE to ISO Case 1
 			if (dataIn.GetLength () == 4)
 			{
-				//dwLen++;
+				dwLen++;
 			}
 		}
 

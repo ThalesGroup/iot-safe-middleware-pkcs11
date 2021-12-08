@@ -47,9 +47,9 @@ SEACCESSLIB_SRCDIR=se-access-lib
 TESTP11LIB_SRCDIR=test
 
 #Make sure all files are Linux text files. can be comment once formated
-#find ${PKCS11LIB_SRCDIR} -type f -exec dos2unix {} \; 
-#find ${SEACCESSLIB_SRCDIR} -type f -exec dos2unix {} \;
-#find ${TESTP11LIB_SRCDIR} -type f -exec dos2unix {} \;
+find ${PKCS11LIB_SRCDIR} -type f -exec dos2unix {} \; 
+find ${SEACCESSLIB_SRCDIR} -type f -exec dos2unix {} \;
+find ${TESTP11LIB_SRCDIR} -type f -exec dos2unix {} \;
 
 # Build and install the PKCS#11 library
 printf "\n"
@@ -58,7 +58,7 @@ echo "----- Secure Element PKCS#11 library - Build -----"
 echo "=================================================="
 cd ${SCRIPTPATH}
 cd ${PKCS11LIB_SRCDIR}/build
-#make clean BUILDTYPE=${BUILDTYPE} #can be commented for faster build
+make clean BUILDTYPE=${BUILDTYPE} #can be commented for faster build
 make BUILDTYPE=${BUILDTYPE}
 if [ $? -ne 0 ]; then
     cd ${SAVEDPATH}

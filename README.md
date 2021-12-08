@@ -30,6 +30,19 @@ The current SE hardware interfaces supported for this PKCS#11 provider implement
 
   Suitable for mini / micro / nano SIM card.
 
+# Containers present in the IoT Applet
+
+| Containers ID |                                                              |
+| :-----------: | :----------------------------------------------------------- |
+|      01       | ECC (256r1) key pair for signature and verification          |
+|      02       | Client Certificate                                           |
+|      03       | Server Certificate                                           |
+|      04       | Ephemeral ecc (256r1) private key for Diffie-Hellman key exchange |
+|      05       | Ephemeral ecc (256r1) public key for Diffie-Hellman key exchange |
+|      06       | Secret Key (AES128 bits)                                     |
+
+
+
 # Prepare this repository
 
 ```
@@ -164,6 +177,7 @@ Below are the short descriptions of each configuration variables:
   PINs used for the PKCS#11 provider.
 
   This variable is ignored for now.
+  
 
 # Running Tests
 
@@ -195,7 +209,8 @@ The printed help usage of the test is as follow:
                                        Encrypt plain text data using a public key identified by id
                                        Decrypt the encrypted data using the private key to get the plain text data
                                        Example : -e:rsa:keyid of pubk -e:aes:keyid
-      -c                               Perform AES CMAC 128-bit signature.      -g                               Random generation 8 bytes.
+      -c                               Perform AES CMAC 128-bit signature.      
+      -g                               Random generation 8 bytes.
       -a:<nb tests>                    Perform nb iteration of all tests.
 
       -h                               Perform a Diffie-Hellman.
@@ -318,4 +333,5 @@ This PKCS#11 library could be integrated with other projects mentioned below:
 - https://github.com/OpenSC/libp11
 - https://www.gnutls.org/manual/html_node/PKCS11-Initialization.html
 - https://botan.randombit.net/handbook/api_ref/pkcs11.html
+- https://docs.microsoft.com/en-us/previous-versions/windows/hardware/design/dn631754(v=vs.85)?redirectedfrom=MSDN (MiniDriver Microsoft specifications)
 

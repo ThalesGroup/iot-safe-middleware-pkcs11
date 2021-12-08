@@ -46,7 +46,7 @@ PKCS11LIB_SRCDIR=se-pkcs11-lib
 SEACCESSLIB_SRCDIR=se-access-lib
 TESTP11LIB_SRCDIR=test
 
-#Make sure all files are Linux text files. can be comment once formated
+# Make sure all files are Linux text files. can be commented out once formated
 find ${PKCS11LIB_SRCDIR} -type f -exec dos2unix {} \; 
 find ${SEACCESSLIB_SRCDIR} -type f -exec dos2unix {} \;
 find ${TESTP11LIB_SRCDIR} -type f -exec dos2unix {} \;
@@ -58,7 +58,7 @@ echo "----- Secure Element PKCS#11 library - Build -----"
 echo "=================================================="
 cd ${SCRIPTPATH}
 cd ${PKCS11LIB_SRCDIR}/build
-make clean BUILDTYPE=${BUILDTYPE} #can be commented for faster build
+make clean BUILDTYPE=${BUILDTYPE} #Can be commented out for faster build
 make BUILDTYPE=${BUILDTYPE}
 if [ $? -ne 0 ]; then
     cd ${SAVEDPATH}

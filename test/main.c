@@ -1173,11 +1173,9 @@ int main (int argc, char *argv[])
         performAESCMACTest_InputLength64( l_pFunctions, l_hSession, 0 );
     }
 
-    //printf("Generate a KEY PAIR REMY, bnGenerateKeypair %d", nbgenerateKey);
-    // Geenerate a key/key pair
+    // Generate a key/key pair
     for (i = 0; i < nbgenerateKey; i++)
     {
-        printf("Generate a KEY PAIR REMY step 1");
         tolowercase (l_pKey[i].stID.pszAlgo);
         if (strstr ((const char *)l_pKey[i].stID.pszAlgo, "rsa") != NULL)
         {
@@ -1204,7 +1202,6 @@ int main (int argc, char *argv[])
         }
          else if (strstr ((const char *)l_pKey[i].stID.pszAlgo, "ecc") != NULL)
         {
-            //REMY ADDED ECC 
             printf ("Generating ECC key ...\n");
             l_ulErc = genECDSAKeyPair (l_pFunctions, l_hSession, (CK_CHAR_PTR)l_pKey[i].stID.pszID, (CK_ULONG)strlen ((char *)l_pKey[i].stID.pszID), l_pKey[i].size);
             if (l_ulErc != CKR_OK)
@@ -1259,7 +1256,7 @@ int main (int argc, char *argv[])
             }
             else if((strstr ((char *)l_pSign[i].stID.pszAlgo, "ecc") != NULL)) 
             {
-                printf ("\nSigning data using ECC private key REMY ...\n");
+                printf ("\nSigning data using ECC private key ...\n");
                 l_ulErc = signECDSA(l_pFunctions, l_hSession, (CK_CHAR_PTR)l_pSign[i].stID.pszID, (CK_ULONG)strlen ((char *)l_pSign[i].stID.pszID),
                                        (CK_BYTE_PTR)l_pSign[i].data, (CK_ULONG)strlen(l_pSign[i].data), (CK_BYTE_PTR)l_pbBuffer, (CK_ULONG_PTR)&l_ulBufferLen);
                 if (l_ulErc != CKR_OK)

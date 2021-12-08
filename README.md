@@ -33,9 +33,15 @@ The current SE hardware interfaces supported for this PKCS#11 provider implement
 # Prepare this repository
 
 ```
+git clone  --recurse-submodules https://github.com/ThalesGroup/iot-safe-middleware-pkcs11
+```
+or
+```
+git clone https://github.com/ThalesGroup/iot-safe-middleware-pkcs11
 git submodule init
 git submodule update
 ```
+
 # Build the modem library
 ```
 cd se-access-lib\cinterion-modem\build

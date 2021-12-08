@@ -1800,9 +1800,6 @@ typedef struct _CARD_DATA
 
     PFN_CSP_PAD_DATA                    pfnCspPadData;
 
-    SCARDCONTEXT                        hSCardCtx;
-    SCARDHANDLE                         hScard;
-
     // pointer to vendor specific information
 
     PVOID                               pvVendorSpecific;

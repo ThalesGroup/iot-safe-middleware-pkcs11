@@ -42,13 +42,13 @@ git submodule init
 git submodule update
 ```
 
-# Build the modem library
+# Build the modem library first
 ```
 cd se-access-lib\cinterion-modem\build
 make && make install
 ```
 
-# Building and Installing
+# Building and Installing the PKCS#11 library
 
 This PKCS#11 provider implementation will by default, communicate with a "/dev/ttyACM0" device.
 

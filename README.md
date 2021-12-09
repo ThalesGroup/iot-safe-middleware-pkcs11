@@ -322,6 +322,8 @@ Closing the session ... successful.
 ```
 ./pkcs11-test -p:1234 -i:0 -l:/usr/local/lib/libgtosepkcs11.so -c
 ```
+-l is optional
+
 ```
 Using slot ID : 0
 Using PIN : 0000
@@ -381,9 +383,6 @@ AES CMAC 128-bit signature ...
 Closing the session ... successful.
 
 ```
-
- -l is optional
-
 
 # Other Related Projects
 

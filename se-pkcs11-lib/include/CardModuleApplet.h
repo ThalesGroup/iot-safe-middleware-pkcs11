@@ -168,6 +168,7 @@ private:
     KeyInfo         m_keyInfoBuffer = {};
     FileInfo        m_fileInfoBuffer = {};
 
+    void        clearAuditStructure();
     void        auditCard(BOOL select);
     u1Array*    getObjectList(BOOL select);
     void        parseObjectList();

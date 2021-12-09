@@ -32,14 +32,14 @@ The current SE hardware interfaces supported for this PKCS#11 provider implement
 
 # Containers present in the IoT Applet (needed for tests)
 
-| Containers ID |                                                              |
-| :-----------: | :----------------------------------------------------------- |
-|      01       | ECC (256r1) key pair for signature and verification          |
-|      02       | Client Certificate                                           |
-|      03       | Server Certificate                                           |
-|      04       | Ephemeral ecc (256r1) private key for Diffie-Hellman key exchange |
-|      05       | Ephemeral ecc (256r1) public key for Diffie-Hellman key exchange |
-|      06       | Secret Key (AES128 bits)                                     |
+| Container ID | Description                                                  |
+| :----------: | :----------------------------------------------------------- |
+|      01      | ECC (256r1) key pair for signature and verification          |
+|      02      | Client Certificate                                           |
+|      03      | Server Certificate                                           |
+|      04      | Ephemeral ecc (256r1) private key for Diffie-Hellman key exchange |
+|      05      | Ephemeral ecc (256r1) public key for Diffie-Hellman key exchange |
+|      06      | Secret Key (AES128 bits)                                     |
 
 
 

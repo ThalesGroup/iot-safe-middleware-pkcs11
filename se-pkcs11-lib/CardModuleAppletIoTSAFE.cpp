@@ -2045,12 +2045,64 @@ u1Array* CardModuleApplet::getObjectList(BOOL select){
     return getDataOutput;
 }
 
+void CardModuleApplet::clearAuditStructure(){   
+    if(m_auditStructure.publicKeyCount > 0){
+        for(int i = 0; i < m_auditStructure.pubKeyInfo.size(); i++){
+            if(m_auditStructure.pubKeyInfo[i].label != nullptr)
+                free(m_auditStructure.pubKeyInfo[i].label);
+
+            if(m_auditStructure.pubKeyInfo[i].id != nullptr)
+                free(m_auditStructure.pubKeyInfo[i].id); 
+        }
+        m_auditStructure.pubKeyInfo.clear();
+        m_auditStructure.publicKeyCount = m_auditStructure.pubKeyInfo.size();
+    }
+    
+    if(m_auditStructure.privateKeyCount > 0){
+        for(int i = 0; i < m_auditStructure.priKeyInfo.size(); i++){
+            if(m_auditStructure.priKeyInfo[i].label != nullptr)
+                free(m_auditStructure.priKeyInfo[i].label);
+
+            if(m_auditStructure.priKeyInfo[i].id != nullptr)
+                free(m_auditStructure.priKeyInfo[i].id); 
+        }
+        m_auditStructure.priKeyInfo.clear();
+        m_auditStructure.privateKeyCount = m_auditStructure.priKeyInfo.size();
+    }
+
+    if(m_auditStructure.fileCount > 0){
+         for(int i = 0; i < m_auditStructure.fileInfo.size(); i++){
+            if(m_auditStructure.fileInfo[i].label != nullptr)
+                free(m_auditStructure.fileInfo[i].label);
+
+            if(m_auditStructure.fileInfo[i].id != nullptr)
+                free(m_auditStructure.fileInfo[i].id); 
+        }
+        m_auditStructure.fileInfo.clear();
+        m_auditStructure.fileCount = m_auditStructure.fileInfo.size();
+    }
+    if(m_auditStructure.secretKeyCount > 0){
+           for(int i = 0; i < m_auditStructure.secretKeyInfo.size(); i++){
+            if(m_auditStructure.secretKeyInfo[i].label != nullptr)
+                free(m_auditStructure.secretKeyInfo[i].label);
+
+            if(m_auditStructure.secretKeyInfo[i].id != nullptr)
+                free(m_auditStructure.secretKeyInfo[i].id); 
+        }
+        m_auditStructure.secretKeyInfo.clear();
+        m_auditStructure.secretKeyCount = m_auditStructure.secretKeyInfo.size();
+    }
+}
+
 void CardModuleApplet::parseObjectList(){
     uint8_t c1len = 0;
     uint8_t c2len = 0;
     uint8_t c3len = 0;
     uint8_t c4len = 0;
     bool found = false;
+
+    //clear old data
+    clearAuditStructure();
 
     for(int i = 0; i < m_objectlist->GetLength();)
     {

@@ -30,7 +30,7 @@ The current SE hardware interfaces supported for this PKCS#11 provider implement
 
   Suitable for mini / micro / nano SIM card.
 
-# Containers present in the IoT Applet
+# Containers present in the IoT Applet (needed for tests)
 
 | Containers ID |                                                              |
 | :-----------: | :----------------------------------------------------------- |
@@ -321,6 +321,65 @@ Closing the session ... successful.
 
 ```
 ./pkcs11-test -p:1234 -i:0 -l:/usr/local/lib/libgtosepkcs11.so -c
+```
+```
+Using slot ID : 0
+Using PIN : 0000
+
+Opening a new session ... successful.
+Login into the token using PIN '0000' ... successful.
+
+AES CMAC 128-bit signature ...
+        Input value : 256 bytes
+        0000  30 20 30 0C 06 08 2A 86-48 86 F7 0D 02 05 05 00  0 0...*.H.......
+        0010  04 10 30 20 30 0C 06 08-2A 86 48 86 30 20 30 0C  ..0 0...*.H.0 0.
+        0020  06 08 2A 86 48 86 F7 0D-02 05 05 00 04 10 30 20  ..*.H.........0
+        0030  30 0C 06 08 2A 86 48 86-30 20 30 0C 06 08 2A 86  0...*.H.0 0...*.
+        0040  48 86 F7 0D 02 05 05 00-04 10 30 20 30 0C 06 08  H.........0 0...
+        0050  2A 86 48 86 30 20 30 0C-06 08 2A 86 48 86 F7 0D  *.H.0 0...*.H...
+        0060  02 05 05 00 04 10 30 20-30 0C 06 08 2A 86 48 86  ......0 0...*.H.
+        0070  30 20 30 0C 06 08 2A 86-48 86 F7 0D 02 05 05 00  0 0...*.H.......
+        0080  04 10 30 20 30 0C 06 08-2A 86 48 86 30 20 30 0C  ..0 0...*.H.0 0.
+        0090  06 08 2A 86 48 86 F7 0D-02 05 05 00 04 10 30 20  ..*.H.........0
+        00A0  30 0C 06 08 2A 86 48 86-30 20 30 0C 06 08 2A 86  0...*.H.0 0...*.
+        00B0  48 86 F7 0D 02 05 05 00-04 10 30 20 30 0C 06 08  H.........0 0...
+        00C0  2A 86 48 86 30 20 30 0C-06 08 2A 86 48 86 F7 0D  *.H.0 0...*.H...
+        00D0  02 05 05 00 04 10 30 20-30 0C 06 08 2A 86 48 86  ......0 0...*.H.
+        00E0  30 20 30 0C 06 08 2A 86-48 86 F7 0D 02 05 30 20  0 0...*.H.....0
+        00F0  30 0C 06 08 2A 86 48 86-F7 0D 02 06 31 21 31 0D  0...*.H.....1!1.
+        Signature value : 16 bytes
+        0000  81 89 2D 40 30 97 70 70-81 0C 44 4D EF 88 70 A7  ..-@0.pp..DM..p.
+
+AES CMAC 128-bit signature ...
+        Input value : 0 bytes
+        Signature value : 16 bytes
+        0000  BB 1D 69 29 E9 59 37 28-7F A3 7D 12 9B 75 67 46  ..i).Y7(..}..ugF
+
+AES CMAC 128-bit signature ...
+        Input value : 16 bytes
+        0000  6B C1 BE E2 2E 40 9F 96-E9 3D 7E 11 73 93 17 2A  k....@...=~.s..*
+        Signature value : 16 bytes
+        0000  07 0A 16 B4 6B 4D 41 44-F7 9B DD 9D D0 4A 28 7C  ....kMAD.....J(|
+
+AES CMAC 128-bit signature ...
+        Input value : 40 bytes
+        0000  6B C1 BE E2 2E 40 9F 96-E9 3D 7E 11 73 93 17 2A  k....@...=~.s..*
+        0010  AE 2D 8A 57 1E 03 AC 9C-9E B7 6F AC 45 AF 8E 51  .-.W......o.E..Q
+        0020  30 C8 1C 46 A3 5C E4 11                          0..F.\..
+        Signature value : 16 bytes
+        0000  DF A6 67 47 DE 9A E6 30-30 CA 32 61 14 97 C8 27  ..gG...00.2a...'
+
+AES CMAC 128-bit signature ...
+        Input value : 64 bytes
+        0000  6B C1 BE E2 2E 40 9F 96-E9 3D 7E 11 73 93 17 2A  k....@...=~.s..*
+        0010  AE 2D 8A 57 1E 03 AC 9C-9E B7 6F AC 45 AF 8E 51  .-.W......o.E..Q
+        0020  30 C8 1C 46 A3 5C E4 11-E5 FB C1 19 1A 0A 52 EF  0..F.\........R.
+        0030  F6 9F 24 45 DF 4F 9B 17-AD 2B 41 7B E6 6C 37 10  ..$E.O...+A{.l7.
+        Signature value : 16 bytes
+        0000  51 F0 BE BF 7E 3B 9D 92-FC 49 74 17 79 36 3C FE  Q...~;...It.y6<.
+
+Closing the session ... successful.
+
 ```
 
  -l is optional

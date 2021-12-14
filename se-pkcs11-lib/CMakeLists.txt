@@ -3,12 +3,12 @@ find_package(Boost 1.67 REQUIRED COMPONENTS serialization system thread date_tim
 set(OPENSSL_USE_STATIC_LIBS TRUE)
 find_package(OpenSSL REQUIRED)
 
-add_library (gtosepkcs11 SHARED "algo_des.cpp" "algo_utils.cpp" "Application.cpp" "Array.cpp" "attrcert.cpp" "beroctet.cpp" 
-"Cache.cpp" "CardManager.cpp" "CardModuleAPI.cpp" "CardModuleAppletIoTSAFE.cpp" "cert_utils.cpp" "Configuration.cpp" 
-"cr_digit.cpp" "cr_nn.cpp" "cr_random.cpp" "cr_rsa.cpp" "DataShare.cpp" "des.cpp" "Device.cpp" "Digest.cpp" "EccUtils.cpp" 
-"filesystem.cpp" "gem_aes.cpp" "gem_des.cpp" "Log.cpp" "MiniDriverAuthentication.cpp" "MiniDriverCardCacheFile.cpp" 
+add_library (gtosepkcs11 SHARED "algo_des.cpp"   "Application.cpp" "Array.cpp" "attrcert.cpp" "beroctet.cpp" 
+"Cache.cpp" "CardManager.cpp" "CardModuleAPI.cpp" "CardModuleAppletIoTSAFE.cpp"   "Configuration.cpp" 
+"cr_digit.cpp" "cr_nn.cpp" "cr_random.cpp" "cr_rsa.cpp" "DataShare.cpp"   "Device.cpp" "Digest.cpp" "EccUtils.cpp" 
+"filesystem.cpp"     "Log.cpp" "MiniDriverAuthentication.cpp" "MiniDriverCardCacheFile.cpp" 
 "MiniDriverContainer.cpp" "MiniDriverContainerMapFile.cpp" "MiniDriver.cpp" "MiniDriverFiles.cpp" 
-"MiniDriverModuleService.cpp" "MiniDriverPinPolicy.cpp" "Module.cpp" "PinPolicy.cpp" "PKCS11.cpp" 
+"MiniDriverModuleService.cpp" "MiniDriverPinPolicy.cpp" "Module.cpp"   "PKCS11.cpp" 
 "Pkcs11ObjectCertificate.cpp" "Pkcs11ObjectCertificateX509PublicKey.cpp" "Pkcs11ObjectData.cpp" "Pkcs11ObjectKey.cpp" 
 "Pkcs11ObjectKeyGenericSecret.cpp" "Pkcs11ObjectKeyPrivate.cpp" "Pkcs11ObjectKeyPrivateECC.cpp" 
 "Pkcs11ObjectKeyPrivateRSA.cpp" "Pkcs11ObjectKeyPublic.cpp" "Pkcs11ObjectKeyPublicECC.cpp" "Pkcs11ObjectKeyPublicRSA.cpp" 

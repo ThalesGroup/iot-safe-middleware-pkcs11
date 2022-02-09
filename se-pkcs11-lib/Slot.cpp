@@ -1903,7 +1903,7 @@ void Slot::digest( const CK_SESSION_HANDLE& a_hSession, CK_BYTE_PTR a_pData, con
 
         if( a_pDigest ) {
             digest->hashFinal(a_pDigest);
-
+	    s->removeDigestKeyOp(); /* Needed to avoid double hash of data in SignUpdate function */
             s->removeDigest( );
         }
     }

@@ -55,6 +55,15 @@ git submodule init
 git submodule update
 ```
 
+# Install Dependency
+
+We need to install several dependency in order to build the PKCS#11 Library
+
+```
+sudo apt-get update
+sudo apt-get install libboost-dev libboost-serialization-dev libboost-system-dev liboost-date-time-dev libboost-thread-dev
+```
+
 # Build the modem library first
 ```
 cd se-access-lib\cinterion-modem\build

@@ -55,6 +55,15 @@ git submodule init
 git submodule update
 ```
 
+# Install Dependencies
+
+We need to install several dependencies in order to build the library
+```
+sudo apt-get update
+sudo apt-get install cmake build-essential
+sudo apt-get install libboost-dev libboost-serialization-dev libboost-system-dev libboost-date-time-dev libboost-thread-dev dos2unix libssl-dev zlib1g-dev
+```
+
 # Build the modem library first
 ```
 cd se-access-lib\cinterion-modem\build

@@ -1336,9 +1336,20 @@ u1Array* CardModuleApplet::PrivateKeySignECC(u1 ctrIndex, u1 keyType, u1 padding
             throw RemotingException("");
     }
 
+    //check leading 0x33
+    if (m_dataOut->GetBuffer()[0] != 0x33) {
+        throw RemotingException("");
+    }
+
     // Remove the Tag 0x33 Length 0x40 overhead from the signature.
-    u1Array *result = new u1Array(m_dataOut->GetLength() - 2);
-    result->SetBuffer(m_dataOut->GetBuffer() + 2);
+    u4 startIndex = 2;
+
+    //handle leading 0
+    if(m_dataOut->GetBuffer()[1] == 0x00){
+       startIndex = 3;
+    }
+    
+    u1Array *result = new u1Array(m_dataOut->GetBuffer() + startIndex,m_dataOut->GetLength() - startIndex);
 
     reset_buffers();
 

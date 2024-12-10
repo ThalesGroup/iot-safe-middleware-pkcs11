@@ -206,9 +206,8 @@ The printed help usage of the test is as follow:
       -R                               Remove all objects from the token.
       -r:<id>                          Remove object identified by id from
                                        the token.
-      -k:<algo:length:id>              Generate a new key pair public
-                                       private pair and aes key.
-                                       for example -k:rsa:1024 -k:aes:128.
+      -k:<algo:length:id>              Generate a new key pair 
+                                       for example -k:rsa:1024
       -s:<algo:id:data>                Signature with verification
                                        Sign data using a private key identified by id.
                                        Verify the sgnature using the related public key
@@ -216,8 +215,7 @@ The printed help usage of the test is as follow:
       -e:<algo:id:data>                Encryption / decryption
                                        Encrypt plain text data using a public key identified by id
                                        Decrypt the encrypted data using the private key to get the plain text data
-                                       Example : -e:rsa:keyid of pubk -e:aes:keyid
-      -c                               Perform AES CMAC 128-bit signature.      
+                                       Example : -e:rsa:keyid     
       -g                               Random generation 8 bytes.
       -a:<nb tests>                    Perform nb iteration of all tests.
 

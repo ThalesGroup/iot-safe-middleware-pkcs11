@@ -108,13 +108,14 @@ CK_MECHANISM_INFO g_mechanismInfoRsaEx[] = {
 };
 
 CK_MECHANISM_INFO g_mechanismInfoECC[] = {
+    {MiniDriver::s_iMinLengthKeyECC, MiniDriver::s_iMaxLengthKeyECC, CKF_HW | CKF_GENERATE_KEY_PAIR              | CKF_EC_F_P | CKF_EC_NAMEDCURVE | CKF_EC_UNCOMPRESS},
     {MiniDriver::s_iMinLengthKeyECC, MiniDriver::s_iMaxLengthKeyECC, CKF_HW | CKF_GENERATE_KEY_PAIR | CKF_EC_F_P | CKF_EC_NAMEDCURVE | CKF_EC_UNCOMPRESS},
-    {MiniDriver::s_iMinLengthKeyECC, MiniDriver::s_iMaxLengthKeyECC, CKF_HW | CKF_SIGN | CKF_VERIFY | CKF_EC_F_P | CKF_EC_NAMEDCURVE | CKF_EC_UNCOMPRESS},
-    {MiniDriver::s_iMinLengthKeyECC, MiniDriver::s_iMaxLengthKeyECC, CKF_HW | CKF_SIGN | CKF_VERIFY | CKF_EC_F_P | CKF_EC_NAMEDCURVE | CKF_EC_UNCOMPRESS},
-    {MiniDriver::s_iMinLengthKeyECC, MiniDriver::s_iMaxLengthKeyECC, CKF_HW | CKF_SIGN | CKF_VERIFY | CKF_EC_F_P | CKF_EC_NAMEDCURVE | CKF_EC_UNCOMPRESS},
-    {384, MiniDriver::s_iMaxLengthKeyECC, CKF_HW | CKF_SIGN | CKF_VERIFY | CKF_EC_F_P | CKF_EC_NAMEDCURVE | CKF_EC_UNCOMPRESS},
-    {521, MiniDriver::s_iMaxLengthKeyECC, CKF_HW | CKF_SIGN | CKF_VERIFY | CKF_EC_F_P | CKF_EC_NAMEDCURVE | CKF_EC_UNCOMPRESS},
-    {MiniDriver::s_iMinLengthKeyECC, MiniDriver::s_iMaxLengthKeyECC, CKF_HW | CKF_DERIVE | CKF_EC_F_P | CKF_EC_NAMEDCURVE | CKF_EC_UNCOMPRESS},
+    {MiniDriver::s_iMinLengthKeyECC, MiniDriver::s_iMaxLengthKeyECC, CKF_HW | CKF_SIGN | CKF_VERIFY              | CKF_EC_F_P | CKF_EC_NAMEDCURVE | CKF_EC_UNCOMPRESS},
+    {MiniDriver::s_iMinLengthKeyECC, MiniDriver::s_iMaxLengthKeyECC, CKF_HW | CKF_SIGN | CKF_VERIFY              | CKF_EC_F_P | CKF_EC_NAMEDCURVE | CKF_EC_UNCOMPRESS},
+    {MiniDriver::s_iMinLengthKeyECC, MiniDriver::s_iMaxLengthKeyECC, CKF_HW | CKF_SIGN | CKF_VERIFY              | CKF_EC_F_P | CKF_EC_NAMEDCURVE | CKF_EC_UNCOMPRESS},
+    {384, MiniDriver::s_iMaxLengthKeyECC,                            CKF_HW | CKF_SIGN | CKF_VERIFY              | CKF_EC_F_P | CKF_EC_NAMEDCURVE | CKF_EC_UNCOMPRESS},
+    {521, MiniDriver::s_iMaxLengthKeyECC,                            CKF_HW | CKF_SIGN | CKF_VERIFY              | CKF_EC_F_P | CKF_EC_NAMEDCURVE | CKF_EC_UNCOMPRESS},
+    {MiniDriver::s_iMinLengthKeyECC, MiniDriver::s_iMaxLengthKeyECC, CKF_HW | CKF_DERIVE                         | CKF_EC_F_P | CKF_EC_NAMEDCURVE | CKF_EC_UNCOMPRESS},
 };
 
 const int g_iLabelSize = 32;

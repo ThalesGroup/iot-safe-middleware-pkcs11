@@ -50,36 +50,6 @@ TESTP11LIB_SRCDIR=test
 find ${PKCS11LIB_SRCDIR} -type f -exec dos2unix {} \; 
 find ${SEACCESSLIB_SRCDIR} -type f -exec dos2unix {} \;
 find ${TESTP11LIB_SRCDIR} -type f -exec dos2unix {} \;
-
-# Build and install the PKCS#11 library
-printf "\n"
-echo "=================================================="
-echo "----- Secure Element PKCS#11 library - Build -----"
-echo "=================================================="
-cd ${SCRIPTPATH}
-cd ${PKCS11LIB_SRCDIR}/build
-make clean BUILDTYPE=${BUILDTYPE} #Can be commented out for faster build
-make BUILDTYPE=${BUILDTYPE}
-if [ $? -ne 0 ]; then
-    cd ${SAVEDPATH}
-    exit 1
-fi
-
-printf "\n"
-echo "========================================================="
-echo "----- Secure Element PKCS#11 library - Installation -----"
-echo "========================================================="
-make install BUILDTYPE=${BUILDTYPE}
-if [ $? -ne 0 ]; then
-    cd ${SAVEDPATH}
-    exit 1
-fi
-
-# Display the result
-echo "The PKCS#11 library for Secure Element is located :"
-ls -ld `find /usr/local/lib/libgtosepkcs11* -print`
-
-printf "\n"
 echo "========================================================"
 echo "----- Secure Element Access library - Build -----"
 echo "========================================================"
@@ -128,6 +98,36 @@ if [ $? -ne 0 ]; then
 fi
 
 printf "\n"
+# Build and install the PKCS#11 library
+printf "\n"
+echo "=================================================="
+echo "----- Secure Element PKCS#11 library - Build -----"
+echo "=================================================="
+cd ${SCRIPTPATH}
+cd ${PKCS11LIB_SRCDIR}/build
+make clean BUILDTYPE=${BUILDTYPE} #Can be commented out for faster build
+make BUILDTYPE=${BUILDTYPE}
+if [ $? -ne 0 ]; then
+    cd ${SAVEDPATH}
+    exit 1
+fi
+
+printf "\n"
+echo "========================================================="
+echo "----- Secure Element PKCS#11 library - Installation -----"
+echo "========================================================="
+make install BUILDTYPE=${BUILDTYPE}
+if [ $? -ne 0 ]; then
+    cd ${SAVEDPATH}
+    exit 1
+fi
+
+# Display the result
+echo "The PKCS#11 library for Secure Element is located :"
+ls -ld `find /usr/local/lib/libgtosepkcs11* -print`
+
+printf "\n"
+
 
 echo "========================================================"
 echo "----- Secure Element PKCS#11 library tests - Build -----"

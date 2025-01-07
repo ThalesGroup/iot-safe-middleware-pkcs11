@@ -38,8 +38,6 @@ else
 	BUILDMODE := Release
 endif
 
-CC := gcc
-
 TARGETNAME := pkcs11-test
 BUILDDIR   := $(PROJECT_DIR)/binaries/$(BUILDMODE)/$(TARGETNAME)
 TARGET     := $(BUILDDIR)/$(TARGETNAME)

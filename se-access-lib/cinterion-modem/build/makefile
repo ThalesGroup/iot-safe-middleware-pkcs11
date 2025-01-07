@@ -58,8 +58,6 @@ INSTALL_PREFIX := /usr/local
 #     - Log files management
 # NOFILESYSTEM := true
 
-CC  := gcc
-CXX := g++
 
 BUILDDIR := $(PROJECT_DIR)/binaries/$(BUILDMODE)/$(LIBRARY_NAME)
 TARGET   := $(BUILDDIR)/$(TARGET_NAME)

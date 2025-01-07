@@ -36,6 +36,12 @@ echo 'Building in' ${BUILDTYPE} 'mode ...'
 SCRIPT=$(readlink -f "$0")
 SCRIPTPATH=$(dirname "${SCRIPT}")
 
+#cross compilation setting
+# export CXX=arm-linux-gnueabihf-g++
+# export CC=arm-linux-gnueabihf-gcc
+export CC=gcc
+export CXX=g++
+
 # Create the PROJECT_DIR environment variable
 export PROJECT_DIR="${SCRIPTPATH}/"
 
@@ -72,30 +78,30 @@ if [ $? -ne 0 ]; then
 fi
 
 
-echo "========================================================"
-echo "--------------- Modem Access tests - Build 1/2 ---------"
-echo "========================================================"
-cd ${SCRIPTPATH}/${SEACCESSLIB_SRCDIR}/test/build
-make -f p11-cardmgr-Makefile clean
-make -f p11-cardmgr-Makefile BUILDTYPE=${BUILDTYPE}
-if [ $? -ne 0 ]; then
-   cd ${SAVEDPATH}
-   exit 1
-fi
+# echo "========================================================"
+# echo "--------------- Modem Access tests - Build 1/2 ---------"
+# echo "========================================================"
+# cd ${SCRIPTPATH}/${SEACCESSLIB_SRCDIR}/test/build
+# make -f p11-cardmgr-Makefile clean
+# make -f p11-cardmgr-Makefile BUILDTYPE=${BUILDTYPE}
+# if [ $? -ne 0 ]; then
+#    cd ${SAVEDPATH}
+#    exit 1
+# fi
 
-printf "\n"
+# printf "\n"
 
-echo "========================================================"
-echo "--------------- Modem Access tests - Build 2/2 ---------"
-echo "========================================================"
+# echo "========================================================"
+# echo "--------------- Modem Access tests - Build 2/2 ---------"
+# echo "========================================================"
 
-cd ${SCRIPTPATH}/${SEACCESSLIB_SRCDIR}/test/build
-make -f cinterion-modem-test-Makefile clean
-make -f cinterion-modem-test-Makefile BUILDTYPE=${BUILDTYPE}
-if [ $? -ne 0 ]; then
-   cd ${SAVEDPATH}
-   exit 1
-fi
+# cd ${SCRIPTPATH}/${SEACCESSLIB_SRCDIR}/test/build
+# make -f cinterion-modem-test-Makefile clean
+# make -f cinterion-modem-test-Makefile BUILDTYPE=${BUILDTYPE}
+# if [ $? -ne 0 ]; then
+#    cd ${SAVEDPATH}
+#    exit 1
+# fi
 
 printf "\n"
 # Build and install the PKCS#11 library

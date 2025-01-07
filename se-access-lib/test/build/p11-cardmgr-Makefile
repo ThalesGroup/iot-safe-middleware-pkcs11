@@ -35,7 +35,7 @@ else
    BUILDMODE := Release
 endif
 
-CC := g++
+
 
 TARGETNAME := p11-cardmgr-access-test
 BUILDDIR := $(PROJECT_DIR)/binaries/$(BUILDMODE)/$(TARGETNAME)
@@ -62,7 +62,7 @@ CFLAGS += -std=c++11
 
 $(TARGET): $(OBJECTS)
 	@echo "   Build mode : $(BUILDMODE) - Building target $@ ..."
-	@echo "   $(CC) $^ -o $(TARGET) $(LIB)"; $(CC) $^ -o $@ $(LIB)
+	@echo "   $(CXX) $^ -o $(TARGET) $(LIB)"; $(CXX) $^ -o $@ $(LIB)
 
 $(BUILDDIR)/%.o : %.cpp
 #	@echo "   VPATH = $(VPATH)"
@@ -70,8 +70,8 @@ $(BUILDDIR)/%.o : %.cpp
 #	@echo "   OBJECTS = $(OBJECTS)"
 	@echo "   Build mode : $(BUILDMODE) - Compiling $< ..."
 	@mkdir -p $(BUILDDIR)
-	@echo "   $(CC) $(CFLAGS) $(INC) -c -o $@ $<"
-	$(CC) $(CFLAGS) $(INC) -c -o $@ "$<"
+	@echo "   $(CXX) $(CFLAGS) $(INC) -c -o $@ $<"
+	$(CXX) $(CFLAGS) $(INC) -c -o $@ "$<"
 
 clean:
 	@echo "   Cleaning $(BUILDDIR) directory ..." 

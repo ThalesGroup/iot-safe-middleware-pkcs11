@@ -35,7 +35,6 @@ else
    BUILDMODE := Release
 endif
 
-CC := g++
 
 TARGETNAME := cinterion-modem-access-test
 BUILDDIR := $(PROJECT_DIR)/binaries/$(BUILDMODE)/$(TARGETNAME)
@@ -54,14 +53,14 @@ endif
 
 $(TARGET): $(OBJECTS)
 	@echo "   Build mode : $(BUILDMODE) - Building target $@ ..."
-	@echo "   $(CC) $^ -o $(TARGET) $(LIB)"
-	$(CC) $^ -o $(TARGET) $(LIB)
+	@echo "   $(CXX) $^ -o $(TARGET) $(LIB)"
+	$(CXX) $^ -o $(TARGET) $(LIB)
 
 $(OBJECTS): $(SOURCES)
 	@echo "   Build mode : $(BUILDMODE) - Compiling $< ..."
 	@mkdir -p $(BUILDDIR)
-	@echo "   $(CC) $(CFLAGS) $(INC) -c -o $@ $<"
-	$(CC) $(CFLAGS) $(INC) -c -o $@ $<
+	@echo "   $(CXX) $(CFLAGS) $(INC) -c -o $@ $<"
+	$(CXX) $(CFLAGS) $(INC) -c -o $@ $<
 
 clean:
 	@echo "   Cleaning $(BUILDDIR) directory ..." 

@@ -3,3 +3,5 @@ temp
 *.img
 *.iso
 *squashfs*
+binaries/*
+build/*

@@ -25,6 +25,18 @@ SSL_CTX *create_context() {
     return ctx;
 }
 
+void configure_context(SSL_CTX *ctx) {
+    // Load and trust the CA certificate for server verification
+    SSL_CTX_load_verify_locations(ctx, "../cert/ca-cert.pem", NULL);
+
+    // Load client certificate & key
+    if (SSL_CTX_use_certificate_file(ctx, "../cert/client-cert.pem", SSL_FILETYPE_PEM) <= 0 ||
+        SSL_CTX_use_PrivateKey_file(ctx, "../cert/client-key.pem", SSL_FILETYPE_PEM) <= 0) {
+        ERR_print_errors_fp(stderr);
+        exit(EXIT_FAILURE);
+    }
+}
+
 int main() {
     int sockfd;
     struct sockaddr_in addr;
@@ -32,6 +44,7 @@ int main() {
     
     init_openssl();
     SSL_CTX *ctx = create_context();
+    configure_context(ctx);
     SSL *ssl = SSL_new(ctx);
 
     sockfd = socket(AF_INET, SOCK_STREAM, 0);
@@ -48,7 +61,7 @@ int main() {
     if (SSL_connect(ssl) <= 0) {
         ERR_print_errors_fp(stderr);
     } else {
-        printf("Connected to server via TLS\n");
+        printf("Connected and verified the server\n");
         SSL_write(ssl, buffer, strlen(buffer));
         SSL_read(ssl, buffer, sizeof(buffer));
         printf("Received: %s\n", buffer);

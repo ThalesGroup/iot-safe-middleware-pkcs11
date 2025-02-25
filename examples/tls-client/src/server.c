@@ -25,11 +25,16 @@ SSL_CTX *create_context() {
 }
 
 void configure_context(SSL_CTX *ctx) {
-    if (SSL_CTX_use_certificate_file(ctx, "cert.pem", SSL_FILETYPE_PEM) <= 0 ||
-        SSL_CTX_use_PrivateKey_file(ctx, "key.pem", SSL_FILETYPE_PEM) <= 0) {
+    // Load server certificate & key
+    if (SSL_CTX_use_certificate_file(ctx, "../cert/server-cert.pem", SSL_FILETYPE_PEM) <= 0 ||
+        SSL_CTX_use_PrivateKey_file(ctx, "../cert/server-key.pem", SSL_FILETYPE_PEM) <= 0) {
         ERR_print_errors_fp(stderr);
         exit(EXIT_FAILURE);
     }
+
+    // Load and trust the CA certificate for client verification
+    SSL_CTX_load_verify_locations(ctx, "../cert/ca-cert.pem", NULL);
+    SSL_CTX_set_verify(ctx, SSL_VERIFY_PEER | SSL_VERIFY_FAIL_IF_NO_PEER_CERT, NULL);
 }
 
 int main() {
@@ -59,10 +64,10 @@ int main() {
         if (SSL_accept(ssl) <= 0) {
             ERR_print_errors_fp(stderr);
         } else {
-            printf("Client connected via TLS\n");
+            printf("Client connected and verified\n");
             SSL_read(ssl, buffer, sizeof(buffer));
             printf("Received: %s\n", buffer);
-            SSL_write(ssl, "Hello, TLS Client!", 19);
+            SSL_write(ssl, "Hello, Verified TLS Client!", 28);
         }
 
         SSL_shutdown(ssl);

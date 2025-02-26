@@ -5,7 +5,7 @@
 #include <arpa/inet.h>
 #include <openssl/ssl.h>
 #include <openssl/err.h>
-
+#include <openssl/engine.h>
 #define SERVER_IP "127.0.0.1"
 #define PORT 4443
 
@@ -26,17 +26,83 @@ SSL_CTX *create_context() {
 }
 
 void configure_context(SSL_CTX *ctx) {
-    // Load and trust the CA certificate for server verification
-    SSL_CTX_load_verify_locations(ctx, "ca-cert.pem", NULL);
+    ENGINE *engine;
+    const char *engine_id = "pkcs11";
+    const char *pkcs11_key_id = "pkcs11:id=01;type=private";
+    const char *pkcs11_cert_id = "pkcs11:id=01;type=cert";
+    const char *pin = "0000";
 
-    // Load client certificate & key
-    if (SSL_CTX_use_certificate_file(ctx, "client-cert.pem", SSL_FILETYPE_PEM) <= 0 ||
-        SSL_CTX_use_PrivateKey_file(ctx, "client-key.pem", SSL_FILETYPE_PEM) <= 0) {
+    // Load the PKCS#11 engine
+    ENGINE_load_dynamic();
+    engine = ENGINE_by_id(engine_id);
+    if (!engine) {
+        fprintf(stderr, "Failed to load PKCS#11 engine\n");
         ERR_print_errors_fp(stderr);
         exit(EXIT_FAILURE);
     }
 
-    SSL_CTX_set_verify(ctx,SSL_VERIFY_PEER,NULL);
+    // Initialize the engine
+    if (!ENGINE_init(engine)) {
+        fprintf(stderr, "Failed to initialize PKCS#11 engine\n");
+        ERR_print_errors_fp(stderr);
+        ENGINE_free(engine);
+        exit(EXIT_FAILURE);
+    }
+
+    // Set the engine as the default for all cryptographic operations
+    if (!ENGINE_set_default(engine, ENGINE_METHOD_ALL)) {
+        fprintf(stderr, "Failed to set PKCS#11 engine as default\n");
+        ERR_print_errors_fp(stderr);
+        ENGINE_free(engine);
+        exit(EXIT_FAILURE);
+    }
+
+    ENGINE_ctrl_cmd(engine,"PIN",0,pin,NULL,0);
+
+    // Load and trust the CA certificate for server verification
+    if (SSL_CTX_load_verify_locations(ctx, "ca-cert.pem", NULL) <= 0) {
+        ERR_print_errors_fp(stderr);
+        exit(EXIT_FAILURE);
+    }
+
+    if (SSL_CTX_use_certificate_file(ctx, "client-cert.pem", SSL_FILETYPE_PEM) <= 0 ) {
+        ERR_print_errors_fp(stderr);
+        exit(EXIT_FAILURE);
+    }
+    
+    // Load private key from PKCS#11
+    EVP_PKEY *pkey = ENGINE_load_private_key(engine, pkcs11_key_id, NULL, NULL);
+    if (!pkey) {
+        fprintf(stderr, "Failed to load private key from PKCS#11\n");
+        ERR_print_errors_fp(stderr);
+        ENGINE_free(engine);
+        exit(EXIT_FAILURE);
+    }
+
+    if (SSL_CTX_use_PrivateKey(ctx, pkey) <= 0) {
+        fprintf(stderr, "Failed to use the private key\n");
+        ERR_print_errors_fp(stderr);
+        EVP_PKEY_free(pkey);
+        ENGINE_free(engine);
+        exit(EXIT_FAILURE);
+    }
+
+   
+    
+
+
+
+    // Verify that the private key matches the certificate
+    if (!SSL_CTX_check_private_key(ctx)) {
+        fprintf(stderr, "Private key does not match the certificate public key\n");
+        exit(EXIT_FAILURE);
+    }
+
+    // Enforce server certificate verification
+    SSL_CTX_set_verify(ctx, SSL_VERIFY_PEER, NULL);
+
+    // Free the engine
+    ENGINE_free(engine);
 }
 
 int main() {

@@ -26,14 +26,14 @@ SSL_CTX *create_context() {
 
 void configure_context(SSL_CTX *ctx) {
     // Load server certificate & key
-    if (SSL_CTX_use_certificate_file(ctx, "../cert/server-cert.pem", SSL_FILETYPE_PEM) <= 0 ||
-        SSL_CTX_use_PrivateKey_file(ctx, "../cert/server-key.pem", SSL_FILETYPE_PEM) <= 0) {
+    if (SSL_CTX_use_certificate_file(ctx, "server-cert.pem", SSL_FILETYPE_PEM) <= 0 ||
+        SSL_CTX_use_PrivateKey_file(ctx, "server-key.pem", SSL_FILETYPE_PEM) <= 0) {
         ERR_print_errors_fp(stderr);
         exit(EXIT_FAILURE);
     }
 
     // Load and trust the CA certificate for client verification
-    SSL_CTX_load_verify_locations(ctx, "../cert/ca-cert.pem", NULL);
+    SSL_CTX_load_verify_locations(ctx, "ca-cert.pem", NULL);
     SSL_CTX_set_verify(ctx, SSL_VERIFY_PEER | SSL_VERIFY_FAIL_IF_NO_PEER_CERT, NULL);
 }
 

@@ -27,14 +27,16 @@ SSL_CTX *create_context() {
 
 void configure_context(SSL_CTX *ctx) {
     // Load and trust the CA certificate for server verification
-    SSL_CTX_load_verify_locations(ctx, "../cert/ca-cert.pem", NULL);
+    SSL_CTX_load_verify_locations(ctx, "ca-cert.pem", NULL);
 
     // Load client certificate & key
-    if (SSL_CTX_use_certificate_file(ctx, "../cert/client-cert.pem", SSL_FILETYPE_PEM) <= 0 ||
-        SSL_CTX_use_PrivateKey_file(ctx, "../cert/client-key.pem", SSL_FILETYPE_PEM) <= 0) {
+    if (SSL_CTX_use_certificate_file(ctx, "client-cert.pem", SSL_FILETYPE_PEM) <= 0 ||
+        SSL_CTX_use_PrivateKey_file(ctx, "client-key.pem", SSL_FILETYPE_PEM) <= 0) {
         ERR_print_errors_fp(stderr);
         exit(EXIT_FAILURE);
     }
+
+    SSL_CTX_set_verify(ctx,SSL_VERIFY_PEER,NULL);
 }
 
 int main() {

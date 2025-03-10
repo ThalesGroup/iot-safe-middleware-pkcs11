@@ -14,7 +14,7 @@ ENGINE *engine;
 const char *engine_id = "pkcs11";
 const char *pkcs11_key_id = "pkcs11:id=01;type=private";
 const char client_cert_id[CERT_ID_LEN] = {0x77, 0x2C, 0xBC, 0xA7, 0xB8, 0xD7, 0x7C, 0x7D, 0xF5, 0x7F, 0xA7, 0xE3, 0x90, 0x2F, 0x73, 0x10, 0x71, 0x4C, 0x6F, 0x36};
-const char ca_cert_id[CERT_ID_LEN] = {0xED, 0xD7, 0xA9, 0x78, 0x41, 0xB5, 0x24, 0xC1, 0xD6, 0x54, 0xC0, 0x8C, 0xED, 0x2D, 0xF9, 0x5C, 0xAD, 0xCF, 0xFF, 0x39};
+const char ca_cert_id[CERT_ID_LEN] = {0xe4,0x02,0xcc,0x57,0x74,0x6e,0x99,0x61,0x36,0x4f,0xcb,0x09,0xf9,0xa1,0x32,0x1b,0x8a,0x24,0x02,0xd7};
 const char *pin = "0000";
 
 void init_openssl()
@@ -72,27 +72,36 @@ void configure_context(SSL_CTX *ctx)
     // enable log
     // ENGINE_ctrl_cmd(engine, "VERBOSE", 0, NULL, NULL, 0);
 
-    // Load and trust the CA certificate for server verification
-    if (SSL_CTX_load_verify_locations(ctx, "ca-cert.pem", NULL) <= 0)
-    {
-        ERR_print_errors_fp(stderr);
-        exit(EXIT_FAILURE);
-    }
-
-    // retrieve client certificate
     char pkcs11_cert_id[40] = "pkcs11:id=00000000000000000000;type=cert";
-    for (int i = 0; i < CERT_ID_LEN; i++)
-    {
-        pkcs11_cert_id[i + 10] = client_cert_id[i];
-    }
+
+    // Load and trust the CA certificate from IOT Safe applet for server verification
+    memcpy(&pkcs11_cert_id[10],ca_cert_id,CERT_ID_LEN);
     struct
     {
         const char *s_slot_cert_id;
         X509 *cert;
-    } p = {pkcs11_cert_id, NULL};
+    } pCA = {pkcs11_cert_id, NULL};
+    ENGINE_ctrl_cmd(engine, "LOAD_CERT_CTRL", 0, &pCA, NULL, 0);
+    X509_STORE * CA_store = SSL_CTX_get_cert_store(ctx);
+    if (!CA_store) {
+        fprintf(stderr, "Failed to get X509_STORE\n");
+        return;
+    }
+    // Add the CA certificate to the store
+    if (!X509_STORE_add_cert(CA_store, pCA.cert)) {
+        fprintf(stderr, "Failed to add CA certificate to store\n");
+        return;
+    }
 
-    ENGINE_ctrl_cmd(engine, "LOAD_CERT_CTRL", 0, &p, NULL, 0);
-    if (SSL_CTX_use_certificate(ctx, p.cert) <= 0)
+    //Load client certificate from IOT Safe applet
+    memcpy(&pkcs11_cert_id[10],client_cert_id,CERT_ID_LEN);
+    struct
+    {
+        const char *s_slot_cert_id;
+        X509 *cert;
+    } pClient = {pkcs11_cert_id, NULL};
+    ENGINE_ctrl_cmd(engine, "LOAD_CERT_CTRL", 0, &pClient, NULL, 0);
+    if (SSL_CTX_use_certificate(ctx, pClient.cert) <= 0)
     {
         ERR_print_errors_fp(stderr);
         exit(EXIT_FAILURE);

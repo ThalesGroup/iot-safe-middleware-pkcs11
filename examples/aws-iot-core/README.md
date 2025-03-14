@@ -3,7 +3,18 @@
 This example demonstrates How to use IoT Safe PKCS11 middleware to connect to AWS IOT Core. There are two example, one is written in 
 1. [pkcs11_pubsub.py](python/pkcs11_pubsub.py), python application written based on two example application in [aws-iot-device-sdk-python-v2](https://github.com/aws/aws-iot-device-sdk-python-v2) version [9518299](https://github.com/aws/aws-iot-device-sdk-python-v2/commit/9518299b90b5979bae2140ed69123c809fdd1609), which are [pubsub.py](https://github.com/aws/aws-iot-device-sdk-python-v2/blob/main/samples/pubsub.py) and [pkcs11_connect.py](https://github.com/aws/aws-iot-device-sdk-python-v2/blob/main/samples/pkcs11_connect.py).
 
-2. [pkcs11_pubsub.cpp](cpp/pkcs11_pubsub.cpp)
+## Certificate Registration
+
+There are multiple way to register the client certificate in AWS IoT Core, in this example, we will focus on manual provisioning of the certificate
+
+You need to register the IoT Safe public key in AWS IoT Core before running this example. Please follow the steps below
+
+1. Generate CSR based on IoT Safe Public key with below command  
+```
+openssl req -new -engine pkcs11 -keyform engine -key "pkcs11:id=%30%31" -out $(BUILDDIR)/client-csr.pem -subj "/C=US/ST=State/L=City/O=Client" 
+```
+2. Create new certificate in AWS IoT Core and associate the certificate with the policy and the things
+
 
 ## pkcs11_pubsub.py
 ### Dependencies

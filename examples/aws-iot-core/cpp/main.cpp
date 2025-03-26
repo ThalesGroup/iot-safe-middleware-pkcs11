@@ -6,14 +6,96 @@
 #include <aws/crt/UUID.h>
 #include <aws/crt/io/Pkcs11.h>
 #include <aws/crt/UUID.h>
-
+#include <libp11.h>
 #include "utils/CommandLineUtils.h"
-
+#include <openssl/x509.h>
+#include <openssl/pem.h>
+#include <openssl/evp.h>
+#include <openssl/bio.h>
 #include <algorithm>
 #include <chrono>
 #include <mutex>
 #include <thread>
 using namespace Aws::Crt;
+
+
+
+Aws::Crt::ByteCursor getCertificate(const String &pkcs11LibPath, const String &pkcs11TokenLabel, const String &pin, const String &id){
+    PKCS11_CTX *ctx;
+	PKCS11_SLOT *slots=NULL, *slot;
+    PKCS11_CERT *certs;
+    unsigned int nslots,ncerts;
+    int certIdx  = -1;
+    int rc = 0;
+
+    //initialize the module
+    ctx = PKCS11_CTX_new();
+    rc = PKCS11_CTX_load(ctx, (const char *)pkcs11LibPath.data());
+    if (rc < 0)
+    {
+        fprintf(stderr, "loading pkcs11 engine failed");
+        exit(-1);
+    }
+
+    //enumerate all the slot
+    rc = PKCS11_enumerate_slots(ctx, &slots, &nslots);
+    //find the slot with label
+    for(unsigned int i = 0;i<nslots;i++){
+        if(pkcs11TokenLabel.compare(slots[i].token->label) == 0){
+            slot = &slots[i];
+            break;
+        }
+    }
+    if (slot == NULL)
+    {
+        fprintf(stderr, "slot not found");
+        exit(-1);
+    }
+
+    //enumerate the certificates
+    rc = PKCS11_enumerate_certs(slot->token,&certs,&ncerts);
+    //find the certificate
+    for (unsigned int i = 0; i < ncerts; i++){
+        rc = id.compare((const char*) certs[i].id);
+        if(rc == 0){
+            certIdx = i;
+        }
+    }
+        
+    //unload the pkcs11 module
+    PKCS11_CTX_unload(ctx);
+	PKCS11_CTX_free(ctx);
+
+    //certificate is found, prepare to PER format
+    if(certIdx > -1 ){
+        // Write certificate in PEM format to a BIO (memory buffer)
+        BIO* bio = BIO_new(BIO_s_mem());
+        if (bio == nullptr) {
+            return  ByteCursor();
+        }
+
+        // Write the X509 certificate to the BIO in PEM format
+        if (PEM_write_bio_X509(bio, certs[certIdx].x509) == 0) {
+            BIO_free(bio);
+            return  ByteCursor();
+        }
+
+        // Get the length of the PEM data in memory
+        size_t pemLen = BIO_pending(bio);
+
+        // Allocate memory for the PEM data
+        unsigned char* pemData = new unsigned char[pemLen + 1];
+        BIO_read(bio, pemData, pemLen);
+        pemData[pemLen] = '\0';  // Null-terminate the string
+
+        return ByteCursorFromArray((const uint8_t*) pemData, pemLen);
+
+    }   
+    else{
+        return ByteCursor();
+    }
+   
+}
 
 int main(int argc, char *argv[])
 {
@@ -36,23 +118,29 @@ int main(int argc, char *argv[])
     cmdData.input_pkcs11SlotId = 0;
     cmdData.input_endpoint = "";
     cmdData.input_clientId = "basicPubSub";
-    cmdData.input_ca = "";
-    cmdData.input_cert = "";
+    cmdData.input_ca = "03";
+    cmdData.input_cert = "02";
     cmdData.input_message = "Hello World from IOT Safe";
     cmdData.input_topic = "";
+    
 
     String messagePayload = "\"" + cmdData.input_message + "\"";
 
+    //retrieve client and ca cert from PKCS11 module
+    Aws::Crt::ByteCursor client_cert =  getCertificate(cmdData.input_pkcs11LibPath,cmdData.input_pkcs11TokenLabel,cmdData.input_pkcs11UserPin,cmdData.input_cert);
+    Aws::Crt::ByteCursor ca_cert =  getCertificate(cmdData.input_pkcs11LibPath,cmdData.input_pkcs11TokenLabel,cmdData.input_pkcs11UserPin,cmdData.input_ca);
+    Aws::Crt::String client_cert_content((const char*)client_cert.ptr);
+
     // Create the MQTT builder and populate it with data from cmdData.
-    
     std::shared_ptr<Aws::Crt::Io::Pkcs11Lib> pkcs11Lib = Aws::Crt::Io::Pkcs11Lib::Create(cmdData.input_pkcs11LibPath);
     if (!pkcs11Lib)
     {
         fprintf(stderr, "Pkcs11Lib failed: %s\n", Aws::Crt::ErrorDebugString(Aws::Crt::LastError()));
         exit(-1);
     }
+
     Aws::Crt::Io::TlsContextPkcs11Options pkcs11Options(pkcs11Lib);
-    pkcs11Options.SetCertificateFilePath(cmdData.input_cert);
+    pkcs11Options.SetCertificateFileContents(client_cert_content);
     pkcs11Options.SetUserPin(cmdData.input_pkcs11UserPin);
     if (cmdData.input_pkcs11TokenLabel != "")
     {
@@ -77,9 +165,9 @@ int main(int argc, char *argv[])
         exit(-1);
     }
     clientConfigBuilder.WithEndpoint(cmdData.input_endpoint);
-    if (cmdData.input_ca != "")
+    if (ca_cert.len > 0)
     {
-        clientConfigBuilder.WithCertificateAuthority(cmdData.input_ca.c_str());
+        clientConfigBuilder.WithCertificateAuthority(ca_cert);
     }
     
 

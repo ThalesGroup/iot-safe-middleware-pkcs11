@@ -35,4 +35,7 @@ include(AwsSanitizers)
 enable_language(C)
 aws_add_sanitizers(${PROJECT_NAME})
 
-target_link_libraries(${PROJECT_NAME} PRIVATE AWS::aws-crt-cpp)
+find_package(PkgConfig REQUIRED)
+pkg_check_modules(LIBP11 REQUIRED libp11)
+
+target_link_libraries(${PROJECT_NAME}  PRIVATE  ${LIBP11_LIBRARIES} AWS::aws-crt-cpp)

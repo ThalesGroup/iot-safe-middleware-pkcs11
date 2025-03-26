@@ -122,7 +122,7 @@ int main(int argc, char *argv[])
     cmdData.input_cert = "02";
     cmdData.input_message = "Hello World from IOT Safe";
     cmdData.input_topic = "iottopic-ite-d-ue1-innolab-topic1";
-    
+    cmdData.input_count = 10;
 
     String messagePayload = "\"" + cmdData.input_message + "\"";
 

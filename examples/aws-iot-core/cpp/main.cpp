@@ -116,12 +116,12 @@ int main(int argc, char *argv[])
     cmdData.input_pkcs11TokenLabel = "Card #0000000000000000";
     cmdData.input_pkcs11KeyLabel = "0B";
     cmdData.input_pkcs11SlotId = 0;
-    cmdData.input_endpoint = "a3kz826qo9h89i-ats.iot.eu-west-1.amazonaws.com";
+    cmdData.input_endpoint = "";
     cmdData.input_clientId = "basicPubSub";
     cmdData.input_ca = "03";
     cmdData.input_cert = "02";
     cmdData.input_message = "Hello World from IOT Safe";
-    cmdData.input_topic = "iottopic-ite-d-ue1-innolab-topic1";
+    cmdData.input_topic = "";
     cmdData.input_count = 10;
 
     String messagePayload = "\"" + cmdData.input_message + "\"";

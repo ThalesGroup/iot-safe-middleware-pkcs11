@@ -5,7 +5,9 @@ This example demonstrates How to use IoT Safe PKCS11 middleware to connect to AW
 
 ## Certificate Registration
 
-There are multiple way to register the client certificate in AWS IoT Core, in this example, we will focus on manual provisioning of the certificate
+There are multiple way to register the client certificate in AWS IoT Core. Thales IoT Safe Security Server provide a secure way of provisioning the IoT Safe applet based on GSMA IoT Safe specification 
+
+In this example, we will focus on manual provisioning of the certificate
 
 You need to register the IoT Safe public key in AWS IoT Core before running this example. Please follow the steps below
 
@@ -16,7 +18,8 @@ openssl req -new -engine pkcs11 -keyform engine -key "pkcs11:id=%30%31" -out $(B
 2. Create new certificate in AWS IoT Core and associate the certificate with the policy and the things
 
 
-## pkcs11_pubsub.py
+## Python Example
+This example is modified version of [pkcs11_connect.py](https://github.com/aws/aws-iot-device-sdk-python-v2/blob/main/samples/pkcs11_connect.py) that uses [aws-iot-device-sdk-python-v2](https://github.com/aws/aws-iot-device-sdk-python-v2) library
 ### Dependencies
 To run this example, you need Python 3.x and dependency below
 
@@ -57,4 +60,44 @@ cmdData = {
 you can run the application by executing this command
 ```
 python3 pkcs11_pubsub.py
+```
+
+## C++ example
+This example is modified version of [pkcs11_connect](https://github.com/aws/aws-iot-device-sdk-cpp-v2/tree/main/samples/mqtt/pkcs11_connect) that uses [aws-iot-device-sdk-cpp-v2](https://github.com/aws/aws-iot-device-sdk-cpp-v2) library
+
+### Dependencies
+
+you need to build and install [aws-iot-device-sdk-cpp-v2](https://github.com/aws/aws-iot-device-sdk-cpp-v2)
+
+you also need to install 
+```
+sudo apt install libp11-dev
+```
+
+### Build
+
+Please configure the `cmdData` inside the [main.cpp](cpp/main.cpp)
+
+```
+Utils::cmdData cmdData;
+cmdData.input_pkcs11UserPin = "0000";
+cmdData.input_pkcs11LibPath = "/usr/local/lib/libgtosepkcs11.so";
+cmdData.input_pkcs11TokenLabel = "Card #0000000000000000";
+cmdData.input_pkcs11KeyLabel = "01";
+cmdData.input_pkcs11SlotId = 0;
+cmdData.input_endpoint = "";
+cmdData.input_clientId = "basicPubSub";
+cmdData.input_ca = "03";
+cmdData.input_cert = "02";
+cmdData.input_message = "Hello World from IOT Safe";
+cmdData.input_topic = "";
+cmdData.input_count = 10;
+```
+
+### Run
+
+you can the application by executing the command
+
+```
+./pkcs11-pubsub
 ```

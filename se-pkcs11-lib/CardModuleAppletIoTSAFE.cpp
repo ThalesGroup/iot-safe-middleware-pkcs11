@@ -201,7 +201,7 @@ void CardModuleApplet::close_all_logical_channel()
     #ifdef USE_LOGICAL_CHANNEL
     m_SW1SW2 = 0x9000;
     int channel = 1;
-    while(m_SW1SW2 == 0x9000){
+    for(channel = 1;channel<13;channel++){
         m_dataIn = new u1Array(5);
         m_dataOut = new u1Array(0);
 
@@ -211,16 +211,12 @@ void CardModuleApplet::close_all_logical_channel()
         m_dataIn->GetBuffer()[3] = channel;
         m_dataIn->GetBuffer()[4] = 0x00;
 
+        //the card may 6200 if the channel never opened. we ignore it
         CardManager::getInstance ()->exchangeData (*m_dataIn, *m_dataOut, &m_SW1SW2, FALSE);
-
-        if(m_SW1SW2 == 0x9000)
-        {
-            channel++;
-        }
     }
     #endif
 }
-void CardModuleApplet::close_logical_channel(BYTE channel)
+bool CardModuleApplet::close_logical_channel(BYTE channel)
 {
     #ifdef USE_LOGICAL_CHANNEL
         m_dataIn = new u1Array(5);
@@ -234,15 +230,15 @@ void CardModuleApplet::close_logical_channel(BYTE channel)
 
         CardManager::getInstance ()->exchangeData (*m_dataIn, *m_dataOut, &m_SW1SW2, FALSE);
 
-        if (m_SW1SW2 != 0x9000){
-                Log::log("error closing the logical channel");
-        }
+        return m_SW1SW2 == 0x9000;
+    #else
+        return true;
 	#endif
 }
 void CardModuleApplet::setup_logical_channel()
 {
     #ifdef USE_LOGICAL_CHANNEL
-        close_all_logical_channel();
+        close_logical_channel(1);
         m_dataIn = new u1Array(5);
         m_dataOut = new u1Array(0);
 

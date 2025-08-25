@@ -179,7 +179,7 @@ private:
     void        reset_buffers();
     void        init_context(BYTE channel, u1Array* uri);
     void        setup_logical_channel();
-    void        close_logical_channel(BYTE channel);
+    bool        close_logical_channel(BYTE channel);
     void        close_all_logical_channel();
 
     u1Array*    readFile(u1 EFID, u2 offset, u2 length);
